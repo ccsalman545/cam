@@ -39,6 +39,24 @@ void encoder_worker_join(EncoderWorker *worker);
 
 uint64_t encoder_worker_frames_encoded(const EncoderWorker *worker);
 
+/*
+ * Breakdown of what the encode thread did with the frames it
+ * pulled from the hub. Lets /status tell "idle by design"
+ * (skipped_idle == everything) apart from a real stall
+ * (mismatch, bad size or encoder producing no output).
+ */
+typedef struct {
+    uint64_t frames_seen;       /* frames taken from the hub */
+    uint64_t frames_encoded;    /* access units pushed into the ring */
+    uint64_t skipped_idle;      /* dropped: no WebRTC session active */
+    uint64_t skipped_mismatch;  /* dropped: width/height not as expected */
+    uint64_t skipped_bad_size;  /* dropped: empty frame (size 0) */
+    uint64_t no_output;         /* encode call returned nothing */
+} EncoderWorkerStats;
+
+void encoder_worker_get_stats(const EncoderWorker *worker,
+                              EncoderWorkerStats *out);
+
 void encoder_worker_destroy(EncoderWorker *worker);
 
 #endif

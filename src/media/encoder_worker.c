@@ -42,13 +42,30 @@ struct EncoderWorker {
 
     uint64_t frames_in;
     uint64_t frames_encoded;
+    uint64_t skipped_idle;
+    uint64_t skipped_mismatch;
+    uint64_t skipped_bad_size;
+    uint64_t no_output;
 };
+
+/*
+ * Frames the worker may consume while active before the stall
+ * watchdog complains. At 30 fps this is about three seconds,
+ * well inside the ICE checking window of a connecting viewer.
+ */
+#define STALL_WATCHDOG_FRAMES 90
 
 static void *encoder_thread(void *arg)
 {
     EncoderWorker *worker = arg;
 
     printf("encode worker: started\n");
+
+    int was_active = 0;
+    int stall_warned = 0;
+    int mismatch_logged = 0;
+    int bad_size_logged = 0;
+    uint64_t last_encode_at_seen = 0;
 
     while (worker->running) {
         Frame *frame = frame_hub_take(worker->consumer);
@@ -70,12 +87,71 @@ static void *encoder_thread(void *arg)
             active = atomic_load(worker->active);
         }
 
-        int usable = active &&
-                     frame->width == worker->width &&
-                     frame->height == worker->height &&
-                     frame->size > 0;
+        if (active && !was_active) {
+            /*
+             * A viewer session appeared: re-arm the stall
+             * watchdog for this active window.
+             */
+            stall_warned = 0;
+            last_encode_at_seen = worker->frames_in;
+        }
+        was_active = active;
 
-        if (!usable) {
+        if (!active) {
+            /*
+             * Idle by design: without a viewer there is nobody
+             * to send the stream to, so skip conversion and
+             * encoding entirely.
+             */
+            worker->skipped_idle++;
+            frame_unref(frame_hub_pool(worker->hub), frame);
+            continue;
+        }
+
+        /*
+         * Stall watchdog: active for a while without a single
+         * encoded access unit. Report once with the full drop
+         * breakdown so the cause is identifiable; re-arms when
+         * the encoder produces output again.
+         */
+        if (!stall_warned &&
+            worker->frames_in - last_encode_at_seen >= STALL_WATCHDOG_FRAMES) {
+            stall_warned = 1;
+            fprintf(stderr,
+                    "encode worker: stalled, no output for %llu frames while "
+                    "active (encoded total=%llu, skipped: mismatch=%llu "
+                    "bad-size=%llu, encoder-no-output=%llu)\n",
+                    (unsigned long long) (worker->frames_in -
+                                          last_encode_at_seen),
+                    (unsigned long long) worker->frames_encoded,
+                    (unsigned long long) worker->skipped_mismatch,
+                    (unsigned long long) worker->skipped_bad_size,
+                    (unsigned long long) worker->no_output);
+        }
+
+        if (frame->width != worker->width ||
+            frame->height != worker->height) {
+            if (!mismatch_logged) {
+                mismatch_logged = 1;
+                fprintf(stderr,
+                        "encode worker: frame %ux%u does not match the "
+                        "encoder %ux%u, frames are dropped\n",
+                        frame->width, frame->height,
+                        worker->width, worker->height);
+            }
+            worker->skipped_mismatch++;
+            frame_unref(frame_hub_pool(worker->hub), frame);
+            continue;
+        }
+
+        if (frame->size == 0) {
+            if (!bad_size_logged) {
+                bad_size_logged = 1;
+                fprintf(stderr,
+                        "encode worker: empty frame (size 0), "
+                        "frames are dropped\n");
+            }
+            worker->skipped_bad_size++;
             frame_unref(frame_hub_pool(worker->hub), frame);
             continue;
         }
@@ -139,10 +215,13 @@ static void *encoder_thread(void *arg)
             /*
              * Hardware pipeline depth: no output this round.
              */
+            worker->no_output++;
             continue;
         }
 
         worker->frames_encoded++;
+        last_encode_at_seen = worker->frames_in;
+        stall_warned = 0;
 
         if (is_idr) {
             /*
@@ -255,6 +334,31 @@ void encoder_worker_join(EncoderWorker *worker)
 uint64_t encoder_worker_frames_encoded(const EncoderWorker *worker)
 {
     return worker != NULL ? worker->frames_encoded : 0;
+}
+
+void encoder_worker_get_stats(const EncoderWorker *worker,
+                              EncoderWorkerStats *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    if (worker == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+
+    /*
+     * The counters are written by the encode thread only and
+     * only ever grow, so a plain read from the HTTP thread is
+     * benign here (same contract as frames_encoded above).
+     */
+    out->frames_seen = worker->frames_in;
+    out->frames_encoded = worker->frames_encoded;
+    out->skipped_idle = worker->skipped_idle;
+    out->skipped_mismatch = worker->skipped_mismatch;
+    out->skipped_bad_size = worker->skipped_bad_size;
+    out->no_output = worker->no_output;
 }
 
 void encoder_worker_destroy(EncoderWorker *worker)

@@ -40,6 +40,15 @@ flowchart TB
 | capture timeouts in the log | USB bandwidth saturation | lower resolution or fps, use a USB 3 port |
 | Pi CSI camera not found | libcamera does not expose V4L2 YUYV | see the v4l2loopback bridge in the Pi guide |
 
+## Encoder problems
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `encoded frames` stays 0, viewers table says none | idle by design: with no session the encode worker discards raw frames instead of burning CPU | nothing to do; the server panel shows `encoder idle`. Counters move as soon as a viewer connects |
+| captured grows, encoded stays 0, a viewer connected | the encode worker stalled while active | compare `captured_frames` with `encoder_frames_seen` in `/status`: equal means frames reach the worker and the `encoder_skipped_*` / `encoder_no_output` counters name the drop path; `encoder_frames_seen` stuck near 0 means frames never arrive (hub/pool problem) |
+| `encode worker: frame WxH does not match the encoder WxH` in the log | source negotiated a different resolution than the encoder was opened with | restart; if it persists, force resolution with `-W`/`-H` matching what `v4l2-ctl --list-formats-ext` reports |
+| `encode worker: stalled, no output for N frames while active` in the log | nothing was encoded for about three seconds while a session existed | the same line prints the drop breakdown (mismatch, bad-size, encoder-no-output); with all counters zero the encode thread starves, check capture health |
+
 ## Network problems
 
 | Symptom | Cause | Fix |
