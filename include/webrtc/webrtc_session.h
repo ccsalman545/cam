@@ -53,7 +53,9 @@ typedef enum {
 typedef struct {
     uint32_t id;
     uint16_t udp_port;
-    const char *advertise_ip;       /* server IP for the candidate line */
+    const char *advertise_ip;       /* server IP for the c= line and first candidate */
+    const char **extra_ips;         /* additional host candidates (local interfaces) */
+    size_t extra_ip_count;
     SdpOffer offer;                 /* parsed browser offer */
 
     /* Server hooks. */

@@ -28,7 +28,7 @@ struct EncoderWorker {
     H264Encoder *encoder;
     AuRing *ring;
     atomic_int *force_idr;
-    const int *active;
+    const atomic_int *active;
 
     uint32_t width;
     uint32_t height;
@@ -65,7 +65,12 @@ static void *encoder_thread(void *arg)
 
         worker->frames_in++;
 
-        int usable = worker->active != NULL && *worker->active &&
+        int active = 0;
+        if (worker->active != NULL) {
+            active = atomic_load(worker->active);
+        }
+
+        int usable = active &&
                      frame->width == worker->width &&
                      frame->height == worker->height &&
                      frame->size > 0;
@@ -169,7 +174,7 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
                                      uint32_t height,
                                      AuRing *ring,
                                      atomic_int *force_idr,
-                                     const int *active)
+                                     const atomic_int *active)
 {
     EncoderWorker *worker = calloc(1, sizeof(*worker));
     if (worker == NULL) {

@@ -363,15 +363,30 @@ int rtc_session_create(const RtcSessionConfig *config,
     session->created_ms = now_ms();
     session->last_rx_ms = session->created_ms;
 
-    size_t built = sdp_build_answer(&config->offer,
-                                    dtls_srtp_local_fingerprint(),
-                                    session->local_ufrag,
-                                    session->local_pwd,
-                                    config->advertise_ip,
-                                    session->udp_port,
-                                    ssrc,
-                                    answer_sdp,
-                                    answer_capacity);
+    size_t built = 0;
+    if (config->extra_ips != NULL && config->extra_ip_count > 0) {
+        built = sdp_build_answer_multi(&config->offer,
+                                       dtls_srtp_local_fingerprint(),
+                                       session->local_ufrag,
+                                       session->local_pwd,
+                                       config->advertise_ip,
+                                       config->extra_ips,
+                                       config->extra_ip_count,
+                                       session->udp_port,
+                                       ssrc,
+                                       answer_sdp,
+                                       answer_capacity);
+    } else {
+        built = sdp_build_answer(&config->offer,
+                                 dtls_srtp_local_fingerprint(),
+                                 session->local_ufrag,
+                                 session->local_pwd,
+                                 config->advertise_ip,
+                                 session->udp_port,
+                                 ssrc,
+                                 answer_sdp,
+                                 answer_capacity);
+    }
 
     if (built == 0) {
         fprintf(stderr, "rtc %08x: SDP answer overflow\n", config->id);
@@ -381,11 +396,17 @@ int rtc_session_create(const RtcSessionConfig *config,
 
     *answer_length = built;
 
+    /* Clear dangling extra IP pointers that were on the caller's stack.
+     * The SDP has already been built, we don't need them anymore. */
+    session->config.extra_ips = NULL;
+    session->config.extra_ip_count = 0;
+
     *session_out = session;
 
-    printf("rtc %08x: created, UDP %u, ice-ufrag %s, payload type %d\n",
+    printf("rtc %08x: created, UDP %u, ice-ufrag %s, payload type %d, candidates %zu\n",
            config->id, session->udp_port, session->local_ufrag,
-           config->offer.h264_payload_type);
+           config->offer.h264_payload_type,
+           1 + config->extra_ip_count);
 
     return 0;
 }

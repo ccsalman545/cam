@@ -16,6 +16,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,7 +58,7 @@ typedef struct {
     EncoderWorker *encoder_worker;
     AuRing *ring;
     atomic_int force_idr;
-    int rtc_active;
+    atomic_int rtc_active;
 
     RtcSession *sessions[MAX_RTC_SESSIONS];
 
@@ -388,8 +389,73 @@ static void handle_rtc_offer(Server *server,
     memcpy(host_copy, host.buf, copy_len);
 
     char advertise_ip[INET_ADDRSTRLEN];
-
     choose_advertise_ip(host_copy, advertise_ip, sizeof(advertise_ip));
+
+    /* Collect all local IPs to advertise as additional host candidates */
+    InterfaceInfo all_ifaces[16];
+    size_t all_count = collect_interfaces(all_ifaces, 16);
+
+    /* Build deduplicated extra IP list (excluding primary) */
+    const char *extra_ip_ptrs[16];
+    char extra_ip_storage[16][INET_ADDRSTRLEN];
+    size_t extra_count = 0;
+
+    for (size_t i = 0; i < all_count && extra_count < 16; i++) {
+        if (strcmp(all_ifaces[i].ip, advertise_ip) == 0) {
+            continue;
+        }
+        /* deduplicate */
+        int dup = 0;
+        for (size_t j = 0; j < extra_count; j++) {
+            if (strcmp(extra_ip_storage[j], all_ifaces[i].ip) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        snprintf(extra_ip_storage[extra_count], sizeof(extra_ip_storage[0]),
+                 "%s", all_ifaces[i].ip);
+        extra_ip_ptrs[extra_count] = extra_ip_storage[extra_count];
+        extra_count++;
+    }
+
+    /* Proxy detection: if Host header is not a local IP and not private, warn */
+    int host_matches_local = 0;
+    char host_ip_only[INET_ADDRSTRLEN] = "";
+    if (host_copy[0] != 0) {
+        size_t k = 0;
+        for (; host_copy[k] != 0 && host_copy[k] != ':' && k + 1 < sizeof(host_ip_only); k++) {
+            host_ip_only[k] = host_copy[k];
+        }
+        host_ip_only[k] = 0;
+        for (size_t n = 0; n < all_count; n++) {
+            if (strcmp(all_ifaces[n].ip, host_ip_only) == 0) {
+                host_matches_local = 1;
+                break;
+            }
+        }
+        if (!host_matches_local && host_ip_only[0] != 0) {
+            /* Check if host_ip_only looks like an IP (contains dot) vs hostname */
+            int is_ip_like = 0;
+            for (size_t c = 0; host_ip_only[c] != 0; c++) {
+                if (host_ip_only[c] == '.' && host_ip_only[c+1] >= '0' && host_ip_only[c+1] <= '9') {
+                    is_ip_like = 1;
+                    break;
+                }
+                if (host_ip_only[c] >= '0' && host_ip_only[c] <= '9') {
+                    is_ip_like = 1;
+                }
+            }
+            if (!is_ip_like || strcmp(host_ip_only, advertise_ip) != 0) {
+                printf("rtc: Host header '%s' does not match local interfaces (primary %s). "
+                       "If this page is opened through a proxy, UDP media will fail. "
+                       "Open directly via http://%s:%u/\n",
+                       host_copy, advertise_ip, advertise_ip, server->config->http_port);
+            }
+        }
+    }
 
     uint32_t session_id = 0;
 
@@ -402,6 +468,8 @@ static void handle_rtc_offer(Server *server,
         .id = session_id,
         .udp_port = (uint16_t) (server->config->udp_base_port + slot),
         .advertise_ip = advertise_ip,
+        .extra_ips = extra_count ? extra_ip_ptrs : NULL,
+        .extra_ip_count = extra_count,
         .offer = offer,
         .server = server,
         .on_idr_request = session_on_idr_request,
@@ -409,7 +477,7 @@ static void handle_rtc_offer(Server *server,
     };
 
     RtcSession *session = NULL;
-    char answer[4096];
+    char answer[8192];
     size_t answer_length = 0;
 
     if (rtc_session_create(&session_config, &session,
@@ -420,7 +488,7 @@ static void handle_rtc_offer(Server *server,
     }
 
     server->sessions[slot] = session;
-    server->rtc_active = 1;
+    atomic_store(&server->rtc_active, 1);
 
     /*
      * A fresh viewer always needs a keyframe first.
@@ -509,6 +577,7 @@ static void handle_status(Server *server,
         "\"encoder\":{\"name\":\"%s\",\"preference\":\"%s\","
         "\"bitrate_kbps\":%u,\"keyframe_seconds\":%u},"
         "\"http_port\":%u,"
+        "\"udp_port\":%u,"
         "\"transport\":\"webrtc\","
         "\"captured_frames\":%llu,"
         "\"encoded_frames\":%llu,"
@@ -526,6 +595,7 @@ static void handle_status(Server *server,
         server->config->bitrate_kbps,
         server->config->keyframe_seconds,
         server->config->http_port,
+        server->config->udp_base_port,
         (unsigned long long) source_worker_captured(server->source_worker),
         (unsigned long long) encoder_worker_frames_encoded(server->encoder_worker),
         (unsigned long long) au_ring_dropped(server->ring));
@@ -648,6 +718,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     server->started_ms = now_ms();
 
     atomic_init(&server->force_idr, 0);
+    atomic_init(&server->rtc_active, 0);
 
     if (dtls_srtp_global_init() != 0) {
         fprintf(stderr, "server: DTLS global init failed\n");
@@ -760,6 +831,16 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                interfaces[i].ip, config->http_port, interfaces[i].name);
     }
 
+    printf("udp media ports %u-%u (one per viewer, up to %d)\n",
+           config->udp_base_port,
+           config->udp_base_port + MAX_RTC_SESSIONS - 1,
+           MAX_RTC_SESSIONS);
+    printf("firewall: allow TCP %u and UDP %u-%u\n",
+           config->http_port,
+           config->udp_base_port,
+           config->udp_base_port + MAX_RTC_SESSIONS - 1);
+    printf("hint: open the page directly via LAN IP, not through a proxy. "
+           "Proxies cannot forward UDP media.\n");
     printf("\n");
 
     /*
@@ -896,7 +977,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
             }
         }
 
-        server->rtc_active = live_sessions > 0;
+        atomic_store(&server->rtc_active, live_sessions > 0 ? 1 : 0);
     }
 
     printf("\nshutting down\n");

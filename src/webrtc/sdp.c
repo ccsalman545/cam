@@ -186,20 +186,22 @@ int sdp_parse_offer(const char *sdp, size_t length, SdpOffer *offer)
     return 0;
 }
 
-size_t sdp_build_answer(const SdpOffer *offer,
-                        const char *local_fingerprint,
-                        const char *local_ufrag,
-                        const char *local_pwd,
-                        const char *advertise_ip,
-                        uint16_t udp_port,
-                        uint32_t ssrc,
-                        char *out,
-                        size_t out_capacity)
+size_t sdp_build_answer_multi(const SdpOffer *offer,
+                              const char *local_fingerprint,
+                              const char *local_ufrag,
+                              const char *local_pwd,
+                              const char *advertise_ip,
+                              const char **extra_ips,
+                              size_t extra_count,
+                              uint16_t udp_port,
+                              uint32_t ssrc,
+                              char *out,
+                              size_t out_capacity)
 {
     const char *video_mid = offer->video_mid[0] ? offer->video_mid : "video";
     const char *audio_mid = offer->audio_mid[0] ? offer->audio_mid : "audio";
 
-    char buffer[4096];
+    char buffer[8192];
     size_t offset = 0;
 
     /*
@@ -247,18 +249,6 @@ size_t sdp_build_answer(const SdpOffer *offer,
         offset += (size_t) written;
     }
 
-    /*
-     * The candidate line must follow the RFC 8445 grammar exactly:
-     *
-     *   candidate:<foundation> <component-id> <transport>
-     *            <priority> <connection-address> <port>
-     *            typ <candidate-type> [generation <n>]
-     *
-     * Browsers reject the whole answer when any of the integer
-     * fields is missing or out of order (the component id used
-     * to be omitted, which made Chromium fail with
-     * "SDP Parse Error ... Integer parsing error" on this line).
-     */
     written = snprintf(buffer + offset, sizeof(buffer) - offset,
         "m=video 9 UDP/TLS/RTP/SAVPF %d\r\n"
         "c=IN IP4 %s\r\n"
@@ -278,9 +268,7 @@ size_t sdp_build_answer(const SdpOffer *offer,
             "level-asymmetry-allowed=1\r\n"
         "a=rtcp-fb:%d nack\r\n"
         "a=rtcp-fb:%d nack pli\r\n"
-        "a=rtcp-fb:%d ccm fir\r\n"
-        "a=candidate:1 1 udp 2130706431 %s %u typ host generation 0\r\n"
-        "a=end-of-candidates\r\n",
+        "a=rtcp-fb:%d ccm fir\r\n",
         offer->h264_payload_type,
         advertise_ip,
         video_mid,
@@ -293,9 +281,67 @@ size_t sdp_build_answer(const SdpOffer *offer,
         offer->h264_payload_type,
         offer->h264_payload_type,
         offer->h264_payload_type,
-        offer->h264_payload_type,
+        offer->h264_payload_type);
+
+    if (written < 0) {
+        return 0;
+    }
+    offset += (size_t) written;
+
+    /*
+     * The candidate lines must follow the RFC 8445 grammar exactly:
+     *
+     *   candidate:<foundation> <component-id> <transport>
+     *            <priority> <connection-address> <port>
+     *            typ <candidate-type> [generation <n>]
+     *
+     * Browsers reject the whole answer when any of the integer
+     * fields is missing or out of order.
+     *
+     * We advertise the primary IP as foundation 1 and any extra
+     * local interfaces as additional host candidates. This helps
+     * multi-homed machines (Ethernet + Wi-Fi + VPN) and makes the
+     * failure mode obvious when the page is opened through a proxy
+     * that cannot forward UDP: at least one host candidate will be
+     * a private LAN IP that the browser can try directly.
+     */
+    written = snprintf(buffer + offset, sizeof(buffer) - offset,
+        "a=candidate:1 1 udp 2130706431 %s %u typ host generation 0\r\n",
         advertise_ip,
         (unsigned) udp_port);
+
+    if (written < 0) {
+        return 0;
+    }
+    offset += (size_t) written;
+
+    for (size_t i = 0; i < extra_count; i++) {
+        const char *ip = extra_ips[i];
+        if (ip == NULL || ip[0] == 0) {
+            continue;
+        }
+        if (strcmp(ip, advertise_ip) == 0) {
+            continue; /* already advertised as foundation 1 */
+        }
+        /* foundation = i+2, priority slightly lower for extra interfaces */
+        uint32_t prio = 2130706431 - (uint32_t)(i + 1) * 10;
+        if (prio < 1000) {
+            prio = 1000;
+        }
+        written = snprintf(buffer + offset, sizeof(buffer) - offset,
+            "a=candidate:%zu 1 udp %u %s %u typ host generation 0\r\n",
+            i + 2, prio, ip, (unsigned) udp_port);
+        if (written < 0) {
+            return 0;
+        }
+        offset += (size_t) written;
+        if (offset + 256 > sizeof(buffer)) {
+            break; /* avoid overflow, still produce valid SDP */
+        }
+    }
+
+    written = snprintf(buffer + offset, sizeof(buffer) - offset,
+        "a=end-of-candidates\r\n");
 
     if (written < 0) {
         return 0;
@@ -309,4 +355,27 @@ size_t sdp_build_answer(const SdpOffer *offer,
     memcpy(out, buffer, offset + 1);
 
     return offset;
+}
+
+size_t sdp_build_answer(const SdpOffer *offer,
+                        const char *local_fingerprint,
+                        const char *local_ufrag,
+                        const char *local_pwd,
+                        const char *advertise_ip,
+                        uint16_t udp_port,
+                        uint32_t ssrc,
+                        char *out,
+                        size_t out_capacity)
+{
+    return sdp_build_answer_multi(offer,
+                                  local_fingerprint,
+                                  local_ufrag,
+                                  local_pwd,
+                                  advertise_ip,
+                                  NULL,
+                                  0,
+                                  udp_port,
+                                  ssrc,
+                                  out,
+                                  out_capacity);
 }
