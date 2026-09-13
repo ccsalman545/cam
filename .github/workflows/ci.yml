@@ -1,0 +1,49 @@
+name: build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libsrtp2-dev libx264-dev
+
+      - name: Build application
+        run: make -j2
+
+      - name: Run tests
+        run: make test vision-capture
+
+      - name: Run synthetic vision pipeline
+        run: ./build/vision-capture --test -W 64 -H 48 -F 10 -s 2 -o build/ci-mosaic
+
+      - name: Check generated outputs
+        run: |
+          test -s build/ci-mosaic.pgm
+          test -s build/ci-mosaic.obj
+          grep -q '^P5$' build/ci-mosaic.pgm
+          grep -q '^v ' build/ci-mosaic.obj
+          grep -q '^f ' build/ci-mosaic.obj
+
+      - name: Check documentation punctuation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          roots = [Path('README.md'), Path('docs'), Path('include'), Path('src'), Path('tools')]
+          files = [p for root in roots for p in ([root] if root.is_file() else root.rglob('*')) if p.is_file()]
+          bad = [str(p) for p in files if any(c in p.read_text(errors='ignore') for c in ('\\u2013', '\\u2014'))]
+          if bad:
+              print('Use a plain hyphen in repository documentation and comments:', *bad, sep='\\n')
+              raise SystemExit(1)
+          PY

@@ -37,7 +37,7 @@ struct EncoderWorker {
     uint8_t *au_buffer;         /* access unit output */
 
     pthread_t thread;
-    int running;
+    atomic_int running;
     int started;
 
     uint64_t frames_in;

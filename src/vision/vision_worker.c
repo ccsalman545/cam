@@ -4,6 +4,7 @@
 
 #include <linux/videodev2.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,8 @@ struct VisionWorker {
     uint32_t width, height, output_interval;
     char prefix[256];
     pthread_t thread;
-    int running, started;
+    atomic_int running;
+    int started;
     uint64_t processed;
     uint8_t *previous_data;
     uint8_t *current_data;
