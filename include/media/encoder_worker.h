@@ -29,7 +29,7 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
                                      uint32_t height,
                                      AuRing *ring,
                                      atomic_int *force_idr,
-                                     const int *active);
+                                     const atomic_int *active);
 
 int encoder_worker_start(EncoderWorker *worker);
 

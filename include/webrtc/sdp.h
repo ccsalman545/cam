@@ -52,4 +52,22 @@ size_t sdp_build_answer(const SdpOffer *offer,
                         char *out,
                         size_t out_capacity);
 
+/*
+ * Multi-candidate variant: advertise_ip is used for the c= line
+ * and as the first host candidate. extra_ips (if any) are added
+ * as additional host candidates with increasing foundation ids.
+ * Returns bytes written or 0 on overflow.
+ */
+size_t sdp_build_answer_multi(const SdpOffer *offer,
+                              const char *local_fingerprint,
+                              const char *local_ufrag,
+                              const char *local_pwd,
+                              const char *advertise_ip,
+                              const char **extra_ips,
+                              size_t extra_count,
+                              uint16_t udp_port,
+                              uint32_t ssrc,
+                              char *out,
+                              size_t out_capacity);
+
 #endif

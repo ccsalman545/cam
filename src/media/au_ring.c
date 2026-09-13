@@ -56,7 +56,11 @@ int au_ring_push(AuRing *ring,
                  uint64_t pts_us,
                  int is_idr)
 {
-    if (ring == NULL || size > ring->slot_capacity) {
+    if (ring == NULL || size == 0 || size > ring->slot_capacity) {
+        return -1;
+    }
+
+    if (data == NULL) {
         return -1;
     }
 

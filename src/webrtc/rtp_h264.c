@@ -136,7 +136,8 @@ int rtp_h264_packetize(RtpH264 *p,
         p->have_base = 1;
     }
 
-    uint32_t rtp_ts = (uint32_t) ((pts_us - p->base_pts_us) / 1000000.0 * 90000.0);
+    uint64_t delta_us = pts_us >= p->base_pts_us ? pts_us - p->base_pts_us : 0;
+    uint32_t rtp_ts = (uint32_t) ((delta_us * 90000ULL) / 1000000ULL);
 
     p->last_timestamp = rtp_ts;
 

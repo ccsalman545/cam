@@ -16,6 +16,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef USE_LIBPEER
+/* libpeer uses mbedTLS internally, no OpenSSL needed */
+#else
+#if __has_include(<openssl/rand.h>)
 #include <openssl/rand.h>
+#endif
+#endif
 
 #include "mongoose.h"
 
@@ -57,7 +64,7 @@ typedef struct {
     EncoderWorker *encoder_worker;
     AuRing *ring;
     atomic_int force_idr;
-    int rtc_active;
+    atomic_int rtc_active;
 
     RtcSession *sessions[MAX_RTC_SESSIONS];
 
@@ -86,6 +93,7 @@ typedef struct {
 
 /*
  * Collect local IPv4 addresses, loopback excluded.
+ * Only interfaces that are UP and not loopback are considered.
  */
 static size_t collect_interfaces(InterfaceInfo *out, size_t max)
 {
@@ -99,6 +107,14 @@ static size_t collect_interfaces(InterfaceInfo *out, size_t max)
 
     for (struct ifaddrs *ifa = addrs; ifa != NULL && count < max; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        if ((ifa->ifa_flags & IFF_UP) == 0) {
+            continue;
+        }
+
+        if (ifa->ifa_flags & IFF_LOOPBACK) {
             continue;
         }
 
@@ -123,6 +139,7 @@ static size_t collect_interfaces(InterfaceInfo *out, size_t max)
  * Best address to advertise in SDP candidates: prefer the IP
  * the browser used to reach us, otherwise the first private
  * IPv4 address.
+ * Uses inet_pton for validation instead of deprecated inet_addr.
  */
 static void choose_advertise_ip(const char *host_header,
                                 char *out,
@@ -140,16 +157,23 @@ static void choose_advertise_ip(const char *host_header,
         }
         candidate[i] = 0;
 
-        for (size_t n = 0; n < count; n++) {
-            if (strcmp(interfaces[n].ip, candidate) == 0) {
-                snprintf(out, out_size, "%s", candidate);
-                return;
+        struct in_addr addr;
+        if (inet_pton(AF_INET, candidate, &addr) == 1) {
+            for (size_t n = 0; n < count; n++) {
+                if (strcmp(interfaces[n].ip, candidate) == 0) {
+                    snprintf(out, out_size, "%s", candidate);
+                    return;
+                }
             }
         }
     }
 
     for (size_t n = 0; n < count; n++) {
-        uint32_t host = ntohl(inet_addr(interfaces[n].ip));
+        struct in_addr addr;
+        if (inet_pton(AF_INET, interfaces[n].ip, &addr) != 1) {
+            continue;
+        }
+        uint32_t host = ntohl(addr.s_addr);
 
         int private_range =
             ((host >> 24) == 10) ||
@@ -269,7 +293,14 @@ static int json_get_int(const char *body, const char *field, long *out)
         pos++;
     }
 
-    *out = strtol(pos, NULL, 10);
+    char *end = NULL;
+    long val = strtol(pos, &end, 10);
+
+    if (end == pos) {
+        return -1;
+    }
+
+    *out = val;
 
     return 0;
 }
@@ -388,12 +419,101 @@ static void handle_rtc_offer(Server *server,
     memcpy(host_copy, host.buf, copy_len);
 
     char advertise_ip[INET_ADDRSTRLEN];
-
     choose_advertise_ip(host_copy, advertise_ip, sizeof(advertise_ip));
+
+    /* Collect all local IPs to advertise as additional host candidates */
+    InterfaceInfo all_ifaces[16];
+    size_t all_count = collect_interfaces(all_ifaces, 16);
+
+    /* Build deduplicated extra IP list (excluding primary) */
+    const char *extra_ip_ptrs[16];
+    char extra_ip_storage[16][INET_ADDRSTRLEN];
+    size_t extra_count = 0;
+
+    for (size_t i = 0; i < all_count && extra_count < 16; i++) {
+        if (strcmp(all_ifaces[i].ip, advertise_ip) == 0) {
+            continue;
+        }
+        /* deduplicate */
+        int dup = 0;
+        for (size_t j = 0; j < extra_count; j++) {
+            if (strcmp(extra_ip_storage[j], all_ifaces[i].ip) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        snprintf(extra_ip_storage[extra_count], sizeof(extra_ip_storage[0]),
+                 "%s", all_ifaces[i].ip);
+        extra_ip_ptrs[extra_count] = extra_ip_storage[extra_count];
+        extra_count++;
+    }
+
+    /* Proxy detection: if Host header is not a local IP and not private, warn */
+    int host_matches_local = 0;
+    char host_ip_only[INET_ADDRSTRLEN] = "";
+    if (host_copy[0] != 0) {
+        size_t k = 0;
+        for (; host_copy[k] != 0 && host_copy[k] != ':' && k + 1 < sizeof(host_ip_only); k++) {
+            host_ip_only[k] = host_copy[k];
+        }
+        host_ip_only[k] = 0;
+        for (size_t n = 0; n < all_count; n++) {
+            if (strcmp(all_ifaces[n].ip, host_ip_only) == 0) {
+                host_matches_local = 1;
+                break;
+            }
+        }
+        if (!host_matches_local && host_ip_only[0] != 0) {
+            /* Check if host_ip_only looks like an IP (contains dot) vs hostname */
+            int is_ip_like = 0;
+            for (size_t c = 0; host_ip_only[c] != 0; c++) {
+                if (host_ip_only[c] == '.' && host_ip_only[c+1] >= '0' && host_ip_only[c+1] <= '9') {
+                    is_ip_like = 1;
+                    break;
+                }
+                if (host_ip_only[c] >= '0' && host_ip_only[c] <= '9') {
+                    is_ip_like = 1;
+                }
+            }
+            if (!is_ip_like || strcmp(host_ip_only, advertise_ip) != 0) {
+                printf("rtc: Host header '%s' does not match local interfaces (primary %s). "
+                       "If this page is opened through a proxy, UDP media will fail. "
+                       "Open directly via http://%s:%u/\n",
+                       host_copy, advertise_ip, advertise_ip, server->config->http_port);
+            }
+        }
+    }
 
     uint32_t session_id = 0;
 
-    RAND_bytes((unsigned char *) &session_id, sizeof(session_id));
+    /* Secure random session id without requiring OpenSSL */
+    {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            fread(&session_id, 1, sizeof(session_id), f);
+            fclose(f);
+        }
+#ifdef USE_LIBPEER
+        /* libpeer mode - no RAND_bytes */
+        if (session_id == 0) {
+            session_id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)server ^ (uint32_t)slot;
+            session_id = session_id * 2654435761u;
+        }
+#else
+#if __has_include(<openssl/rand.h>)
+        if (session_id == 0) {
+            RAND_bytes((unsigned char*)&session_id, sizeof(session_id));
+        }
+#endif
+        if (session_id == 0) {
+            session_id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)server ^ (uint32_t)slot;
+            session_id = session_id * 2654435761u;
+        }
+#endif
+    }
     if (session_id == 0) {
         session_id = 1;
     }
@@ -402,14 +522,17 @@ static void handle_rtc_offer(Server *server,
         .id = session_id,
         .udp_port = (uint16_t) (server->config->udp_base_port + slot),
         .advertise_ip = advertise_ip,
+        .extra_ips = extra_count ? extra_ip_ptrs : NULL,
+        .extra_ip_count = extra_count,
         .offer = offer,
+        .remote_sdp = sdp,
         .server = server,
         .on_idr_request = session_on_idr_request,
         .on_closed = session_on_closed
     };
 
     RtcSession *session = NULL;
-    char answer[4096];
+    char answer[8192];
     size_t answer_length = 0;
 
     if (rtc_session_create(&session_config, &session,
@@ -420,7 +543,7 @@ static void handle_rtc_offer(Server *server,
     }
 
     server->sessions[slot] = session;
-    server->rtc_active = 1;
+    atomic_store(&server->rtc_active, 1);
 
     /*
      * A fresh viewer always needs a keyframe first.
@@ -429,21 +552,49 @@ static void handle_rtc_offer(Server *server,
 
     /*
      * Build the JSON response with the escaped SDP answer.
+     * Answer is up to 8192, escaped it can double (CRLF -> \r\n), so payload
+     * needs to be much larger than 9216. Use 24k to be safe.
      */
-    char payload[9216];
+    char payload[24576];
     size_t offset = 0;
 
-    offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
-                                "{\"type\":\"answer\",\"session_id\":%u,"
-                                "\"udp_port\":%u,\"sdp\":\"",
-                                session_id,
-                                (unsigned) session_config.udp_port);
+    int n = snprintf(payload + offset, sizeof(payload) - offset,
+                     "{\"type\":\"answer\",\"session_id\":%u,"
+                     "\"udp_port\":%u,\"sdp\":\"",
+                     session_id,
+                     (unsigned) session_config.udp_port);
+    if (n < 0 || (size_t)n >= sizeof(payload) - offset) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"answer too large\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += (size_t) n;
 
-    offset += json_escape_append(answer, payload + offset,
-                                 sizeof(payload) - offset);
+    size_t esc = json_escape_append(answer, payload + offset,
+                                    sizeof(payload) - offset);
+    if (esc == 0 && answer[0] != 0) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"SDP escape overflow\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += esc;
 
-    offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
-                                "\"}");
+    n = snprintf(payload + offset, sizeof(payload) - offset, "\"}");
+    if (n < 0 || (size_t)n >= sizeof(payload) - offset) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"payload overflow\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += (size_t) n;
 
     mg_http_reply(connection, 200, "Content-Type: application/json\r\n",
                   "%s", payload);
@@ -509,7 +660,12 @@ static void handle_status(Server *server,
         "\"encoder\":{\"name\":\"%s\",\"preference\":\"%s\","
         "\"bitrate_kbps\":%u,\"keyframe_seconds\":%u},"
         "\"http_port\":%u,"
+        "\"udp_port\":%u,"
+#ifdef USE_LIBPEER
+        "\"transport\":\"webrtc-libpeer\","
+#else
         "\"transport\":\"webrtc\","
+#endif
         "\"captured_frames\":%llu,"
         "\"encoded_frames\":%llu,"
         "\"au_dropped\":%llu,"
@@ -526,6 +682,7 @@ static void handle_status(Server *server,
         server->config->bitrate_kbps,
         server->config->keyframe_seconds,
         server->config->http_port,
+        server->config->udp_base_port,
         (unsigned long long) source_worker_captured(server->source_worker),
         (unsigned long long) encoder_worker_frames_encoded(server->encoder_worker),
         (unsigned long long) au_ring_dropped(server->ring));
@@ -648,6 +805,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     server->started_ms = now_ms();
 
     atomic_init(&server->force_idr, 0);
+    atomic_init(&server->rtc_active, 0);
 
     if (dtls_srtp_global_init() != 0) {
         fprintf(stderr, "server: DTLS global init failed\n");
@@ -749,7 +907,13 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     InterfaceInfo interfaces[16];
     size_t interface_count = collect_interfaces(interfaces, 16);
 
-    printf("\ncamstream %s ready\n", APP_VERSION);
+    printf("\ncamstream %s ready [%s]\n", APP_VERSION,
+#ifdef USE_LIBPEER
+           "libpeer backend - mbedTLS + libsrtp + usrsctp"
+#else
+           "native backend - OpenSSL + libsrtp2"
+#endif
+    );
 
     if (interface_count == 0) {
         printf("open http://localhost:%u/\n", config->http_port);
@@ -760,6 +924,22 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                interfaces[i].ip, config->http_port, interfaces[i].name);
     }
 
+#ifdef USE_LIBPEER
+    printf("udp media: managed internally by libpeer (host candidates, one socket per PeerConnection)\n");
+    printf("firewall: allow TCP %u and UDP 50000-50100 (libpeer ephemeral)\n",
+           config->http_port);
+#else
+    printf("udp media ports %u-%u (one per viewer, up to %d)\n",
+           config->udp_base_port,
+           config->udp_base_port + MAX_RTC_SESSIONS - 1,
+           MAX_RTC_SESSIONS);
+    printf("firewall: allow TCP %u and UDP %u-%u\n",
+           config->http_port,
+           config->udp_base_port,
+           config->udp_base_port + MAX_RTC_SESSIONS - 1);
+#endif
+    printf("hint: open the page directly via LAN IP, not through a proxy. "
+           "Proxies cannot forward UDP media.\n");
     printf("\n");
 
     /*
@@ -774,6 +954,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
         struct pollfd fds[MAX_RTC_SESSIONS];
         int fd_count = 0;
         int timeout = 10;
+        int has_sessions = 0;
 
         for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
             RtcSession *session = server->sessions[i];
@@ -786,16 +967,26 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                 continue;
             }
 
-            fds[fd_count].fd = rtc_session_fd(session);
-            fds[fd_count].events = POLLIN;
-            fds[fd_count].revents = 0;
-            fd_count++;
+            has_sessions = 1;
+
+            int session_fd = rtc_session_fd(session);
+            if (session_fd >= 0) {
+                fds[fd_count].fd = session_fd;
+                fds[fd_count].events = POLLIN;
+                fds[fd_count].revents = 0;
+                fd_count++;
+            }
 
             int dtls_timeout = rtc_session_dtls_timeout_ms(session);
 
             if (dtls_timeout >= 0 && dtls_timeout < timeout) {
                 timeout = dtls_timeout > 0 ? dtls_timeout : 0;
             }
+        }
+
+        if (!has_sessions) {
+            /* Idle: no viewers, save CPU and avoid busy loop */
+            timeout = 100;
         }
 
         if (fd_count > 0) {
@@ -896,7 +1087,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
             }
         }
 
-        server->rtc_active = live_sessions > 0;
+        atomic_store(&server->rtc_active, live_sessions > 0 ? 1 : 0);
     }
 
     printf("\nshutting down\n");

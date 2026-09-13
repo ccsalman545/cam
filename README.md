@@ -84,8 +84,9 @@ procedure, read `docs/20_webrtc_zero_latency.md` and then
 14. [Troubleshooting](#troubleshooting)
 15. [Repository layout](#repository-layout)
 16. [libpeer Phase 3](docs/18_libpeer_phase3.md)
-17. [Execution roadmap](docs/19_execution_roadmap.md)
-18. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
+17. [libpeer Runtime - Fully Migrated](docs/21_libpeer_runtime.md)
+18. [Execution roadmap](docs/19_execution_roadmap.md)
+19. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
 
 ## Features
 
@@ -634,21 +635,38 @@ Server log messages worth knowing:
 - `rtc <id>: keyframe requested (pli/fir)`: viewer asked for a refresh.
 - `rtc <id>: idle timeout` / `closed`: session ended.
 
-## libpeer Phase 3
+## libpeer Phase 3 - Fully Migrated Runtime
 
-This repository's default server already implements the complete low-latency
-browser path in native C. An optional, isolated libpeer build is available
-for ARM/Linux evaluation:
+Two backends are now available:
 
+- **Native** (`build/camstream`): ICE-lite + DTLS 1.2 + SRTP + RTP H.264 in own C code,
+  deps `libssl-dev`, `libsrtp2-dev`, `libx264-dev`, vendored `mongoose.c` - **minimal**
+- **libpeer** (`build/camstream-libpeer`): sepfy/libpeer PeerConnection (mbedTLS + bundled
+  libsrtp, usrsctp, cJSON), same V4L2/test pipeline and Mongoose signaling - **spec compliant**
+
+Build native (minimal):
+```sh
+sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev
+make -j2
+./build/camstream --test --encoder sw --listen 0.0.0.0 --http-port 8080
 ```
+
+Build libpeer (fully migrated runtime per Phase 3 spec):
+```sh
+sudo apt install -y git cmake build-essential libx264-dev
 make libpeer
-# or: TARGET=aarch64-linux-gnu make libpeer
+make camstream-libpeer -j2
+./build/camstream-libpeer --test --encoder sw --listen 0.0.0.0 --http-port 8000
 ```
 
-It is intentionally not linked into `camstream`: libpeer has a separate
-mbedTLS/libsrtp/usrsctp dependency graph and different peer/signaling
-callbacks. The migration boundary, build details and Ethernet acceptance
-checklist are documented in [`docs/18_libpeer_phase3.md`](docs/18_libpeer_phase3.md).
+The libpeer binary:
+- Uses `src/webrtc/webrtc_session_libpeer.c` + `libpeer_global.c` (peer_init, PeerConnection per viewer)
+- Video path: V4L2/test -> FrameHub -> H264 (V4L2 M2M or x264) -> AU ring -> `peer_connection_send_video()`
+- Signaling: Mongoose `POST /rtc/offer` with raw SDP, answer from `peer_connection_create_answer()`
+- Media: libpeer manages UDP, ICE host candidates, DTLS-SRTP internally, `peer_connection_loop()` in main tick
+- Browser: same `RTCPeerConnection` JS, works offline RJ45 `192.168.1.10 <-> 192.168.1.20`
+
+Details: `docs/21_libpeer_runtime.md` (new) and `docs/18_libpeer_phase3.md` (original evaluation).
 
 ## Repository layout
 
