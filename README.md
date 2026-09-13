@@ -612,6 +612,7 @@ include/
                 source_worker.h, encoder_worker.h
   webrtc/       ice_lite.h, dtls_srtp.h, rtp_h264.h, rtcp.h, sdp.h,
                 webrtc_session.h
+  vision/       frame_matrix.h (profiles, motion search, mosaic export)
 src/
   camstream_main.c   entry point, signal handling
   app/               app_config.c (CLI), app_server.c (HTTP + main loop),
@@ -637,6 +638,7 @@ docs/
   16_protocol_reference.md  SDP/STUN/DTLS/SRTP/RTP/RTCP tables
   17_troubleshooting.md   symptom by symptom guide
   18_libpeer_phase3.md     libpeer build and migration boundary
+  19_execution_roadmap.md  phases 1 through 5 and acceptance checklist
 Makefile
 ```
 
