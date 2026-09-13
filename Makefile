@@ -103,9 +103,15 @@ APP_LIBS = $(DEP_LIBDIRS) -lssl -lcrypto -lsrtp2 -lpthread $(X264_LIB) -lm
 
 # Rules ------------------------------------------------------------------
 
-.PHONY: all camstream clean help test
+.PHONY: all camstream libpeer clean help test
 
 all: camstream
+
+# Optional: clone and build upstream libpeer in ignored build/ directories.
+# This is deliberately separate: libpeer uses mbedTLS and its own SRTP
+# dependency graph, while camstream uses OpenSSL/libsrtp2.
+libpeer:
+	tools/setup-libpeer.sh
 
 camstream: $(BUILD_DIR)/camstream
 
@@ -144,6 +150,7 @@ clean:
 help:
 	@echo "targets:"
 	@echo "  make            build build/camstream (WebRTC server)"
+	@echo "  make libpeer    clone/build upstream libpeer in build/ (optional)"
 	@echo "  make clean      remove build/"
 	@echo ""
 	@echo "overrides:"

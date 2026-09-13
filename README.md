@@ -37,6 +37,7 @@ built in web page and the WebRTC signaling HTTP API.
 12. [Verification checklist](#verification-checklist)
 13. [Troubleshooting](#troubleshooting)
 14. [Repository layout](#repository-layout)
+15. [libpeer Phase 3](docs/18_libpeer_phase3.md)
 
 ## Features
 
@@ -585,6 +586,22 @@ Server log messages worth knowing:
 - `rtc <id>: keyframe requested (pli/fir)`: viewer asked for a refresh.
 - `rtc <id>: idle timeout` / `closed`: session ended.
 
+## libpeer Phase 3
+
+This repository's default server already implements the complete low-latency
+browser path in native C. An optional, isolated libpeer build is available
+for ARM/Linux evaluation:
+
+```
+make libpeer
+# or: TARGET=aarch64-linux-gnu make libpeer
+```
+
+It is intentionally not linked into `camstream`: libpeer has a separate
+mbedTLS/libsrtp/usrsctp dependency graph and different peer/signaling
+callbacks. The migration boundary, build details and Ethernet acceptance
+checklist are documented in [`docs/18_libpeer_phase3.md`](docs/18_libpeer_phase3.md).
+
 ## Repository layout
 
 ```
@@ -619,6 +636,7 @@ docs/
   15_optimization_notes.md
   16_protocol_reference.md  SDP/STUN/DTLS/SRTP/RTP/RTCP tables
   17_troubleshooting.md   symptom by symptom guide
+  18_libpeer_phase3.md     libpeer build and migration boundary
 Makefile
 ```
 
