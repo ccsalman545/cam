@@ -67,6 +67,7 @@ typedef struct {
     atomic_int rtc_active;
 
     RtcSession *sessions[MAX_RTC_SESSIONS];
+    uint64_t sessions_total;    /* every session ever created */
 
     uint64_t started_ms;
     volatile sig_atomic_t *stop_flag;
@@ -543,6 +544,7 @@ static void handle_rtc_offer(Server *server,
     }
 
     server->sessions[slot] = session;
+    server->sessions_total++;
     atomic_store(&server->rtc_active, 1);
 
     /*
@@ -568,6 +570,7 @@ static void handle_rtc_offer(Server *server,
                       "{\"error\":\"answer too large\"}");
         rtc_session_destroy(session);
         server->sessions[slot] = NULL;
+        server->sessions_total--;
         atomic_store(&server->rtc_active, 0);
         return;
     }
@@ -580,6 +583,7 @@ static void handle_rtc_offer(Server *server,
                       "{\"error\":\"SDP escape overflow\"}");
         rtc_session_destroy(session);
         server->sessions[slot] = NULL;
+        server->sessions_total--;
         atomic_store(&server->rtc_active, 0);
         return;
     }
@@ -591,6 +595,7 @@ static void handle_rtc_offer(Server *server,
                       "{\"error\":\"payload overflow\"}");
         rtc_session_destroy(session);
         server->sessions[slot] = NULL;
+        server->sessions_total--;
         atomic_store(&server->rtc_active, 0);
         return;
     }
@@ -652,6 +657,9 @@ static void handle_status(Server *server,
 
     uint64_t uptime_s = (now_ms() - server->started_ms) / 1000;
 
+    EncoderWorkerStats encoder_stats;
+    encoder_worker_get_stats(server->encoder_worker, &encoder_stats);
+
     offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
         "{\"version\":\"%s\","
         "\"uptime_sec\":%llu,"
@@ -669,6 +677,13 @@ static void handle_status(Server *server,
         "\"captured_frames\":%llu,"
         "\"encoded_frames\":%llu,"
         "\"au_dropped\":%llu,"
+        "\"encoder_active\":%d,"
+        "\"sessions_total\":%llu,"
+        "\"encoder_frames_seen\":%llu,"
+        "\"encoder_skipped_idle\":%llu,"
+        "\"encoder_skipped_mismatch\":%llu,"
+        "\"encoder_skipped_bad_size\":%llu,"
+        "\"encoder_no_output\":%llu,"
         "\"sessions\":[",
         APP_VERSION,
         (unsigned long long) uptime_s,
@@ -685,7 +700,14 @@ static void handle_status(Server *server,
         server->config->udp_base_port,
         (unsigned long long) source_worker_captured(server->source_worker),
         (unsigned long long) encoder_worker_frames_encoded(server->encoder_worker),
-        (unsigned long long) au_ring_dropped(server->ring));
+        (unsigned long long) au_ring_dropped(server->ring),
+        atomic_load(&server->rtc_active) ? 1 : 0,
+        (unsigned long long) server->sessions_total,
+        (unsigned long long) encoder_stats.frames_seen,
+        (unsigned long long) encoder_stats.skipped_idle,
+        (unsigned long long) encoder_stats.skipped_mismatch,
+        (unsigned long long) encoder_stats.skipped_bad_size,
+        (unsigned long long) encoder_stats.no_output);
 
     int session_count = 0;
 

@@ -207,6 +207,16 @@ $(BUILD_DIR)/test_vision: tests/test_vision.c src/vision/frame_matrix.c include/
 	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude/vision \
 	      tests/test_vision.c src/vision/frame_matrix.c -o $@
 
+$(BUILD_DIR)/test_encoder_worker: tests/test_encoder_worker.c \
+        src/media/encoder_worker.c src/media/frame_hub.c \
+        src/media/frame_pool.c src/media/au_ring.c \
+        src/media/yuv_convert.c include/media/encoder_worker.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
+	      tests/test_encoder_worker.c src/media/encoder_worker.c \
+	      src/media/frame_hub.c src/media/frame_pool.c \
+	      src/media/au_ring.c src/media/yuv_convert.c -o $@ -lpthread
+
 $(BUILD_DIR)/vision-capture: src/vision/vision_capture.c src/vision/vision_worker.c \
         src/vision/frame_matrix.c src/media/source_worker.c src/media/frame_hub.c \
         src/media/frame_pool.c src/media/v4l2_source.c src/media/test_source.c \
@@ -222,9 +232,10 @@ vision-capture: $(BUILD_DIR)/vision-capture
 vision-test: $(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_vision
 
-test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision
+test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_worker
 	$(BUILD_DIR)/test_stun
 	$(BUILD_DIR)/test_vision
+	$(BUILD_DIR)/test_encoder_worker
 
 clean:
 	rm -rf $(BUILD_DIR)
