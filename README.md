@@ -612,7 +612,8 @@ include/
                 source_worker.h, encoder_worker.h
   webrtc/       ice_lite.h, dtls_srtp.h, rtp_h264.h, rtcp.h, sdp.h,
                 webrtc_session.h
-  vision/       frame_matrix.h (profiles, motion search, mosaic export)
+  vision/       frame_matrix.h, vision_worker.h (profiles, motion search,
+                newest-frame mosaic worker)
 src/
   camstream_main.c   entry point, signal handling
   app/               app_config.c (CLI), app_server.c (HTTP + main loop),
@@ -641,6 +642,15 @@ docs/
   19_execution_roadmap.md  phases 1 through 5 and acceptance checklist
 Makefile
 ```
+
+Vision smoke pipeline:
+
+```
+make vision-capture
+./build/vision-capture --test -W 640 -H 480 -F 30 -s 10 -o build/mosaic
+```
+
+This writes a grayscale PGM and an intensity-derived OBJ mosaic.
 
 ## Version
 

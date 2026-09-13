@@ -112,6 +112,23 @@ Run the unit test:
 make vision-test
 ```
 
+Run the integrated newest-frame capture/vision pipeline without a camera:
+
+```sh
+make vision-capture
+./build/vision-capture --test -W 640 -H 480 -F 30 -s 10 -o build/mosaic
+# writes build/mosaic.pgm and build/mosaic.obj
+```
+
+Use a real V4L2 camera by replacing `--test`:
+
+```sh
+./build/vision-capture --device /dev/video0 -W 1024 -H 768 -F 30 -s 0 -o build/mosaic
+```
+
+`-s 0` runs until Ctrl-C. The worker uses a keep-newest mailbox, so a slow
+matrix operation drops stale frames rather than blocking camera capture.
+
 The current camera source produces YUYV or planar YU12. For a raw processing
 pipeline, consume the frame before H.264 conversion, copy it into a buffer
 owned by the vision worker, then release the V4L2 buffer. Never retain a V4L2

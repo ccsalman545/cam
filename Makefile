@@ -103,7 +103,7 @@ APP_LIBS = $(DEP_LIBDIRS) -lssl -lcrypto -lsrtp2 -lpthread $(X264_LIB) -lm
 
 # Rules ------------------------------------------------------------------
 
-.PHONY: all camstream libpeer clean help test vision-test
+.PHONY: all camstream libpeer vision-capture clean help test vision-test
 
 all: camstream
 
@@ -145,6 +145,18 @@ $(BUILD_DIR)/test_vision: tests/test_vision.c src/vision/frame_matrix.c include/
 	@mkdir -p $(dir $@)
 	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude/vision \
 	      tests/test_vision.c src/vision/frame_matrix.c -o $@
+
+$(BUILD_DIR)/vision-capture: src/vision/vision_capture.c src/vision/vision_worker.c \
+        src/vision/frame_matrix.c src/media/source_worker.c src/media/frame_hub.c \
+        src/media/frame_pool.c src/media/v4l2_source.c src/media/test_source.c \
+        include/vision/vision_worker.h include/vision/frame_matrix.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media -Iinclude/vision \
+	      src/vision/vision_capture.c src/vision/vision_worker.c src/vision/frame_matrix.c \
+	      src/media/source_worker.c src/media/frame_hub.c src/media/frame_pool.c \
+	      src/media/v4l2_source.c src/media/test_source.c -o $@ -lpthread -lm
+
+vision-capture: $(BUILD_DIR)/vision-capture
 
 vision-test: $(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_vision
