@@ -640,6 +640,7 @@ docs/
   17_troubleshooting.md   symptom by symptom guide
   18_libpeer_phase3.md     libpeer build and migration boundary
   19_execution_roadmap.md  phases 1 through 5 and acceptance checklist
+  20_webrtc_zero_latency.md offline Pi-to-laptop WebRTC deployment
 Makefile
 ```
 

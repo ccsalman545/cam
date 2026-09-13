@@ -106,6 +106,9 @@ static void *encoder_thread(void *arg)
                       worker->width, worker->height);
         }
 
+        /* The frame may be recycled immediately after unref; retain all
+         * metadata needed by the encoded access unit before releasing it. */
+        uint64_t pts_us = frame->timestamp_us;
         int force_idr = atomic_exchange(worker->force_idr, 0);
 
         size_t au_size = 0;
@@ -113,7 +116,7 @@ static void *encoder_thread(void *arg)
 
         int result = h264_encoder_encode(worker->encoder,
                                          plane_y, plane_u, plane_v,
-                                         frame->timestamp_us,
+                                         pts_us,
                                          force_idr,
                                          worker->au_buffer,
                                          AU_SCRATCH_CAPACITY,
@@ -147,7 +150,7 @@ static void *encoder_thread(void *arg)
         if (au_ring_push(worker->ring,
                          worker->au_buffer,
                          au_size,
-                         frame->timestamp_us,
+                         pts_us,
                          is_idr) != 0) {
             fprintf(stderr, "encode worker: access unit too large\n");
         }
