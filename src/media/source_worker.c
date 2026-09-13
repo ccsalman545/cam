@@ -9,6 +9,7 @@
 #include "source_worker.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -18,7 +19,7 @@ struct SourceWorker {
     FrameHub *hub;
 
     pthread_t thread;
-    int running;
+    atomic_int running;
     int started;
 
     uint64_t captured;

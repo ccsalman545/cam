@@ -4,7 +4,7 @@
  * Encoder abstraction for the WebRTC video track.
  *
  * Backends:
- *   - H264_ENCODER_HW: V4L2 stateless memory-to-memory encoder.
+ *   - H264_ENCODER_HW: V4L2 stateful memory-to-memory encoder.
  *     On Raspberry Pi this is the bcm2835-codec H.264 encoder
  *     (usually /dev/video11), which offloads all encoding work
  *     to the GPU or hardware block.

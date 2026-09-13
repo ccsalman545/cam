@@ -330,9 +330,20 @@ static void handle_rtc_offer(Server *server,
                              struct mg_connection *connection,
                              struct mg_http_message *message)
 {
+    char request_body[16384];
+
+    if (message->body.len >= sizeof(request_body)) {
+        mg_http_reply(connection, 413, "Content-Type: application/json\r\n",
+                      "{\"error\":\"signaling request is too large\"}");
+        return;
+    }
+
+    memcpy(request_body, message->body.buf, message->body.len);
+    request_body[message->body.len] = 0;
+
     char sdp[8192];
 
-    if (json_get_string(message->body.buf, "sdp", sdp, sizeof(sdp)) != 0) {
+    if (json_get_string(request_body, "sdp", sdp, sizeof(sdp)) != 0) {
         mg_http_reply(connection, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"missing sdp field\"}");
         return;
@@ -445,9 +456,19 @@ static void handle_rtc_close(Server *server,
                              struct mg_connection *connection,
                              struct mg_http_message *message)
 {
+    if (message->body.len >= 512) {
+        mg_http_reply(connection, 413, "Content-Type: application/json\r\n",
+                      "{\"error\":\"close request is too large\"}");
+        return;
+    }
+
+    char request_body[512];
+    memcpy(request_body, message->body.buf, message->body.len);
+    request_body[message->body.len] = 0;
+
     long id = 0;
 
-    if (json_get_int(message->body.buf, "session_id", &id) != 0) {
+    if (json_get_int(request_body, "session_id", &id) != 0) {
         mg_http_reply(connection, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"missing session_id\"}");
         return;

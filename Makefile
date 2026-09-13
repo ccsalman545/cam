@@ -103,9 +103,15 @@ APP_LIBS = $(DEP_LIBDIRS) -lssl -lcrypto -lsrtp2 -lpthread $(X264_LIB) -lm
 
 # Rules ------------------------------------------------------------------
 
-.PHONY: all camstream clean help test
+.PHONY: all camstream libpeer vision-capture clean help test vision-test
 
 all: camstream
+
+# Optional: clone and build upstream libpeer in ignored build/ directories.
+# This is deliberately separate: libpeer uses mbedTLS and its own SRTP
+# dependency graph, while camstream uses OpenSSL/libsrtp2.
+libpeer:
+	tools/setup-libpeer.sh
 
 camstream: $(BUILD_DIR)/camstream
 
@@ -135,8 +141,29 @@ $(BUILD_DIR)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/i
 	$(CC) $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) \
 	      tests/test_stun.c src/webrtc/ice_lite.c -o $@ $(DEP_LIBDIRS) -lcrypto
 
-test: $(BUILD_DIR)/test_stun
+$(BUILD_DIR)/test_vision: tests/test_vision.c src/vision/frame_matrix.c include/vision/frame_matrix.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude/vision \
+	      tests/test_vision.c src/vision/frame_matrix.c -o $@
+
+$(BUILD_DIR)/vision-capture: src/vision/vision_capture.c src/vision/vision_worker.c \
+        src/vision/frame_matrix.c src/media/source_worker.c src/media/frame_hub.c \
+        src/media/frame_pool.c src/media/v4l2_source.c src/media/test_source.c \
+        include/vision/vision_worker.h include/vision/frame_matrix.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media -Iinclude/vision \
+	      src/vision/vision_capture.c src/vision/vision_worker.c src/vision/frame_matrix.c \
+	      src/media/source_worker.c src/media/frame_hub.c src/media/frame_pool.c \
+	      src/media/v4l2_source.c src/media/test_source.c -o $@ -lpthread -lm
+
+vision-capture: $(BUILD_DIR)/vision-capture
+
+vision-test: $(BUILD_DIR)/test_vision
+	$(BUILD_DIR)/test_vision
+
+test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_stun
+	$(BUILD_DIR)/test_vision
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -144,6 +171,7 @@ clean:
 help:
 	@echo "targets:"
 	@echo "  make            build build/camstream (WebRTC server)"
+	@echo "  make libpeer    clone/build upstream libpeer in build/ (optional)"
 	@echo "  make clean      remove build/"
 	@echo ""
 	@echo "overrides:"

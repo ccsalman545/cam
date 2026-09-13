@@ -170,6 +170,16 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
         return -1;
     }
 
+    if (config->width < 2 || config->width > 4096 ||
+        config->height < 2 || config->height > 4096 ||
+        config->fps == 0 || config->fps > 120 ||
+        config->http_port == 0 || config->udp_base_port == 0 ||
+        config->bitrate_kbps == 0 || config->keyframe_seconds == 0) {
+        fprintf(stderr, "invalid configuration: dimensions, fps, ports, bitrate "
+                        "and keyframe interval must be positive and in range\n");
+        return -1;
+    }
+
     return 0;
 }
 
