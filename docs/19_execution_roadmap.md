@@ -5,7 +5,7 @@ checkout. The repository has moved beyond the original Phase 2 prototype:
 `camstream` is now the integrated C server, and its defaults are HTTP `8080`
 and media UDP `50000` through `50007` rather than HTTP `8000`.
 
-## Phase 1 — direct Raspberry Pi link
+## Phase 1 - direct Raspberry Pi link
 
 ### Pi
 
@@ -45,7 +45,7 @@ For a CSI camera on modern Raspberry Pi OS, prefer `rpicam-*`; the old
 `raspi-config` camera-interface toggle is not required on current libcamera
 systems. Verify the actual nodes with `v4l2-ctl --list-devices`.
 
-## Phase 2 — Mongoose server
+## Phase 2 - Mongoose server
 
 The current server embeds Mongoose and already serves the dashboard and
 signaling API. It does not use a `/web_root` directory because the page is
@@ -62,7 +62,7 @@ Open `http://192.168.1.10:8080/` from the host. The old outline's port 8000
 is valid only for a separate Phase 2-only server; do not run both servers on
 the same port.
 
-## Phase 3 — WebRTC/libpeer decision
+## Phase 3 - WebRTC/libpeer decision
 
 The existing server already provides the complete browser video path with
 V4L2/test capture, H.264, RTP, ICE-lite, DTLS-SRTP, RTCP and a native
@@ -95,7 +95,7 @@ sudo ufw allow 50000:50007/udp
 
 The browser must access the Pi by its Ethernet IP, not `localhost`.
 
-## Phase 4 — raw matrix extraction
+## Phase 4 - raw matrix extraction
 
 The new `include/vision/frame_matrix.h` and
 `src/vision/frame_matrix.c` provide a dependency-free foundation:
@@ -143,7 +143,7 @@ For 1024x768 grayscale, allocate at least:
 Use a bounded queue or newest-frame mailbox so matrix processing cannot stall
 camera capture indefinitely.
 
-## Phase 5 — spatial mapping and stitching
+## Phase 5 - spatial mapping and stitching
 
 The matrix module includes `VisionMosaic`, which maintains a sum and sample
 count per output pixel. Overlaps are averaged and can be exported as:

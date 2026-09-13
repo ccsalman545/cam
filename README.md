@@ -21,31 +21,79 @@ built in web page and the WebRTC signaling HTTP API.
                     Mongoose: web page + WebRTC signaling on one HTTP port
 ```
 
+## Start here: offline Pi to laptop WebRTC
+
+This is the primary deployment path. The Raspberry Pi owns the camera and
+runs `camstream`. The laptop runs only a browser. The Ethernet cable carries
+HTTP signaling over TCP and WebRTC media over UDP. No Internet, cloud service,
+STUN server, TURN server, container or WebSocket video transport is required.
+
+Pi address:
+
+```text
+192.168.1.10/24
+```
+
+Laptop address:
+
+```text
+192.168.1.20/24
+```
+
+Build and run on the Pi:
+
+```sh
+sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev
+make -j2
+./build/camstream --device /dev/video0 --encoder auto --listen 0.0.0.0
+```
+
+Open this URL on the laptop:
+
+```text
+http://192.168.1.10:8080/
+```
+
+If the camera or hardware encoder is not ready, verify the WebRTC path first
+with the synthetic source:
+
+```sh
+./build/camstream --test --encoder sw --listen 0.0.0.0
+```
+
+Allow TCP port `8080` and UDP ports `50000` through `50007` on the Pi. The
+browser must use the Pi Ethernet address, not `localhost`. For the complete
+procedure, read `docs/20_webrtc_zero_latency.md` and then
+`docs/17_troubleshooting.md` if a state does not become `streaming`.
+
 ## Table of contents
 
-1. [Features](#features)
-2. [Requirements](#requirements)
-3. [Build](#build)
-4. [Run](#run)
-5. [Command line reference](#command-line-reference)
-6. [Web UI](#web-ui)
-7. [HTTP API](#http-api)
-8. [Architecture](#architecture)
-9. [WebRTC internals](#webrtc-internals)
-10. [Multi viewer behavior](#multi-viewer-behavior)
-11. [Raspberry Pi](#raspberry-pi)
-12. [Verification checklist](#verification-checklist)
-13. [Troubleshooting](#troubleshooting)
-14. [Repository layout](#repository-layout)
-15. [libpeer Phase 3](docs/18_libpeer_phase3.md)
+1. [Start here: offline Pi to laptop WebRTC](#start-here-offline-pi-to-laptop-webrtc)
+2. [Features](#features)
+3. [Requirements](#requirements)
+4. [Build](#build)
+5. [Run](#run)
+6. [Command line reference](#command-line-reference)
+7. [Web UI](#web-ui)
+8. [HTTP API](#http-api)
+9. [Architecture](#architecture)
+10. [WebRTC internals](#webrtc-internals)
+11. [Multi viewer behavior](#multi-viewer-behavior)
+12. [Raspberry Pi](#raspberry-pi)
+13. [Verification checklist](#verification-checklist)
+14. [Troubleshooting](#troubleshooting)
+15. [Repository layout](#repository-layout)
+16. [libpeer Phase 3](docs/18_libpeer_phase3.md)
+17. [Execution roadmap](docs/19_execution_roadmap.md)
+18. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
 
 ## Features
 
 - Real WebRTC media transport (RFC 8839 stack built natively in C):
   ICE lite (RFC 5245/5389), DTLS 1.2 (RFC 6347/5764), SRTP (RFC 3711,
   AES_CM_128_HMAC_SHA1_80), RTP H.264 (RFC 6184).
-- Hardware or software H.264 encoding: V4L2 stateless M2M encoders
-  (bcm2835 on Raspberry Pi, codel, etc.) with automatic fallback to
+- Hardware or software H.264 encoding: V4L2 memory-to-memory encoders
+  (bcm2835 on Raspberry Pi, cedrus, etc.) with automatic fallback to
   libx264 when the hardware encoder is not available.
 - Up to 8 concurrent viewers, each with its own SRTP keys, RTP sequence
   space, retransmission cache and DTLS session.
@@ -209,7 +257,7 @@ first private IPv4 address.
 
 Encoder selection:
 
-- `auto` (default): try the V4L2 stateless H.264 M2M encoder first,
+- `auto` (default): try the V4L2 memory-to-memory H.264 encoder first,
   fall back to libx264.
 - `hw`: V4L2 M2M only, fail if none works.
 - `hw:/dev/videoNN`: force a specific device node.
@@ -401,7 +449,7 @@ and remembers the validated peer address.
 
 ### DTLS 1.2
 
-- The server acts as the DTLS server on a self signed 2048 bit RSA
+- The server acts as the DTLS server on a self signed P-256 EC
   certificate (generated at startup, one per process).
 - The browser verifies the certificate SHA-256 fingerprint against the
   SDP answer; the server verifies the browser's fingerprint from the
@@ -485,7 +533,7 @@ sudo usermod -aG video $USER     # if /dev/video0 is not readable
 
 Notes:
 
-- The bcm2835 hardware encoder exposes `/dev/video11` (stateless H.264
+- The bcm2835 hardware encoder exposes `/dev/video11` (memory-to-memory H.264
   M2M). It accepts NV12 (preferred) or YU12; the code handles both and
   interleaves I420 to NV12 in the input path. Output is Annex B
   directly from the capture queue.

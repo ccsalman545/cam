@@ -50,7 +50,7 @@ Required traffic:
 | Traffic | Protocol | Port |
 | --- | --- | --- |
 | UI and SDP offer/answer | TCP | 8080 |
-| STUN, DTLS, SRTP, RTCP | UDP | 50000–50007 |
+| STUN, DTLS, SRTP, RTCP | UDP | 50000-50007 |
 
 The application allocates one UDP port per viewer, beginning at `50000`.
 
