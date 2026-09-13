@@ -24,7 +24,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef USE_LIBPEER
+/* libpeer uses mbedTLS internally, no OpenSSL needed */
+#else
+#if __has_include(<openssl/rand.h>)
 #include <openssl/rand.h>
+#endif
+#endif
 
 #include "mongoose.h"
 
@@ -483,7 +489,31 @@ static void handle_rtc_offer(Server *server,
 
     uint32_t session_id = 0;
 
-    RAND_bytes((unsigned char *) &session_id, sizeof(session_id));
+    /* Secure random session id without requiring OpenSSL */
+    {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            fread(&session_id, 1, sizeof(session_id), f);
+            fclose(f);
+        }
+#ifdef USE_LIBPEER
+        /* libpeer mode - no RAND_bytes */
+        if (session_id == 0) {
+            session_id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)server ^ (uint32_t)slot;
+            session_id = session_id * 2654435761u;
+        }
+#else
+#if __has_include(<openssl/rand.h>)
+        if (session_id == 0) {
+            RAND_bytes((unsigned char*)&session_id, sizeof(session_id));
+        }
+#endif
+        if (session_id == 0) {
+            session_id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)server ^ (uint32_t)slot;
+            session_id = session_id * 2654435761u;
+        }
+#endif
+    }
     if (session_id == 0) {
         session_id = 1;
     }
@@ -495,6 +525,7 @@ static void handle_rtc_offer(Server *server,
         .extra_ips = extra_count ? extra_ip_ptrs : NULL,
         .extra_ip_count = extra_count,
         .offer = offer,
+        .remote_sdp = sdp,
         .server = server,
         .on_idr_request = session_on_idr_request,
         .on_closed = session_on_closed
@@ -630,7 +661,11 @@ static void handle_status(Server *server,
         "\"bitrate_kbps\":%u,\"keyframe_seconds\":%u},"
         "\"http_port\":%u,"
         "\"udp_port\":%u,"
+#ifdef USE_LIBPEER
+        "\"transport\":\"webrtc-libpeer\","
+#else
         "\"transport\":\"webrtc\","
+#endif
         "\"captured_frames\":%llu,"
         "\"encoded_frames\":%llu,"
         "\"au_dropped\":%llu,"
@@ -872,7 +907,13 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     InterfaceInfo interfaces[16];
     size_t interface_count = collect_interfaces(interfaces, 16);
 
-    printf("\ncamstream %s ready\n", APP_VERSION);
+    printf("\ncamstream %s ready [%s]\n", APP_VERSION,
+#ifdef USE_LIBPEER
+           "libpeer backend - mbedTLS + libsrtp + usrsctp"
+#else
+           "native backend - OpenSSL + libsrtp2"
+#endif
+    );
 
     if (interface_count == 0) {
         printf("open http://localhost:%u/\n", config->http_port);
@@ -883,6 +924,11 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                interfaces[i].ip, config->http_port, interfaces[i].name);
     }
 
+#ifdef USE_LIBPEER
+    printf("udp media: managed internally by libpeer (host candidates, one socket per PeerConnection)\n");
+    printf("firewall: allow TCP %u and UDP 50000-50100 (libpeer ephemeral)\n",
+           config->http_port);
+#else
     printf("udp media ports %u-%u (one per viewer, up to %d)\n",
            config->udp_base_port,
            config->udp_base_port + MAX_RTC_SESSIONS - 1,
@@ -891,6 +937,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
            config->http_port,
            config->udp_base_port,
            config->udp_base_port + MAX_RTC_SESSIONS - 1);
+#endif
     printf("hint: open the page directly via LAN IP, not through a proxy. "
            "Proxies cannot forward UDP media.\n");
     printf("\n");
@@ -921,10 +968,14 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
             }
 
             has_sessions = 1;
-            fds[fd_count].fd = rtc_session_fd(session);
-            fds[fd_count].events = POLLIN;
-            fds[fd_count].revents = 0;
-            fd_count++;
+
+            int session_fd = rtc_session_fd(session);
+            if (session_fd >= 0) {
+                fds[fd_count].fd = session_fd;
+                fds[fd_count].events = POLLIN;
+                fds[fd_count].revents = 0;
+                fd_count++;
+            }
 
             int dtls_timeout = rtc_session_dtls_timeout_ms(session);
 

@@ -22,7 +22,11 @@ void app_config_defaults(AppConfig *config)
     config->fps = 30;
 
     config->listen = "0.0.0.0";
+#ifdef USE_LIBPEER
+    config->http_port = 8000;
+#else
     config->http_port = 8080;
+#endif
     config->udp_base_port = 50000;
 
     config->bitrate_kbps = 2500;

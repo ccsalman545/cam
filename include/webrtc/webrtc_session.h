@@ -57,6 +57,7 @@ typedef struct {
     const char **extra_ips;         /* additional host candidates (local interfaces) */
     size_t extra_ip_count;
     SdpOffer offer;                 /* parsed browser offer */
+    const char *remote_sdp;         /* raw offer SDP (required for libpeer backend) */
 
     /* Server hooks. */
     void *server;
