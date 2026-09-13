@@ -78,6 +78,7 @@ static void sleep_until(uint64_t deadline_us)
 
 /*
  * Draw one 3x5 digit scaled by 'scale', YUYV plane, at x0, y0.
+ * YUYV: 4 bytes = 2 pixels (Y0 U Y1 V). Correctly handle even/odd x.
  */
 static void draw_digit(uint8_t *buffer,
                        uint32_t stride,
@@ -86,30 +87,40 @@ static void draw_digit(uint8_t *buffer,
                        uint32_t scale,
                        int digit)
 {
+    uint32_t width = stride / 2;
+
     for (uint32_t gy = 0; gy < 5; gy++) {
         uint8_t bits = DIGIT_GLYPHS[digit][gy];
 
         for (uint32_t gx = 0; gx < 3; gx++) {
             int on = (bits >> (2 - gx)) & 1;
+            if (!on) {
+                continue;
+            }
 
             for (uint32_t sy = 0; sy < scale; sy++) {
-                uint8_t *row = buffer + (size_t) (y0 + gy * scale + sy) * stride;
+                uint32_t row_y = y0 + gy * scale + sy;
+                if (row_y >= 10000) { /* sanity, height checked by caller */
+                    continue;
+                }
+                uint8_t *row = buffer + (size_t) row_y * stride;
 
                 for (uint32_t sx = 0; sx < scale; sx++) {
                     uint32_t x = x0 + gx * scale + sx;
 
-                    if (x + 1 >= stride / 2) {
+                    if (x >= width) {
                         continue;
                     }
 
-                    uint8_t *pix = row + (size_t) x * 4;
+                    uint8_t *mac = row + (size_t) (x / 2) * 4;
 
-                    if (on) {
-                        pix[0] = 235;   /* Y */
-                        pix[1] = 128;   /* U */
-                        pix[2] = 235;   /* Y */
-                        pix[3] = 128;   /* V */
+                    if ((x & 1) == 0) {
+                        mac[0] = 235;   /* Y0 */
+                    } else {
+                        mac[2] = 235;   /* Y1 */
                     }
+                    mac[1] = 128;   /* U */
+                    mac[3] = 128;   /* V */
                 }
             }
         }
@@ -178,19 +189,20 @@ static void render_frame(struct TestSource *impl, uint8_t *buffer)
     const uint32_t marker_size = height / 12;
     const uint32_t marker_row = bars_h + (height - bars_h) / 2 - marker_size / 2;
     const uint32_t sweep_steps = impl->fps > 1 ? impl->fps - 1 : 1;
-    const uint32_t marker_x =
+    uint32_t marker_x =
         (uint32_t) (((impl->sequence % impl->fps) * (width - marker_size)) /
                     sweep_steps);
+    marker_x &= ~1u; /* YUYV macropixel is 2 pixels, keep even for correct UV */
 
     for (uint32_t row = 0; row < marker_size && marker_row + row < height; row++) {
         uint8_t *out = buffer + (size_t) (marker_row + row) * stride;
 
-        for (uint32_t x = 0; x < marker_size && marker_x + x + 1 < width; x++) {
-            uint8_t *pix = out + (size_t) (marker_x + x) * 4;
-            pix[0] = 235;
-            pix[1] = 128;
-            pix[2] = 235;
-            pix[3] = 128;
+        for (uint32_t x = 0; x < marker_size && marker_x + x + 1 < width; x += 2) {
+            uint8_t *pix = out + (size_t) (marker_x + x) * 2;
+            pix[0] = 235; /* Y0 */
+            pix[1] = 128; /* U */
+            pix[2] = 235; /* Y1 */
+            pix[3] = 128; /* V */
         }
     }
 

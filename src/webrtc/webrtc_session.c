@@ -267,8 +267,25 @@ static void generate_credentials(char *ufrag, size_t ufrag_size,
     unsigned char raw[32];
 
     if (RAND_bytes(raw, sizeof(raw)) != 1) {
-        for (size_t i = 0; i < sizeof(raw); i++) {
-            raw[i] = (unsigned char) rand();
+        /* Fallback: try /dev/urandom, then time-based entropy */
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f != NULL) {
+            size_t got = fread(raw, 1, sizeof(raw), f);
+            fclose(f);
+            if (got != sizeof(raw)) {
+                /* partial read, fill rest with time */
+                uint64_t t = (uint64_t) time(NULL) ^ (uint64_t) clock();
+                for (size_t i = got; i < sizeof(raw); i++) {
+                    raw[i] ^= (unsigned char) (t >> (i % 8));
+                }
+            }
+        } else {
+            /* Last resort: mix time and pid */
+            uint64_t seed = (uint64_t) time(NULL) ^ (uint64_t) getpid() ^ (uint64_t) clock();
+            for (size_t i = 0; i < sizeof(raw); i++) {
+                seed = seed * 6364136223846793005ULL + 1;
+                raw[i] = (unsigned char) (seed >> 24);
+            }
         }
     }
 
@@ -287,6 +304,9 @@ static void generate_credentials(char *ufrag, size_t ufrag_size,
         pwd[pos++] = alphabet[raw[8 + i] % 52];
     }
     pwd[pos] = 0;
+
+    /* Wipe raw material */
+    memset(raw, 0, sizeof(raw));
 }
 
 int rtc_session_create(const RtcSessionConfig *config,

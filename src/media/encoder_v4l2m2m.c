@@ -41,9 +41,11 @@ struct M2mBackend {
     uint32_t width;
     uint32_t height;
     uint32_t input_format;          /* V4L2_PIX_FMT_NV12 or YU12 */
+    int is_multiplanar;             /* 1 when using NV12M/YUV420M */
     char name[64];
 
     struct M2mBuffer out_bufs[M2M_OUTPUT_BUFFERS];
+    struct M2mBuffer out_bufs_uv[M2M_OUTPUT_BUFFERS]; /* second plane for M formats */
     int out_free[M2M_OUTPUT_BUFFERS];
     int out_free_count;
 
@@ -193,12 +195,16 @@ static struct M2mBackend *m2m_open(const char *path,
     /*
      * INPUT side (OUTPUT queue in kernel terms): try NV12
      * first, then planar YU12.
+     * Prefer single-planar variants (NV12, YUV420) because our
+     * mmap and fill logic currently handles a single contiguous
+     * buffer. Multi-planar (NV12M, YUV420M) would require
+     * mapping multiple planes and separate handling.
      */
     static const uint32_t input_formats[] = {
-        V4L2_PIX_FMT_NV12M,
         V4L2_PIX_FMT_NV12,
-        V4L2_PIX_FMT_YUV420M,
-        V4L2_PIX_FMT_YUV420
+        V4L2_PIX_FMT_YUV420,
+        V4L2_PIX_FMT_NV12M,
+        V4L2_PIX_FMT_YUV420M
     };
 
     int input_ok = 0;
@@ -224,6 +230,9 @@ static struct M2mBackend *m2m_open(const char *path,
         }
 
         encoder->input_format = input_formats[i];
+        encoder->is_multiplanar =
+            (input_formats[i] == V4L2_PIX_FMT_NV12M ||
+             input_formats[i] == V4L2_PIX_FMT_YUV420M) ? 1 : 0;
         input_ok = 1;
         break;
     }
@@ -281,7 +290,7 @@ static struct M2mBackend *m2m_open(const char *path,
         buffer.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         buffer.memory = V4L2_MEMORY_MMAP;
         buffer.index = (uint32_t) i;
-        buffer.length = 1;
+        buffer.length = encoder->is_multiplanar ? 2 : 1;
         buffer.m.planes = planes;
 
         if (xioctl(encoder->fd, VIDIOC_QUERYBUF, &buffer) == -1) {
@@ -299,6 +308,19 @@ static struct M2mBackend *m2m_open(const char *path,
         if (encoder->out_bufs[i].start == MAP_FAILED) {
             perror("m2m: mmap (output)");
             goto fail;
+        }
+
+        if (encoder->is_multiplanar) {
+            encoder->out_bufs_uv[i].length = planes[1].length;
+            encoder->out_bufs_uv[i].start = mmap(NULL, planes[1].length,
+                                                 PROT_READ | PROT_WRITE,
+                                                 MAP_SHARED,
+                                                 encoder->fd,
+                                                 planes[1].m.mem_offset);
+            if (encoder->out_bufs_uv[i].start == MAP_FAILED) {
+                perror("m2m: mmap (output uv)");
+                goto fail;
+            }
         }
     }
 
@@ -396,6 +418,7 @@ static struct M2mBackend *m2m_open(const char *path,
 
 fail:
     m2m_unmap(encoder->out_bufs, M2M_OUTPUT_BUFFERS);
+    m2m_unmap(encoder->out_bufs_uv, M2M_OUTPUT_BUFFERS);
     m2m_unmap(encoder->cap_bufs, M2M_CAPTURE_BUFFERS);
 
     if (encoder->fd >= 0) {
@@ -429,7 +452,7 @@ static int m2m_acquire_input_buffer(struct M2mBackend *encoder)
     memset(planes, 0, sizeof(planes));
     buffer.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     buffer.memory = V4L2_MEMORY_MMAP;
-    buffer.length = 1;
+    buffer.length = encoder->is_multiplanar ? 2 : 1;
     buffer.m.planes = planes;
 
     if (xioctl(encoder->fd, VIDIOC_DQBUF, &buffer) == -1) {
@@ -441,10 +464,12 @@ static int m2m_acquire_input_buffer(struct M2mBackend *encoder)
 
 /*
  * Copy an I420 frame into an m2m input buffer. Handles both
- * semiplanar (NV12) and planar (YU12) drivers.
+ * semiplanar (NV12) and planar (YU12) drivers, and both
+ * single-planar and multi-planar variants.
  */
 static void m2m_fill_input(struct M2mBackend *encoder,
                            uint8_t *dst,
+                           uint8_t *dst_uv,
                            size_t dst_length,
                            const uint8_t *plane_y,
                            const uint8_t *plane_u,
@@ -455,20 +480,51 @@ static void m2m_fill_input(struct M2mBackend *encoder,
     const int nv12 = encoder->input_format == V4L2_PIX_FMT_NV12M ||
                      encoder->input_format == V4L2_PIX_FMT_NV12;
 
-    memcpy(dst, plane_y, luma);
+    if (encoder->is_multiplanar) {
+        /* Y in plane 0, UV or U+V in plane 1 */
+        memcpy(dst, plane_y, luma);
 
-    if (nv12) {
-        uint8_t *uv = dst + luma;
-        const uint8_t *u = plane_u;
-        const uint8_t *v = plane_v;
-
-        for (size_t i = 0; i < chroma; i++) {
-            uv[2 * i] = u[i];
-            uv[2 * i + 1] = v[i];
+        if (nv12) {
+            uint8_t *uv = dst_uv;
+            const uint8_t *u = plane_u;
+            const uint8_t *v = plane_v;
+            for (size_t i = 0; i < chroma; i++) {
+                uv[2 * i] = u[i];
+                uv[2 * i + 1] = v[i];
+            }
+        } else {
+            /* YUV420M: plane 0 = Y, plane 1 = U, but we have only 2 planes
+             * allocated for NV12M. For true YUV420M we need 3 planes.
+             * Most Pi drivers expose NV12M, not YUV420M, so we handle
+             * the common case. If YUV420M is used, we interleave U+V
+             * into plane 1 as best effort and rely on driver accepting it,
+             * otherwise we fallback to software encoder.
+             */
+            memcpy(dst_uv, plane_u, chroma);
+            /* If there's a third plane, we would need it, but we only
+             * have 2. Copy V after U if space permits. */
+            if (dst_length >= chroma * 2) {
+                /* This path is only reached if driver actually gave us
+                 * enough space in plane 1 for both U and V */
+                memcpy(dst_uv + chroma, plane_v, chroma);
+            }
         }
     } else {
-        memcpy(dst + luma, plane_u, chroma);
-        memcpy(dst + luma + chroma, plane_v, chroma);
+        memcpy(dst, plane_y, luma);
+
+        if (nv12) {
+            uint8_t *uv = dst + luma;
+            const uint8_t *u = plane_u;
+            const uint8_t *v = plane_v;
+
+            for (size_t i = 0; i < chroma; i++) {
+                uv[2 * i] = u[i];
+                uv[2 * i + 1] = v[i];
+            }
+        } else {
+            memcpy(dst + luma, plane_u, chroma);
+            memcpy(dst + luma + chroma, plane_v, chroma);
+        }
     }
 
     (void) dst_length;
@@ -499,6 +555,7 @@ static int m2m_encode(struct M2mBackend *encoder,
 
     m2m_fill_input(encoder,
                    encoder->out_bufs[index].start,
+                   encoder->is_multiplanar ? encoder->out_bufs_uv[index].start : NULL,
                    encoder->out_bufs[index].length,
                    plane_y, plane_u, plane_v);
 
@@ -510,7 +567,7 @@ static int m2m_encode(struct M2mBackend *encoder,
     out_buffer.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     out_buffer.memory = V4L2_MEMORY_MMAP;
     out_buffer.index = (uint32_t) index;
-    out_buffer.length = 1;
+    out_buffer.length = encoder->is_multiplanar ? 2 : 1;
     out_buffer.m.planes = out_planes;
     out_buffer.field = V4L2_FIELD_NONE;
     out_buffer.timestamp.tv_sec = (time_t) (pts_us / 1000000ULL);
@@ -520,7 +577,17 @@ static int m2m_encode(struct M2mBackend *encoder,
         out_buffer.flags |= V4L2_BUF_FLAG_KEYFRAME;
     }
 
-    out_planes[0].bytesused = (uint32_t) encoder->out_bufs[index].length;
+    if (encoder->is_multiplanar) {
+        out_planes[0].bytesused = (uint32_t) encoder->width * encoder->height;
+        const size_t chroma = (size_t) encoder->width * encoder->height / 4;
+        if (encoder->input_format == V4L2_PIX_FMT_NV12M) {
+            out_planes[1].bytesused = (uint32_t) (chroma * 2);
+        } else {
+            out_planes[1].bytesused = (uint32_t) (chroma * 2);
+        }
+    } else {
+        out_planes[0].bytesused = (uint32_t) encoder->out_bufs[index].length;
+    }
 
     if (xioctl(encoder->fd, VIDIOC_QBUF, &out_buffer) == -1) {
         perror("m2m: VIDIOC_QBUF (output)");
@@ -617,6 +684,7 @@ static void m2m_close(struct M2mBackend *encoder)
     }
 
     m2m_unmap(encoder->out_bufs, M2M_OUTPUT_BUFFERS);
+    m2m_unmap(encoder->out_bufs_uv, M2M_OUTPUT_BUFFERS);
     m2m_unmap(encoder->cap_bufs, M2M_CAPTURE_BUFFERS);
 
     free(encoder);

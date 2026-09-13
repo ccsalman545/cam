@@ -87,6 +87,7 @@ typedef struct {
 
 /*
  * Collect local IPv4 addresses, loopback excluded.
+ * Only interfaces that are UP and not loopback are considered.
  */
 static size_t collect_interfaces(InterfaceInfo *out, size_t max)
 {
@@ -100,6 +101,14 @@ static size_t collect_interfaces(InterfaceInfo *out, size_t max)
 
     for (struct ifaddrs *ifa = addrs; ifa != NULL && count < max; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        if ((ifa->ifa_flags & IFF_UP) == 0) {
+            continue;
+        }
+
+        if (ifa->ifa_flags & IFF_LOOPBACK) {
             continue;
         }
 
@@ -124,6 +133,7 @@ static size_t collect_interfaces(InterfaceInfo *out, size_t max)
  * Best address to advertise in SDP candidates: prefer the IP
  * the browser used to reach us, otherwise the first private
  * IPv4 address.
+ * Uses inet_pton for validation instead of deprecated inet_addr.
  */
 static void choose_advertise_ip(const char *host_header,
                                 char *out,
@@ -141,16 +151,23 @@ static void choose_advertise_ip(const char *host_header,
         }
         candidate[i] = 0;
 
-        for (size_t n = 0; n < count; n++) {
-            if (strcmp(interfaces[n].ip, candidate) == 0) {
-                snprintf(out, out_size, "%s", candidate);
-                return;
+        struct in_addr addr;
+        if (inet_pton(AF_INET, candidate, &addr) == 1) {
+            for (size_t n = 0; n < count; n++) {
+                if (strcmp(interfaces[n].ip, candidate) == 0) {
+                    snprintf(out, out_size, "%s", candidate);
+                    return;
+                }
             }
         }
     }
 
     for (size_t n = 0; n < count; n++) {
-        uint32_t host = ntohl(inet_addr(interfaces[n].ip));
+        struct in_addr addr;
+        if (inet_pton(AF_INET, interfaces[n].ip, &addr) != 1) {
+            continue;
+        }
+        uint32_t host = ntohl(addr.s_addr);
 
         int private_range =
             ((host >> 24) == 10) ||
@@ -270,7 +287,14 @@ static int json_get_int(const char *body, const char *field, long *out)
         pos++;
     }
 
-    *out = strtol(pos, NULL, 10);
+    char *end = NULL;
+    long val = strtol(pos, &end, 10);
+
+    if (end == pos) {
+        return -1;
+    }
+
+    *out = val;
 
     return 0;
 }
@@ -497,21 +521,49 @@ static void handle_rtc_offer(Server *server,
 
     /*
      * Build the JSON response with the escaped SDP answer.
+     * Answer is up to 8192, escaped it can double (CRLF -> \r\n), so payload
+     * needs to be much larger than 9216. Use 24k to be safe.
      */
-    char payload[9216];
+    char payload[24576];
     size_t offset = 0;
 
-    offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
-                                "{\"type\":\"answer\",\"session_id\":%u,"
-                                "\"udp_port\":%u,\"sdp\":\"",
-                                session_id,
-                                (unsigned) session_config.udp_port);
+    int n = snprintf(payload + offset, sizeof(payload) - offset,
+                     "{\"type\":\"answer\",\"session_id\":%u,"
+                     "\"udp_port\":%u,\"sdp\":\"",
+                     session_id,
+                     (unsigned) session_config.udp_port);
+    if (n < 0 || (size_t)n >= sizeof(payload) - offset) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"answer too large\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += (size_t) n;
 
-    offset += json_escape_append(answer, payload + offset,
-                                 sizeof(payload) - offset);
+    size_t esc = json_escape_append(answer, payload + offset,
+                                    sizeof(payload) - offset);
+    if (esc == 0 && answer[0] != 0) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"SDP escape overflow\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += esc;
 
-    offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
-                                "\"}");
+    n = snprintf(payload + offset, sizeof(payload) - offset, "\"}");
+    if (n < 0 || (size_t)n >= sizeof(payload) - offset) {
+        mg_http_reply(connection, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"payload overflow\"}");
+        rtc_session_destroy(session);
+        server->sessions[slot] = NULL;
+        atomic_store(&server->rtc_active, 0);
+        return;
+    }
+    offset += (size_t) n;
 
     mg_http_reply(connection, 200, "Content-Type: application/json\r\n",
                   "%s", payload);
@@ -855,6 +907,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
         struct pollfd fds[MAX_RTC_SESSIONS];
         int fd_count = 0;
         int timeout = 10;
+        int has_sessions = 0;
 
         for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
             RtcSession *session = server->sessions[i];
@@ -867,6 +920,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                 continue;
             }
 
+            has_sessions = 1;
             fds[fd_count].fd = rtc_session_fd(session);
             fds[fd_count].events = POLLIN;
             fds[fd_count].revents = 0;
@@ -877,6 +931,11 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
             if (dtls_timeout >= 0 && dtls_timeout < timeout) {
                 timeout = dtls_timeout > 0 ? dtls_timeout : 0;
             }
+        }
+
+        if (!has_sessions) {
+            /* Idle: no viewers, save CPU and avoid busy loop */
+            timeout = 100;
         }
 
         if (fd_count > 0) {

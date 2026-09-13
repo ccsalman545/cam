@@ -147,6 +147,28 @@ static int v4l2_capture(VideoSource *source,
         return -1;
     }
 
+    if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
+        /* Driver flagged this buffer as erroneous, recycle it */
+        struct v4l2_buffer qbuf;
+        memset(&qbuf, 0, sizeof(qbuf));
+        qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        qbuf.memory = V4L2_MEMORY_MMAP;
+        qbuf.index = buffer.index;
+        xioctl(impl->fd, VIDIOC_QBUF, &qbuf);
+        return 0;
+    }
+
+    if (buffer.bytesused == 0 || buffer.bytesused > impl->frame_size) {
+        /* Some drivers return 0 bytesused for empty buffers, skip */
+        struct v4l2_buffer qbuf;
+        memset(&qbuf, 0, sizeof(qbuf));
+        qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        qbuf.memory = V4L2_MEMORY_MMAP;
+        qbuf.index = buffer.index;
+        xioctl(impl->fd, VIDIOC_QBUF, &qbuf);
+        return 0;
+    }
+
     *out_timestamp_us = monotonic_us();
     *out_data = impl->buffers[buffer.index].start;
     *out_size = buffer.bytesused;
@@ -158,6 +180,11 @@ static int v4l2_capture(VideoSource *source,
 static void v4l2_release(VideoSource *source, uint32_t buffer_index)
 {
     struct V4l2Source *impl = source->impl;
+
+    if (buffer_index >= impl->buffer_count) {
+        fprintf(stderr, "v4l2: release with invalid index %u\n", buffer_index);
+        return;
+    }
 
     struct v4l2_buffer buffer;
 

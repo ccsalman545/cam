@@ -8,12 +8,26 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+
+static uint32_t g_crc32_table[256];
+static void init_crc32_table(void)
+{
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t crc = i;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+        }
+        g_crc32_table[i] = crc;
+    }
+}
+static pthread_once_t g_crc32_once = PTHREAD_ONCE_INIT;
 
 RtcPacketClass rtc_classify_packet(const uint8_t *buf, size_t len)
 {
@@ -90,26 +104,12 @@ static void write_be16(uint8_t *p, uint16_t value)
 
 static uint32_t crc32_stun(const uint8_t *data, size_t length)
 {
-    static uint32_t table[256];
-    static int table_ready = 0;
-
-    if (!table_ready) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t crc = i;
-
-            for (int bit = 0; bit < 8; bit++) {
-                crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
-            }
-
-            table[i] = crc;
-        }
-        table_ready = 1;
-    }
+    pthread_once(&g_crc32_once, init_crc32_table);
 
     uint32_t crc = 0xFFFFFFFFUL;
 
     for (size_t i = 0; i < length; i++) {
-        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        crc = g_crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     }
 
     return crc ^ 0xFFFFFFFFUL;
