@@ -29,6 +29,18 @@ void app_config_defaults(AppConfig *config)
 #endif
     config->udp_base_port = 50000;
 
+#ifdef USE_JANUS_TRANSPORT
+    config->webrtc_backend = "janus";
+    config->janus_host = "127.0.0.1";
+    config->janus_rtp_port = 5004;
+    config->janus_rtcp_port = 5005;
+    config->janus_rtcp_listen = 5006;
+#elif defined(USE_LIBPEER)
+    config->webrtc_backend = "libpeer";
+#else
+    config->webrtc_backend = "native";
+#endif
+
     config->bitrate_kbps = 2500;
     config->keyframe_seconds = 2;
 
@@ -155,6 +167,39 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
             continue;
         }
 
+        if (match_opt(arg, NULL, "--webrtc", &value, argc, argv, &i)) {
+            if (strcmp(value, "native") != 0 &&
+                strcmp(value, "libpeer") != 0 &&
+                strcmp(value, "janus") != 0) {
+                fprintf(stderr,
+                        "invalid --webrtc '%s' (native, libpeer or janus)\n",
+                        value);
+                return -1;
+            }
+            config->webrtc_backend = value;
+            continue;
+        }
+
+        if (match_opt(arg, NULL, "--janus-host", &value, argc, argv, &i)) {
+            config->janus_host = value;
+            continue;
+        }
+
+        if (match_opt(arg, NULL, "--janus-rtp-port", &value, argc, argv, &i)) {
+            config->janus_rtp_port = (uint16_t) parse_long(value, "janus-rtp-port");
+            continue;
+        }
+
+        if (match_opt(arg, NULL, "--janus-rtcp-port", &value, argc, argv, &i)) {
+            config->janus_rtcp_port = (uint16_t) parse_long(value, "janus-rtcp-port");
+            continue;
+        }
+
+        if (match_opt(arg, NULL, "--janus-rtcp-listen", &value, argc, argv, &i)) {
+            config->janus_rtcp_listen = (uint16_t) parse_long(value, "janus-rtcp-listen");
+            continue;
+        }
+
         if (match_opt(arg, "-b", "--bitrate", &value, argc, argv, &i)) {
             config->bitrate_kbps = (uint32_t) parse_long(value, "bitrate");
             continue;
@@ -184,6 +229,47 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
         return -1;
     }
 
+    /*
+     * Each build is compiled for exactly one transport; refuse to
+     * pretend to run a transport that was not linked in.
+     */
+#if defined(USE_JANUS_TRANSPORT)
+    if (strcmp(config->webrtc_backend, "janus") != 0) {
+        fprintf(stderr,
+                "this binary is the Janus transport build (camstream-janus). "
+                "Use camstream for native WebRTC or camstream-libpeer for "
+                "libpeer, with --webrtc native or --webrtc libpeer.\n");
+        return -1;
+    }
+
+    if (config->janus_rtp_port == 0 || config->janus_rtcp_port == 0 ||
+        config->janus_rtcp_listen == 0) {
+        fprintf(stderr, "invalid Janus ports: --janus-rtp-port, "
+                        "--janus-rtcp-port and --janus-rtcp-listen must be "
+                        "nonzero\n");
+        return -1;
+    }
+#elif defined(USE_LIBPEER)
+    if (strcmp(config->webrtc_backend, "libpeer") != 0) {
+        fprintf(stderr,
+                "this binary is the libpeer build (camstream-libpeer). "
+                "Use camstream for native WebRTC or camstream-janus for the "
+                "Janus transport.\n");
+        return -1;
+    }
+#else
+    if (strcmp(config->webrtc_backend, "native") != 0) {
+        fprintf(stderr,
+                "this binary is the native WebRTC build (camstream). "
+                "The %s transport is a separate binary: %s\n",
+                config->webrtc_backend,
+                strcmp(config->webrtc_backend, "libpeer") == 0 ?
+                    "make libpeer && make camstream-libpeer" :
+                    "make camstream-janus");
+        return -1;
+    }
+#endif
+
     return 0;
 }
 
@@ -211,6 +297,23 @@ void app_config_print_usage(const char *program)
         "  -u, --udp-port N      base UDP port for media sessions\n"
         "                        (default 50000, one port per viewer)\n"
         "\n"
+        "WebRTC transport:\n"
+        "  --webrtc MODE         native (default), libpeer or janus.\n"
+        "                        Each build is compiled for exactly one:\n"
+        "                        camstream (native), camstream-libpeer\n"
+        "                        and camstream-janus respectively.\n"
+#ifdef USE_JANUS_TRANSPORT
+        "\n"
+        "Janus transport (camstream-janus build):\n"
+        "  --janus-host ADDR     Janus gateway address (default 127.0.0.1)\n"
+        "  --janus-rtp-port N    Janus video RTP port, videoport\n"
+        "                        (default 5004)\n"
+        "  --janus-rtcp-port N   Janus video RTCP port, videortcpport,\n"
+        "                        receives sender reports (default 5005)\n"
+        "  --janus-rtcp-listen N local port for PLI/FIR feedback from\n"
+        "                        Janus (default 5006)\n"
+#endif
+        "\n"
         "Encoding:\n"
         "  -e, --encoder MODE    auto (default), hw, hw:/dev/videoNN, sw\n"
         "  -b, --bitrate KBPS    target bitrate (default 2500)\n"
@@ -225,8 +328,18 @@ void app_config_print_usage(const char *program)
         "  %s -t                          run with the test pattern\n"
         "  %s -d /dev/video0 -W 1280 -H 720 -b 4000\n"
         "  %s -e hw:/dev/video11 -p 8080 -u 50000\n"
+#ifdef USE_JANUS_TRANSPORT
+        "  %s -t -e hw --janus-host 127.0.0.1 "
+        "--janus-rtp-port 5004\n"
+        "                                         H.264 -> RTP -> Janus -> "
+        "WebRTC (install config/janus/*.jcfg into /etc/janus first)\n"
+#endif
         "\n",
-        APP_VERSION, program, program, program, program);
+        APP_VERSION, program, program, program, program
+#ifdef USE_JANUS_TRANSPORT
+        , program
+#endif
+        );
 }
 
 void app_config_print_summary(const AppConfig *config)
@@ -237,7 +350,24 @@ void app_config_print_summary(const AppConfig *config)
            config->width, config->height, config->fps);
     printf("encoder       : %s, %u kbps, keyframe every %us\n",
            config->encoder, config->bitrate_kbps, config->keyframe_seconds);
-    printf("http          : http://%s:%u/  (web UI + WebRTC signaling)\n",
-           config->listen, config->http_port);
+    printf("transport     : %s\n", config->webrtc_backend);
+    printf("http          : http://%s:%u/  (web UI%s)\n",
+           config->listen, config->http_port,
+#ifdef USE_JANUS_TRANSPORT
+           ""
+#else
+           " + WebRTC signaling"
+#endif
+           );
+#ifdef USE_JANUS_TRANSPORT
+    printf("janus rtp     : %s:%u (RTP H.264 video -> Janus)\n",
+           config->janus_host, config->janus_rtp_port);
+    printf("janus rtcp    : %s:%u (sender reports -> Janus)\n",
+           config->janus_host, config->janus_rtcp_port);
+    printf("rtcp listen   : :%u (PLI/FIR keyframe requests <- Janus)\n",
+           config->janus_rtcp_listen);
+    printf("signaling     : handled by Janus (see config/janus/janus.jcfg)\n");
+#else
     printf("udp media     : ports from %u\n", config->udp_base_port);
+#endif
 }

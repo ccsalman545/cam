@@ -58,7 +58,7 @@ endif
 # Primary target: camstream ----------------------------------------------
 
 APP_INCLUDES = -Iinclude -Iinclude/app -Iinclude/media -Iinclude/webrtc \
-               -Ithird_party/mongoose $(DEP_INCLUDES)
+               -Iinclude/janus -Ithird_party/mongoose $(DEP_INCLUDES)
 
 APP_CFLAGS = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) \
              -DHAVE_X264=$(HAVE_X264)
@@ -75,6 +75,14 @@ NATIVE_WEBRTC = \
 LIBPEER_WEBRTC = \
 	src/webrtc/libpeer_global.c \
 	src/webrtc/webrtc_session_libpeer.c
+
+# Janus transport backend (plain RTP to an external Janus gateway).
+# No OpenSSL/libsrtp: Janus owns signaling, ICE, DTLS and SRTP.
+# Reuses the existing RFC 6184 packetizer and the RTCP helpers.
+JANUS_TRANSPORT = \
+	src/janus/janus_rtp_sender.c \
+	src/webrtc/rtp_h264.c \
+	src/webrtc/rtcp.c
 
 # Common sources (including SDP parser used by both backends for logging)
 APP_COMMON = \
@@ -135,9 +143,23 @@ APP_OBJECTS_LIBPEER = $(patsubst %.c,$(BUILD_DIR)/libpeer/%.o,$(APP_SOURCES_LIBP
 APP_CFLAGS_LIBPEER = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) $(LIBPEER_INCLUDES) -DUSE_LIBPEER=1 -DHAVE_X264=$(HAVE_X264)
 APP_LIBS_LIBPEER = $(DEP_LIBDIRS) $(LIBPEER_LIBS) -lpthread $(X264_LIB) -lm
 
+# Janus variant objects: C application + RTP output, no WebRTC stack
+APP_SOURCES_JANUS = $(APP_COMMON) $(JANUS_TRANSPORT)
+ifeq ($(HAVE_X264),1)
+  APP_SOURCES_JANUS += src/media/encoder_x264.c
+endif
+APP_OBJECTS_JANUS = $(patsubst %.c,$(BUILD_DIR)/janus/%.o,$(APP_SOURCES_JANUS))
+APP_CFLAGS_JANUS = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) -DUSE_JANUS_TRANSPORT=1 -DHAVE_X264=$(HAVE_X264)
+# Minimal deps: no OpenSSL, no libsrtp. Janus is a separate process.
+APP_LIBS_JANUS = $(DEP_LIBDIRS) $(X264_LIB) -lpthread -lm
+
+# The Janus web page is embedded at build time from web/janus/.
+JANUS_WEB_SOURCES = web/janus/index.html web/janus/janus-client.js
+JANUS_WEB_HEADER  = $(BUILD_DIR)/janus/janus_web_assets.h
+
 # Rules ------------------------------------------------------------------
 
-.PHONY: all camstream camstream-libpeer libpeer vision-capture clean help test vision-test libpeer-backend
+.PHONY: all camstream camstream-janus camstream-libpeer libpeer vision-capture clean help test vision-test libpeer-backend test-janus
 
 all: camstream
 
@@ -155,6 +177,45 @@ $(BUILD_DIR)/camstream: $(APP_OBJECTS)
 	$(CC) $(APP_CFLAGS) $(APP_OBJECTS) -o $@ $(APP_LIBS)
 	@echo ""
 	@echo "built $(BUILD_DIR)/camstream (native WebRTC, x264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
+
+# Janus transport backend (RTP to an external Janus gateway)
+camstream-janus: $(BUILD_DIR)/camstream-janus
+
+$(BUILD_DIR)/camstream-janus: $(APP_OBJECTS_JANUS) $(JANUS_WEB_HEADER)
+	@mkdir -p $(dir $@)
+	$(CC) $(APP_CFLAGS_JANUS) $(APP_OBJECTS_JANUS) -o $@ $(APP_LIBS_JANUS)
+	@echo ""
+	@echo "built $(BUILD_DIR)/camstream-janus (Janus RTP transport, x264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
+	@echo "  deps: none beyond libc/libpthread (Janus runs as a separate process)"
+	@echo "  run: ./build/camstream-janus --test --encoder sw"
+	@echo "  then install config/janus/*.jcfg into /etc/janus/ and start janus"
+
+$(BUILD_DIR)/janus/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(APP_CFLAGS_JANUS) -c $< -o $@
+
+# The Janus dashboard, embedded from web/janus/ at build time.
+$(BUILD_DIR)/embed_assets: tools/embed_assets.c
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) -O2 -o $@ $<
+
+$(JANUS_WEB_HEADER): $(JANUS_WEB_SOURCES) $(BUILD_DIR)/embed_assets
+	@mkdir -p $(dir $@)
+	$(BUILD_DIR)/embed_assets $@ JANUS_WEB_ASSETS_H \
+		janus_web_index_html web/janus/index.html \
+		janus_web_client_js web/janus/janus-client.js
+
+# The Janus dashboard string is generated; same pedantic exemption
+# as the hand-written page above.
+$(BUILD_DIR)/janus/src/app/web_ui.o: src/app/web_ui.c $(JANUS_WEB_HEADER)
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(filter-out -Wpedantic,$(WARN)) $(CFLAGS) $(APP_INCLUDES) \
+	       -I$(BUILD_DIR)/janus -DUSE_JANUS_TRANSPORT=1 -DHAVE_X264=$(HAVE_X264) \
+	       -c $< -o $@
+
+$(BUILD_DIR)/janus/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(CFLAGS) -Ithird_party/mongoose -include alloca.h -c $< -o $@
 
 # libpeer backend (mbedTLS + bundled deps) - fully migrated runtime
 camstream-libpeer: $(BUILD_DIR)/camstream-libpeer
@@ -213,9 +274,21 @@ $(BUILD_DIR)/test_encoder_worker: tests/test_encoder_worker.c \
         src/media/yuv_convert.c include/media/encoder_worker.h
 	@mkdir -p $(dir $@)
 	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
-	      tests/test_encoder_worker.c src/media/encoder_worker.c \
-	      src/media/frame_hub.c src/media/frame_pool.c \
-	      src/media/au_ring.c src/media/yuv_convert.c -o $@ -lpthread
+	  tests/test_encoder_worker.c src/media/encoder_worker.c \
+	  src/media/frame_hub.c src/media/frame_pool.c \
+	  src/media/au_ring.c src/media/yuv_convert.c -o $@ -lpthread
+
+# Janus sender test: synthetic AUs through the real sender against
+# a local fake-Janus UDP socket. No camera, no x264, no Janus needed.
+$(BUILD_DIR)/test_janus_sender: tests/test_janus_sender.c \
+        src/janus/janus_rtp_sender.c src/webrtc/rtp_h264.c \
+        src/webrtc/rtcp.c src/media/au_ring.c
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
+	  -Iinclude/webrtc -Iinclude/janus \
+	  tests/test_janus_sender.c src/janus/janus_rtp_sender.c \
+	  src/webrtc/rtp_h264.c src/webrtc/rtcp.c src/media/au_ring.c \
+	  -o $@ -lpthread
 
 $(BUILD_DIR)/vision-capture: src/vision/vision_capture.c src/vision/vision_worker.c \
         src/vision/frame_matrix.c src/media/source_worker.c src/media/frame_hub.c \
@@ -237,19 +310,26 @@ test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_
 	$(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_encoder_worker
 
+test-janus: $(BUILD_DIR)/test_janus_sender
+	$(BUILD_DIR)/test_janus_sender
+
 clean:
 	rm -rf $(BUILD_DIR)
 
 help:
 	@echo "targets:"
 	@echo "  make                  build build/camstream (native WebRTC, minimal deps)"
+	@echo "  make camstream-janus  build build/camstream-janus (H.264 RTP -> external Janus gateway)"
 	@echo "  make camstream-libpeer build build/camstream-libpeer (libpeer runtime, Phase 3 fully migrated)"
 	@echo "  make libpeer          clone/build upstream libpeer in build/ (needs network)"
 	@echo "  make libpeer-backend  alias for camstream-libpeer"
+	@echo "  make test-janus       unit test for the Janus RTP sender (no camera/Janus needed)"
 	@echo "  make clean            remove build/"
 	@echo ""
 	@echo "examples:"
 	@echo "  make -j2 && ./build/camstream --test --encoder sw --listen 0.0.0.0 --http-port 8080"
+	@echo "  make camstream-janus -j2 && ./build/camstream-janus --test --encoder sw"
+	@echo "      (first: install config/janus/*.jcfg into /etc/janus/ and start janus)"
 	@echo "  make libpeer && make camstream-libpeer -j2 && ./build/camstream-libpeer --test --encoder sw --listen 0.0.0.0 --http-port 8000"
 	@echo ""
 	@echo "overrides:"

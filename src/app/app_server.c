@@ -3,10 +3,13 @@
  *
  * Composition root:
  *
- *   main thread      Mongoose HTTP loop (web UI + WebRTC signaling),
+ *   main thread      Mongoose HTTP loop (web UI + signaling),
  *                    ICE sockets, SRTP send fan out
+ *                    (native/libpeer) or just the web UI (Janus)
  *   source thread    V4L2 or test pattern capture into the hub
  *   encode thread    I420 conversion + H.264 into the AU ring
+ *   send thread      (Janus only) AU ring -> RTP -> external Janus
+ *                    gateway; PLI/FIR -> keyframe requests
  */
 #include "app_server.h"
 
@@ -37,13 +40,21 @@
 #include "au_ring.h"
 #include "encoder_worker.h"
 #include "source_worker.h"
+
+#ifdef USE_JANUS_TRANSPORT
+#include "janus_rtp_sender.h"
+
+extern const char *web_janus_html;
+extern const char *web_janus_client_js;
+#else
 #include "webrtc_session.h"
+
+extern const char *web_ui_html;
+#endif
 
 #define MAX_RTC_SESSIONS 8
 #define AU_RING_SLOTS 8
 #define AU_SLOT_CAPACITY (512 * 1024)
-
-extern const char *web_ui_html;
 
 /* ------------------------------------------------------------------ */
 /* Server state                                                        */
@@ -66,8 +77,12 @@ typedef struct {
     atomic_int force_idr;
     atomic_int rtc_active;
 
+#ifdef USE_JANUS_TRANSPORT
+    JanusRtpSender *janus_sender;
+#else
     RtcSession *sessions[MAX_RTC_SESSIONS];
     uint64_t sessions_total;    /* every session ever created */
+#endif
 
     uint64_t started_ms;
     volatile sig_atomic_t *stop_flag;
@@ -135,6 +150,11 @@ static size_t collect_interfaces(InterfaceInfo *out, size_t max)
     freeifaddrs(addrs);
     return count;
 }
+
+/*
+ * Signaling helpers (native + libpeer backends only).
+ */
+#ifndef USE_JANUS_TRANSPORT
 
 /*
  * Best address to advertise in SDP candidates: prefer the IP
@@ -340,9 +360,19 @@ static size_t json_escape_append(const char *input, char *out, size_t out_size)
     return written;
 }
 
+#endif /* !USE_JANUS_TRANSPORT (signaling helpers) */
+
 /* ------------------------------------------------------------------ */
 /* Session management                                                  */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Session management (native + libpeer backends). In Janus
+ * transport mode there are no per-viewer sessions in this
+ * process: Janus owns them, and keyframe requests arrive as
+ * RTCP feedback on the janus_rtp_sender instead.
+ */
+#ifndef USE_JANUS_TRANSPORT
 
 static void session_on_idr_request(void *user)
 {
@@ -642,6 +672,8 @@ static void handle_rtc_close(Server *server,
                   "{\"closed\":true}");
 }
 
+#endif /* !USE_JANUS_TRANSPORT */
+
 /* ------------------------------------------------------------------ */
 /* /status                                                             */
 /* ------------------------------------------------------------------ */
@@ -660,6 +692,74 @@ static void handle_status(Server *server,
     EncoderWorkerStats encoder_stats;
     encoder_worker_get_stats(server->encoder_worker, &encoder_stats);
 
+#ifdef USE_JANUS_TRANSPORT
+    /*
+     * Janus transport: no per-viewer sessions in this process;
+     * report the RTP sender instead.
+     */
+    JanusRtpSenderStats janus_stats;
+    janus_rtp_sender_get_stats(server->janus_sender, &janus_stats);
+
+    offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
+        "{\"version\":\"%s\","
+        "\"uptime_sec\":%llu,"
+        "\"source\":{\"name\":\"%s\",\"kind\":\"%s\",\"width\":%u,"
+        "\"height\":%u,\"fps\":%u},"
+        "\"encoder\":{\"name\":\"%s\",\"preference\":\"%s\","
+        "\"bitrate_kbps\":%u,\"keyframe_seconds\":%u},"
+        "\"http_port\":%u,"
+        "\"transport\":\"janus-rtp\","
+        "\"janus\":{\"host\":\"%s\",\"rtp_port\":%u,\"rtcp_port\":%u,"
+        "\"rtcp_listen\":%u,\"ssrc\":\"%08x\",\"payload_type\":%u,"
+        "\"access_units\":%llu,\"packets_sent\":%u,\"octets_sent\":%u,"
+        "\"send_errors\":%u,\"sr_sent\":%u,\"rtcp_received\":%u,"
+        "\"pli_received\":%u,\"fir_received\":%u},"
+        "\"captured_frames\":%llu,"
+        "\"encoded_frames\":%llu,"
+        "\"au_dropped\":%llu,"
+        "\"encoder_active\":%d,"
+        "\"encoder_frames_seen\":%llu,"
+        "\"encoder_skipped_idle\":%llu,"
+        "\"encoder_skipped_mismatch\":%llu,"
+        "\"encoder_skipped_bad_size\":%llu,"
+        "\"encoder_no_output\":%llu,"
+        "\"sessions\":[",
+        APP_VERSION,
+        (unsigned long long) uptime_s,
+        server->source->name,
+        server->config->use_test_source ? "test" : "v4l2",
+        server->source->width,
+        server->source->height,
+        server->source->fps,
+        server->encoder_name[0] ? server->encoder_name : "none",
+        server->config->encoder,
+        server->config->bitrate_kbps,
+        server->config->keyframe_seconds,
+        server->config->http_port,
+        server->config->janus_host,
+        server->config->janus_rtp_port,
+        server->config->janus_rtcp_port,
+        server->config->janus_rtcp_listen,
+        janus_rtp_sender_ssrc(server->janus_sender),
+        janus_rtp_sender_payload_type(server->janus_sender),
+        (unsigned long long) janus_stats.access_units,
+        janus_stats.packets_sent,
+        janus_stats.octets_sent,
+        janus_stats.send_errors,
+        janus_stats.sr_sent,
+        janus_stats.rtcp_received,
+        janus_stats.pli_received,
+        janus_stats.fir_received,
+        (unsigned long long) source_worker_captured(server->source_worker),
+        (unsigned long long) encoder_worker_frames_encoded(server->encoder_worker),
+        (unsigned long long) au_ring_dropped(server->ring),
+        atomic_load(&server->rtc_active) ? 1 : 0,
+        (unsigned long long) encoder_stats.frames_seen,
+        (unsigned long long) encoder_stats.skipped_idle,
+        (unsigned long long) encoder_stats.skipped_mismatch,
+        (unsigned long long) encoder_stats.skipped_bad_size,
+        (unsigned long long) encoder_stats.no_output);
+#else
     offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
         "{\"version\":\"%s\","
         "\"uptime_sec\":%llu,"
@@ -738,6 +838,8 @@ static void handle_status(Server *server,
         session_count++;
     }
 
+#endif /* USE_JANUS_TRANSPORT */
+
     offset += (size_t) snprintf(payload + offset, sizeof(payload) - offset,
                                 "],\"interfaces\":[");
 
@@ -777,6 +879,7 @@ static void http_event_handler(struct mg_connection *connection,
         struct mg_http_message *message =
             (struct mg_http_message *) event_data;
 
+#ifndef USE_JANUS_TRANSPORT
         if (mg_match(message->uri, mg_str("/rtc/offer"), NULL)) {
             handle_rtc_offer(server, connection, message);
             return;
@@ -786,6 +889,7 @@ static void http_event_handler(struct mg_connection *connection,
             handle_rtc_close(server, connection, message);
             return;
         }
+#endif
 
         if (mg_match(message->uri, mg_str("/status"), NULL)) {
             handle_status(server, connection);
@@ -793,12 +897,33 @@ static void http_event_handler(struct mg_connection *connection,
         }
 
         if (mg_match(message->uri, mg_str("/"), NULL)) {
+#ifdef USE_JANUS_TRANSPORT
+            /*
+             * The Janus dashboard: video fed by the Janus gateway,
+             * signaling done against Janus itself, not this server.
+             */
+            mg_http_reply(connection, 200,
+                          "Content-Type: text/html; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n",
+                          "%s", web_janus_html);
+#else
             mg_http_reply(connection, 200,
                           "Content-Type: text/html; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\n",
                           "%s", web_ui_html);
+#endif
             return;
         }
+
+#ifdef USE_JANUS_TRANSPORT
+        if (mg_match(message->uri, mg_str("/janus-client.js"), NULL)) {
+            mg_http_reply(connection, 200,
+                          "Content-Type: application/javascript; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n",
+                          "%s", web_janus_client_js);
+            return;
+        }
+#endif
 
         mg_http_reply(connection, 404, "Content-Type: text/plain\r\n",
                       "404 Not Found\n");
@@ -829,11 +954,13 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     atomic_init(&server->force_idr, 0);
     atomic_init(&server->rtc_active, 0);
 
+#ifndef USE_JANUS_TRANSPORT
     if (dtls_srtp_global_init() != 0) {
         fprintf(stderr, "server: DTLS global init failed\n");
         free(server);
         return 1;
     }
+#endif
 
     /*
      * Source.
@@ -906,6 +1033,40 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
         goto fail;
     }
 
+#ifdef USE_JANUS_TRANSPORT
+    /*
+     * RTP/RTCP bridge to the external Janus gateway. Janus may
+     * have viewers at any moment, so (unlike the native backends)
+     * the stream is considered active from startup; keyframe
+     * requests come back as RTCP feedback on the sender's local
+     * port and raise the same force_idr flag the sessions use.
+     */
+    {
+        JanusRtpSenderConfig janus_config;
+
+        memset(&janus_config, 0, sizeof(janus_config));
+
+        janus_config.host = config->janus_host;
+        janus_config.rtp_port = config->janus_rtp_port;
+        janus_config.rtcp_port = config->janus_rtcp_port;
+        janus_config.rtcp_listen_port = config->janus_rtcp_listen;
+        janus_config.verbose = config->verbose;
+
+        server->janus_sender = janus_rtp_sender_create(&janus_config,
+                                                       server->ring,
+                                                       &server->force_idr,
+                                                       AU_SLOT_CAPACITY);
+
+        if (server->janus_sender == NULL ||
+            janus_rtp_sender_start(server->janus_sender) != 0) {
+            fprintf(stderr, "server: janus RTP sender failed to start\n");
+            goto fail;
+        }
+
+        atomic_store(&server->rtc_active, 1);
+    }
+#endif
+
     /*
      * HTTP listener.
      */
@@ -930,7 +1091,9 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     size_t interface_count = collect_interfaces(interfaces, 16);
 
     printf("\ncamstream %s ready [%s]\n", APP_VERSION,
-#ifdef USE_LIBPEER
+#ifdef USE_JANUS_TRANSPORT
+           "janus transport - H.264 RTP to an external Janus gateway"
+#elif defined(USE_LIBPEER)
            "libpeer backend - mbedTLS + libsrtp + usrsctp"
 #else
            "native backend - OpenSSL + libsrtp2"
@@ -946,7 +1109,25 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
                interfaces[i].ip, config->http_port, interfaces[i].name);
     }
 
-#ifdef USE_LIBPEER
+#ifdef USE_JANUS_TRANSPORT
+    printf("rtp     : H.264 -> %s:%u (pt %u, ssrc %08x)\n",
+           config->janus_host,
+           config->janus_rtp_port,
+           janus_rtp_sender_payload_type(server->janus_sender),
+           janus_rtp_sender_ssrc(server->janus_sender));
+    printf("rtcp    : SR -> %s:%u, PLI/FIR listen on :%u\n",
+           config->janus_host,
+           config->janus_rtcp_port,
+           config->janus_rtcp_listen);
+    printf("signaling + WebRTC media: Janus gateway "
+           "(see config/janus/janus.jcfg)\n");
+    printf("firewall: allow TCP %u, Janus 8088/tcp and 8188/tcp, UDP %u-%u\n",
+           config->http_port,
+           config->janus_rtp_port,
+           config->janus_rtcp_listen);
+    printf("hint: install config/janus/janus.plugin.streaming.jcfg so the\n"
+           "      mountpoint videoport matches --janus-rtp-port.\n");
+#elif defined(USE_LIBPEER)
     printf("udp media: managed internally by libpeer (host candidates, one socket per PeerConnection)\n");
     printf("firewall: allow TCP %u and UDP 50000-50100 (libpeer ephemeral)\n",
            config->http_port);
@@ -968,6 +1149,15 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
      * Event loop.
      */
     while (!*stop_flag) {
+#ifdef USE_JANUS_TRANSPORT
+        /*
+         * Janus transport: the sender thread owns the ring and the
+         * whole media path (RTP out, RTCP in). This thread only
+         * serves the web UI and /status; a 50 ms poll keeps the
+         * loop responsive without burning CPU.
+         */
+        mg_mgr_poll(&server->mgr, 50);
+#else
         uint64_t now = now_ms();
 
         /*
@@ -1110,6 +1300,7 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
         }
 
         atomic_store(&server->rtc_active, live_sessions > 0 ? 1 : 0);
+#endif /* USE_JANUS_TRANSPORT */
     }
 
     printf("\nshutting down\n");
@@ -1117,12 +1308,19 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     /*
      * Cleanup.
      */
+#ifdef USE_JANUS_TRANSPORT
+    janus_rtp_sender_stop(server->janus_sender);
+    janus_rtp_sender_join(server->janus_sender);
+    janus_rtp_sender_destroy(server->janus_sender);
+    server->janus_sender = NULL;
+#else
     for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
         if (server->sessions[i] != NULL) {
             rtc_session_destroy(server->sessions[i]);
             server->sessions[i] = NULL;
         }
     }
+#endif
 
     mg_mgr_free(&server->mgr);
 
@@ -1139,7 +1337,9 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
 
     free(server);
 
+#ifndef USE_JANUS_TRANSPORT
     dtls_srtp_global_shutdown();
+#endif
 
     return 0;
 
@@ -1147,6 +1347,15 @@ fail:
     if (server->listener != NULL) {
         mg_mgr_free(&server->mgr);
     }
+
+#ifdef USE_JANUS_TRANSPORT
+    if (server->janus_sender != NULL) {
+        janus_rtp_sender_stop(server->janus_sender);
+        janus_rtp_sender_join(server->janus_sender);
+        janus_rtp_sender_destroy(server->janus_sender);
+        server->janus_sender = NULL;
+    }
+#endif
 
     if (server->encoder_worker != NULL) {
         encoder_worker_stop(server->encoder_worker);
@@ -1176,7 +1385,9 @@ fail:
 
     free(server);
 
+#ifndef USE_JANUS_TRANSPORT
     dtls_srtp_global_shutdown();
+#endif
 
     return 1;
 }
