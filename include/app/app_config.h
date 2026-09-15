@@ -26,6 +26,14 @@ typedef struct {
     uint32_t bitrate_kbps;
     uint32_t keyframe_seconds;
 
+    const char *webrtc_backend; /* native | libpeer | janus */
+
+    /* Janus transport (used by the camstream-janus build). */
+    const char *janus_host;     /* Janus gateway address */
+    uint16_t janus_rtp_port;    /* Janus video RTP port (videoport) */
+    uint16_t janus_rtcp_port;   /* Janus video RTCP port (videortcpport) */
+    uint16_t janus_rtcp_listen; /* local port for RTCP feedback from Janus */
+
     const char *encoder;        /* auto | hw | hw:<path> | sw */
 
     int verbose;

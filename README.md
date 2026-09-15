@@ -7,6 +7,14 @@ retransmission and RTCP feedback. There is no WebSockets video transport
 and no other streaming framework: Mongoose is used only to serve the
 built in web page and the WebRTC signaling HTTP API.
 
+Three transport backends share the same capture/encoder/vision pipeline:
+
+- **native** (default): the full WebRTC stack in C (below).
+- **libpeer**: sepfy/libpeer handles ICE/DTLS/SRTP (`build/camstream-libpeer`).
+- **janus**: camstream emits plain RTP H.264 over UDP to an external
+  [Janus gateway](#janus-transport); Janus does the WebRTC part for any
+  number of viewers (`build/camstream-janus`, no crypto dependencies).
+
 ```
 [ webcam V4L2 or test pattern ]
         |
@@ -82,11 +90,13 @@ procedure, read `docs/20_webrtc_zero_latency.md` and then
 12. [Raspberry Pi](#raspberry-pi)
 13. [Verification checklist](#verification-checklist)
 14. [Troubleshooting](#troubleshooting)
-15. [Repository layout](#repository-layout)
-16. [libpeer Phase 3](docs/18_libpeer_phase3.md)
-17. [libpeer Runtime - Fully Migrated](docs/21_libpeer_runtime.md)
-18. [Execution roadmap](docs/19_execution_roadmap.md)
-19. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
+15. [Janus transport](#janus-transport)
+16. [Repository layout](#repository-layout)
+17. [libpeer Phase 3](docs/18_libpeer_phase3.md)
+18. [libpeer Runtime - Fully Migrated](docs/21_libpeer_runtime.md)
+19. [Execution roadmap](docs/19_execution_roadmap.md)
+20. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
+21. [Janus transport (full)](docs/22_janus_transport.md)
 
 ## Features
 
@@ -175,13 +185,18 @@ make -j$(nproc)
 Output: `build/camstream`.
 
 ```
-make clean        # remove build/
-make help         # list targets and overrides
+make camstream-janus -j$(nproc)   # Janus RTP transport (no ssl/srtp)
+make test-janus                   # unit test for the Janus RTP sender
+make clean                        # remove build/
+make help                         # list targets and overrides
 ```
 
 The build compiles with `-std=c11 -Wall -Wextra -Wpedantic -O2` and
 links `-lssl -lcrypto -lsrtp2 -lpthread [-lx264] -lm`. No installation
 step is needed; run the binary from `build/`.
+
+The `camstream-janus` binary links only `[-lx264] -lpthread -lm`: it
+contains no WebRTC crypto code, because Janus is a separate process.
 
 ## Run
 
@@ -213,6 +228,14 @@ rtc a1b2c3d4: signaling complete (slot 0, 192.168.1.34)
 rtc a1b2c3d4: ICE validated (192.168.1.35:51234)
 rtc a1b2c3d4: DTLS connected, SRTP keys derived
 rtc a1b2c3d4: streaming video
+```
+
+Janus backend (after installing `config/janus/*.jcfg` into `/etc/janus/`
+and starting Janus, see [Janus transport](#janus-transport)):
+
+```
+./build/camstream-janus --test -e sw
+open http://192.168.1.34:8080/   (dashboard connects to Janus on 127.0.0.1:8188)
 ```
 
 ## Command line reference
@@ -270,6 +293,21 @@ output format, and sets the bitrate/keyframe interval where the driver
 supports it. The software backend is tuned for latency: zero latency
 preset, no reference reordering, CBR rate control, keyframes forced
 every `K` seconds plus on demand (PLI/FIR/new viewer).
+
+### Transport (Janus backend)
+
+The `camstream-janus` build uses these (the native/libpeer builds ignore
+them; `--webrtc janus` is validated so a misconfigured build fails fast):
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--webrtc janus` | Transport backend (fixed per binary build) | `janus` |
+| `--janus-host ADDR` | Janus RTP/RTCP destination host | `127.0.0.1` |
+| `--janus-rtp-port N` | Janus RTP port (mountpoint `videoport`) | 5004 |
+| `--janus-rtcp-port N` | Janus RTCP port (mountpoint `videortcpport`) | 5005 |
+| `--janus-rtcp-listen N` | Local port for RTCP feedback (PLI/FIR) from Janus | 5006 |
+
+The camera, encoder and network options above apply unchanged.
 
 ### Misc
 
@@ -637,12 +675,14 @@ Server log messages worth knowing:
 
 ## libpeer Phase 3 - Fully Migrated Runtime
 
-Two backends are now available:
+Three backends are now available:
 
 - **Native** (`build/camstream`): ICE-lite + DTLS 1.2 + SRTP + RTP H.264 in own C code,
   deps `libssl-dev`, `libsrtp2-dev`, `libx264-dev`, vendored `mongoose.c` - **minimal**
 - **libpeer** (`build/camstream-libpeer`): sepfy/libpeer PeerConnection (mbedTLS + bundled
   libsrtp, usrsctp, cJSON), same V4L2/test pipeline and Mongoose signaling - **spec compliant**
+- **Janus** (`build/camstream-janus`): plain RTP H.264 over UDP to an external Janus
+  gateway process; no crypto/transport deps in the binary - **gateway multi-viewer**
 
 Build native (minimal):
 ```sh
@@ -668,6 +708,48 @@ The libpeer binary:
 
 Details: `docs/21_libpeer_runtime.md` (new) and `docs/18_libpeer_phase3.md` (original evaluation).
 
+## Janus transport
+
+`build/camstream-janus` replaces only the browser-transport path: the same
+C capture/frame/encoder/vision code feeds an AU ring, and a dedicated
+`janus_rtp_sender` thread packetizes it (reusing `rtp_h264.c`, RFC 6184:
+single-NAL + FU-A, PT 96, 90 kHz clock) and `sendto()`s RTP to an external
+**Janus gateway** process, which does ICE/DTLS/SRTP/SDP and serves any
+number of WebRTC viewers.
+
+```
+capture/encode (unchanged) -> AU ring -> janus_rtp_sender
+    -> RTP H.264 udp -> Janus streaming plugin (mountpoint "camstream")
+    -> WebRTC -> browser
+    <- RTCP PLI/FIR (Janus relays viewer keyframe requests -> force_idr)
+```
+
+- **Zero crypto dependencies** in the app binary (`[-lx264] -lpthread -lm`).
+- **Keyframes stay in camstream**: Janus relays viewer PLI/FIR to a local RTCP
+  port; the sender parses it (reusing `rtcp.c`) and sets the same `force_idr`
+  flag the encoder worker already consumes. Sender reports every 5 s (first
+  immediately) also let Janus learn camstream's RTCP address.
+- **Mongoose keeps the dashboard**: `/status` shows Janus stats; the page and
+  its WebSocket client (`janus-client.js`, official `streamingtest.js` flow:
+  create → attach → list → watch → answer+start) are embedded at build time.
+- **Config**: `config/janus/janus.jcfg` (HTTP 8088, WS 8188) and
+  `config/janus/janus.plugin.streaming.jcfg` (mountpoint, RTP 5004 / RTCP
+  5005, PT 96). Copy into `/etc/janus/` and (re)start Janus. Ports used:
+  camstream→Janus RTP 5004, RTCP 5005; Janus→camstream RTCP 5006 (local);
+  camstream HTTP 8080.
+- **Unit test** (no camera/Janus needed): `make test-janus` runs the sender
+  against a fake Janus (UDP sockets) and checks packetization, FU-A
+  reconstruction, PLI→`force_idr`, SR contents and stats.
+
+```sh
+sudo apt install -y janus-gateway        # or build Janus from source
+sudo cp config/janus/*.jcfg /etc/janus/ && sudo systemctl restart janus
+make camstream-janus -j2
+./build/camstream-janus --test -e sw     # browser: http://<host>:8080/?janus=<host>:8188&stream=1
+```
+
+Full details, port table and troubleshooting: `docs/22_janus_transport.md`.
+
 ## Repository layout
 
 ```
@@ -678,6 +760,7 @@ include/
                 source_worker.h, encoder_worker.h
   webrtc/       ice_lite.h, dtls_srtp.h, rtp_h264.h, rtcp.h, sdp.h,
                 webrtc_session.h
+  janus/         janus_rtp_sender.h (RTP sender thread for Janus transport)
   vision/       frame_matrix.h, vision_worker.h (profiles, motion search,
                 newest-frame mosaic worker)
 src/
@@ -693,6 +776,13 @@ src/
                      (RFC 6184 packetizer), rtcp.c (SR/RR/PLI/FIR/NACK),
                      sdp.c (offer parse, answer build),
                      webrtc_session.c (session state machine)
+  janus/             janus_rtp_sender.c (RTP send thread, RTCP PLI/SR)
+tools/
+  embed_assets.c     build-time: files -> C byte arrays (Janus web assets)
+web/
+  janus/             index.html (dashboard), janus-client.js (WS client)
+config/
+  janus/             janus.jcfg, janus.plugin.streaming.jcfg (gateway side)
 third_party/
   mongoose/        Mongoose 7.x (HTTP only)
 docs/
@@ -707,6 +797,7 @@ docs/
   18_libpeer_phase3.md     libpeer build and migration boundary
   19_execution_roadmap.md  phases 1 through 5 and acceptance checklist
   20_webrtc_zero_latency.md offline Pi-to-laptop WebRTC deployment
+  22_janus_transport.md     Janus gateway transport (ports, RTCP, troubleshooting)
 Makefile
 ```
 

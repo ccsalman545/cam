@@ -1,0 +1,40 @@
+#
+# Janus Gateway - general configuration for the camstream deployment.
+#
+# Install:
+#   sudo cp config/janus/janus.jcfg                /etc/janus/janus.jcfg
+#   sudo cp config/janus/janus.plugin.streaming.jcfg /etc/janus/janus.plugin.streaming.jcfg
+#   sudo systemctl restart janus
+#
+# (Debian/Ubuntu package layout; adjust the directory if you built
+# Janus from source with a custom prefix. Existing janus.jcfg keys
+# not listed here keep their defaults.)
+
+general {
+	# Instance name, shown in logs and by "janus --list-config"
+	name = camstream
+
+	# Reach the gateway on every interface. The host PC talks to the
+	# Pi directly over Ethernet, so binding all interfaces is what
+	# the direct-link setup needs.
+	# (Janus >= 0.16 renamed this to bind_address; both are accepted.)
+	ip = 0.0.0.0
+
+	log_level = 4
+	log_colors = true
+}
+
+# HTTP REST API (not required by the dashboard, enabled for
+# `curl`-based troubleshooting).
+http {
+	enabled = true
+	port = 8088
+	admin_only = false
+}
+
+# WebSocket API - this is what the browser dashboard uses.
+websockets {
+	enabled = true
+	port = 8188
+	admin_only = false
+}

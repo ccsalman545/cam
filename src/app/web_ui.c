@@ -10,7 +10,12 @@
  *     with a live statistics dashboard drawn from getStats()
  *   - single quotes only inside the markup so the C string
  *     needs no escaped quotes
+ *
+ * The Janus transport build (USE_JANUS_TRANSPORT) embeds a
+ * different page, generated at build time from web/janus/
+ * (index.html + janus-client.js) by tools/embed_assets.c.
  */
+#ifndef USE_JANUS_TRANSPORT
 const char *web_ui_html =
 "<!doctype html>"
 "<html lang='en'>"
@@ -567,3 +572,15 @@ const char *web_ui_html =
 "</script>"
 "</body>"
 "</html>";
+#endif /* !USE_JANUS_TRANSPORT */
+
+#ifdef USE_JANUS_TRANSPORT
+/*
+ * Janus dashboard: generated from web/janus/index.html and
+ * web/janus/janus-client.js at build time (see Makefile).
+ */
+#include "janus_web_assets.h"
+
+const char *web_janus_html = (const char *) janus_web_index_html;
+const char *web_janus_client_js = (const char *) janus_web_client_js;
+#endif
