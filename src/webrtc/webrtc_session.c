@@ -730,9 +730,16 @@ void rtc_session_close(RtcSession *session)
         return;
     }
 
-    dtls_srtp_close(session->dtls);
-
+    /*
+     * Mark the session closed BEFORE tearing down DTLS:
+     * dtls_srtp_close() fires the state callback, which calls
+     * rtc_session_close() back. With the state still open, that
+     * re-entrant call would run the whole close sequence (and the
+     * on_closed callback) a second time.
+     */
     set_state(session, RTC_CLOSED);
+
+    dtls_srtp_close(session->dtls);
 
     if (session->config.on_closed != NULL) {
         session->config.on_closed(session->config.server, session);
