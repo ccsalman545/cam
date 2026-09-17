@@ -1,5 +1,7 @@
 # Optimization notes
 
+[camstream docs](README.md) / 15. Optimization notes &nbsp;·&nbsp; [README](../README.md)
+
 Every change from the stage 4 prototype to 2.0, with the reason and the measured or expected effect.
 
 ## Summary table
@@ -66,3 +68,9 @@ NACK responses replay the stored protected packet verbatim. Receivers accept ide
 
 - YUYV to I420 conversion is scalar C. It is memory bandwidth bound at 640x480 (about 0.5 ms) and still fine at 720p; a SIMD pass is a natural next step.
 - One IDR per new viewer costs one large frame burst at the configured bitrate; acceptable on LAN, and mitigated by VBV on the software encoder.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[14. Raspberry Pi guide](14_raspberry_pi.md) | **Index**<br>[docs](README.md) | **Next**<br>[16. Protocol reference](16_protocol_reference.md) |

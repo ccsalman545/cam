@@ -1,4 +1,6 @@
-# Connect two laptops with a LAN cable
+# Two laptops, one cable
+
+[camstream docs](README.md) / 13. Two laptops, one cable &nbsp;·&nbsp; [README](../README.md)
 
 Goal: laptop A runs camstream with a camera, laptop B watches the live WebRTC stream, using nothing but one Ethernet cable between them. No router, no switch, no internet.
 
@@ -121,7 +123,7 @@ cd ideal-broccoli
 
 The startup banner lists every address the page can be opened on. Look for the one matching your cable subnet:
 
-```
+```text
 camstream 2.0.0 ready
 open http://192.168.50.1:8080/   (eth0)
 ```
@@ -185,3 +187,9 @@ ip addr show eth0        # look for 169.254.x.x
 ```
 
 Open `http://169.254.x.x:8080/` from laptop B. Static IPs are still recommended: deterministic, and documented startup URLs stay stable.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[12. Build reference](12_build_reference.md) | **Index**<br>[docs](README.md) | **Next**<br>[14. Raspberry Pi guide](14_raspberry_pi.md) |

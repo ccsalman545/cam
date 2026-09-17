@@ -1,5 +1,7 @@
 # Protocol reference
 
+[camstream docs](README.md) / 16. Protocol reference &nbsp;·&nbsp; [README](../README.md)
+
 Byte level formats of everything camstream puts on the wire or accepts.
 
 ## Ports and endpoints
@@ -29,7 +31,7 @@ the RTP class or browser NACK/PLI/FIR/BYE feedback is dropped.)
 
 Request (browser to server):
 
-```
+```text
 0                   1                   2                   3
 | type = 0x0001     | message length   |
 | magic cookie 0x2112A442              |
@@ -55,7 +57,7 @@ Response (server to browser), type 0x0101, same transaction id:
 
 ## RTP (RFC 3550)
 
-```
+```text
 0                   1                   2                   3
 |1 0 V=2|P|X| CC=0  |M| payload type   | sequence number   |
 | timestamp (90 kHz)                                    |
@@ -117,7 +119,7 @@ Response:
 
 ## SDP answer shape (annotated)
 
-```
+```sdp
 v=0
 o=- 1 1 IN IP4 <server-ip>
 s=camstream
@@ -159,3 +161,9 @@ The candidate line follows the RFC 8445 grammar
 <connection-address> <port> typ <candidate-type>`; browsers reject
 the whole answer if any of the integer fields is missing or out of
 order.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[15. Optimization notes](15_optimization_notes.md) | **Index**<br>[docs](README.md) | **Next**<br>[17. Troubleshooting](17_troubleshooting.md) |

@@ -1,4 +1,6 @@
-# Phase 3: libpeer evaluation and integration boundary
+# libpeer evaluation and integration boundary
+
+[camstream docs](README.md) / 18. libpeer phase 3 &nbsp;·&nbsp; [README](../README.md)
 
 ## Important result of the code review
 
@@ -131,3 +133,9 @@ only when all of these are true:
 exchange. Ethernet removes wireless variability, but it does not remove
 capture buffering, encoder GOP delay, browser decode scheduling or display
 vsync.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[17. Troubleshooting](17_troubleshooting.md) | **Index**<br>[docs](README.md) | **Next**<br>[19. Execution roadmap](19_execution_roadmap.md) |

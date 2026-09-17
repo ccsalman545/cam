@@ -1,4 +1,6 @@
-# Phase 3 Fully Migrated: libpeer Runtime
+# libpeer runtime
+
+[camstream docs](README.md) / 21. libpeer runtime &nbsp;·&nbsp; [README](../README.md)
 
 This document describes the **fully migrated libpeer runtime** (`camstream-libpeer`),
 which replaces the native OpenSSL/libsrtp2 stack with sepfy/libpeer (mbedTLS +
@@ -64,7 +66,7 @@ at runtime - useful for CI/offline.
 
 ### Video Pipeline
 
-```
+```text
 Pi camera (/dev/video0) or test pattern
   -> V4L2 capture thread (v4l2_source.c / test_source.c)
   -> newest-frame FrameHub (frame_hub.c)
@@ -120,12 +122,12 @@ Pi:
 ```
 
 Laptop (direct RJ45):
-```
+```text
 http://192.168.1.10:8000/
 ```
 
 Expected logs:
-```
+```text
 camstream 2.0.0 ready [libpeer backend - mbedTLS + libsrtp + usrsctp]
 libpeer: initialized
 rtc 12345678 [libpeer]: created
@@ -190,3 +192,9 @@ For offline RJ45, host candidates are sufficient.
 - [ ] Laptop: `http://192.168.1.10:8000/` loads dashboard
 - [ ] Click Start WebRTC, ICE -> connected, video flows, latency <150ms glass-to-glass
 - [ ] `curl http://192.168.1.10:8000/status` shows `"transport":"webrtc-libpeer"` and sessions `streaming`
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[20. Offline Ethernet deployment](20_webrtc_zero_latency.md) | **Index**<br>[docs](README.md) | **Next**<br>[22. Janus transport](22_janus_transport.md) |

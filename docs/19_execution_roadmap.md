@@ -1,4 +1,6 @@
-# Project execution roadmap
+# Execution roadmap
+
+[camstream docs](README.md) / 19. Execution roadmap &nbsp;·&nbsp; [README](../README.md)
 
 This document reconciles the original five-phase outline with the current
 checkout. The repository has moved beyond the original Phase 2 prototype:
@@ -184,3 +186,9 @@ silently stitching them.
 - [ ] PGM and OBJ outputs open correctly.
 - [ ] Latency is measured with a visible moving LED/clock, not estimated
       only from network ping.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[18. libpeer phase 3](18_libpeer_phase3.md) | **Index**<br>[docs](README.md) | **Next**<br>[20. Offline Ethernet deployment](20_webrtc_zero_latency.md) |
