@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -349,8 +350,14 @@ int stun_build_binding_response(const char *local_pwd,
 
     /*
      * MESSAGE-INTEGRITY ( HMAC-SHA1 with the local pwd ).
-     * The length field in the header must include the MI
-     * attribute while computing the MAC.
+     *
+     * RFC 5389 §15.4: the HMAC input is the STUN message
+     * *up to but NOT including* the MESSAGE-INTEGRITY
+     * attribute, with the header length field already set as
+     * if the 24 byte MI attribute were present.  Hashing the
+     * 4 byte MI attribute header as well produces a MAC the
+     * browser cannot reproduce, so every connectivity check
+     * is answered with a response it discards and ICE fails.
      */
     {
         uint8_t *attr = out + STUN_HEADER_SIZE + payload;
@@ -364,7 +371,7 @@ int stun_build_binding_response(const char *local_pwd,
 
         HMAC(EVP_sha1(),
              local_pwd, (int) strlen(local_pwd),
-             out, STUN_HEADER_SIZE + payload + 4,
+             out, STUN_HEADER_SIZE + payload,
              mac, &mac_len);
 
         memcpy(attr + 4, mac, 20);
@@ -378,11 +385,22 @@ int stun_build_binding_response(const char *local_pwd,
     {
         uint8_t *attr = out + STUN_HEADER_SIZE + payload;
 
-        write_be16(attr, 0x0028);
+        /*
+         * FINGERPRINT is attribute 0x8028 (RFC 5389 §18.2).
+         * 0x0028 is in the comprehension-REQUIRED range, so a
+         * peer that does not know it MUST reject the whole
+         * message.
+         */
+        write_be16(attr, 0x8028);
         write_be16(attr + 2, 4);
         write_be16(out + 2, (uint16_t) (payload + 8));
 
-        uint32_t crc = crc32_stun(out, STUN_HEADER_SIZE + payload + 4) ^
+        /*
+         * RFC 5389 §15.5: the CRC covers the message up to
+         * but not including the FINGERPRINT attribute, with
+         * the length field already counting it.
+         */
+        uint32_t crc = crc32_stun(out, STUN_HEADER_SIZE + payload) ^
                        0x5354554EUL;
 
         attr[4] = (uint8_t) (crc >> 24);
@@ -415,25 +433,46 @@ int stun_verify_mi(const uint8_t *buf, size_t len,
     }
 
     /*
-     * The MAC covers the message from the start of the header
-     * up to the start of the MI value (mi points at the 20
-     * byte value itself, which is the MAC output and not part
-     * of the input; RFC 5389 §15.5).  A FINGERPRINT attribute
-     * after it (RFC 5389 §15.7) is excluded.
+     * RFC 5389 §15.4: the MAC covers the message from the
+     * start of the header up to the start of the
+     * MESSAGE-INTEGRITY *attribute header* (4 bytes before
+     * the value `mi` points at) — the attribute itself is
+     * excluded, as is any FINGERPRINT that follows it.
+     *
+     * Crucially the header length field used in the hash must
+     * be the value it had when the sender computed the MAC:
+     * everything up to and including MI, i.e. the message
+     * truncated right after this attribute.  When a
+     * FINGERPRINT follows, the on-the-wire length field is
+     * 8 bytes larger, so hashing the buffer verbatim yields
+     * the wrong MAC and every browser check is rejected with
+     * a bogus 401.  Hash over a patched copy instead.
      */
-    size_t mi_end = (size_t) (mi - buf);
+    size_t mi_header = (size_t) (mi - buf) - 4;
 
-    if (mi_end < STUN_HEADER_SIZE + 24 || mi_end > len) {
+    if (mi_header < STUN_HEADER_SIZE || mi_header + 24 > len) {
         return 0;
     }
+
+    uint8_t *scratch = malloc(mi_header);
+
+    if (scratch == NULL) {
+        return 0;
+    }
+
+    memcpy(scratch, buf, mi_header);
+    write_be16(scratch + 2, (uint16_t) (mi_header + 24 - STUN_HEADER_SIZE));
 
     unsigned char mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
 
     if (HMAC(EVP_sha1(), password, (int) strlen(password),
-             buf, mi_end, mac, &mac_len) == NULL || mac_len != 20) {
+             scratch, mi_header, mac, &mac_len) == NULL || mac_len != 20) {
+        free(scratch);
         return 0;
     }
+
+    free(scratch);
 
     /* constant-time compare: this MAC guards the peer slot */
     return CRYPTO_memcmp(mac, mi, 20) == 0;

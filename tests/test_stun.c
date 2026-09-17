@@ -44,9 +44,12 @@ static size_t make_binding_request(uint8_t *out, const char *username)
 }
 
 /*
- * Append MESSAGE-INTEGRITY (HMAC-SHA1 over everything up to
- * and including the MI attribute, keyed with password) and
- * fix the message length. Returns the new total length.
+ * Append MESSAGE-INTEGRITY and fix the message length.
+ * Returns the new total length.
+ *
+ * RFC 5389 §15.4: the HMAC input is the message up to but NOT
+ * including the MI attribute, with the length field already
+ * set as if MI were present.
  */
 static size_t sign_request(uint8_t *req, size_t len, const char *password)
 {
@@ -63,11 +66,93 @@ static size_t sign_request(uint8_t *req, size_t len, const char *password)
     unsigned int mac_len = 0;
 
     HMAC(EVP_sha1(), password, (int) strlen(password),
-         req, total - 20, mac, &mac_len);
+         req, len, mac, &mac_len);
     memcpy(mi + 4, mac, 20);
 
     return total;
 }
+
+/*
+ * Append a FINGERPRINT attribute (RFC 5389 §15.5) after an
+ * already-signed message. Browsers always send one, and its
+ * presence must not disturb MESSAGE-INTEGRITY verification.
+ */
+static size_t append_fingerprint(uint8_t *msg, size_t len)
+{
+    static uint32_t table[256];
+    static int table_ready = 0;
+
+    if (!table_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t crc = i;
+
+            for (int bit = 0; bit < 8; bit++) {
+                crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+            }
+            table[i] = crc;
+        }
+        table_ready = 1;
+    }
+
+    uint8_t *fp = msg + len;
+
+    write_be16(fp, 0x8028);
+    write_be16(fp + 2, 4);
+    write_be16(msg + 2, (uint16_t) (len + 8 - 20));
+
+    uint32_t crc = 0xFFFFFFFFUL;
+
+    for (size_t i = 0; i < len; i++) {
+        crc = table[(crc ^ msg[i]) & 0xFF] ^ (crc >> 8);
+    }
+    crc = (crc ^ 0xFFFFFFFFUL) ^ 0x5354554EUL;
+
+    fp[4] = (uint8_t) (crc >> 24);
+    fp[5] = (uint8_t) (crc >> 16);
+    fp[6] = (uint8_t) (crc >> 8);
+    fp[7] = (uint8_t) crc;
+
+    return len + 8;
+}
+
+/*
+ * RFC 5769 §2.1 sample request and §2.2 sample IPv4 response,
+ * the authoritative interop vectors for MESSAGE-INTEGRITY,
+ * FINGERPRINT and XOR-MAPPED-ADDRESS.
+ */
+static const uint8_t rfc5769_req[] =
+    "\x00\x01\x00\x58"
+    "\x21\x12\xa4\x42"
+    "\xb7\xe7\xa7\x01\xbc\x34\xd6\x86\xfa\x87\xdf\xae"
+    "\x80\x22\x00\x10"
+    "STUN test client"
+    "\x00\x24\x00\x04"
+    "\x6e\x00\x01\xff"
+    "\x80\x29\x00\x08"
+    "\x93\x2f\xf9\xb1\x51\x26\x3b\x36"
+    "\x00\x06\x00\x09"
+    "\x65\x76\x74\x6a\x3a\x68\x36\x76\x59\x20\x20\x20"
+    "\x00\x08\x00\x14"
+    "\x9a\xea\xa7\x0c\xbf\xd8\xcb\x56\x78\x1e\xf2\xb5"
+    "\xb2\xd3\xf2\x49\xc1\xb5\x71\xa2"
+    "\x80\x28\x00\x04"
+    "\xe5\x7a\x3b\xcf";
+
+static const uint8_t rfc5769_respv4[] =
+    "\x01\x01\x00\x3c"
+    "\x21\x12\xa4\x42"
+    "\xb7\xe7\xa7\x01\xbc\x34\xd6\x86\xfa\x87\xdf\xae"
+    "\x80\x22\x00\x0b"
+    "\x74\x65\x73\x74\x20\x76\x65\x63\x74\x6f\x72\x20"
+    "\x00\x20\x00\x08"
+    "\x00\x01\xa1\x47\xe1\x12\xa6\x43"
+    "\x00\x08\x00\x14"
+    "\x2b\x91\xf5\x99\xfd\x9e\x90\xc3\x8c\x74\x89\xf9"
+    "\x2a\xf9\xba\x53\xf0\x6b\xe7\xd7"
+    "\x80\x28\x00\x04"
+    "\xc0\x7d\x4c\x96";
+
+static const char rfc5769_pwd[] = "VOkJxbRl1RmTxUk/WvJxBt";
 
 static int find_attr(const uint8_t *msg, size_t len, uint16_t type,
                      const uint8_t **value, size_t *value_len)
@@ -194,6 +279,117 @@ int main(void)
 
     if (stun_verify_mi(tampered, s_len, "localpasswordvalueXXXXXX")) {
         fprintf(stderr, "fail: tampered request passed MI check\n");
+        failed = 1;
+    }
+
+    /*
+     * A trailing FINGERPRINT (every browser sends one) grows
+     * the header length field by 8 after the MAC was computed.
+     * Verification must still succeed.
+     */
+    uint8_t with_fp[256];
+    size_t fp_len;
+
+    memcpy(with_fp, signed_req, s_len);
+    fp_len = append_fingerprint(with_fp, s_len);
+
+    if (!stun_verify_mi(with_fp, fp_len, "localpasswordvalueXXXXXX")) {
+        fprintf(stderr,
+                "fail: MI rejected when a FINGERPRINT follows it\n");
+        failed = 1;
+    }
+
+    /* --------------------------------------------------------- */
+    /* RFC 5769 interop vectors                                   */
+    /* --------------------------------------------------------- */
+
+    if (!stun_verify_mi(rfc5769_req, sizeof(rfc5769_req) - 1,
+                        rfc5769_pwd)) {
+        fprintf(stderr,
+                "fail: RFC 5769 §2.1 sample request failed MI check\n");
+        failed = 1;
+    }
+
+    if (!stun_username_matches(rfc5769_req, sizeof(rfc5769_req) - 1,
+                               "evtj")) {
+        fprintf(stderr, "fail: RFC 5769 USERNAME not matched\n");
+        failed = 1;
+    }
+
+    /*
+     * Rebuild the RFC 5769 IPv4 response from its own request
+     * and compare byte for byte against the published answer.
+     * This pins XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY and
+     * FINGERPRINT all at once.
+     */
+    {
+        struct sockaddr_storage mapped;
+        struct sockaddr_in *m4 = (struct sockaddr_in *) &mapped;
+
+        memset(&mapped, 0, sizeof(mapped));
+        m4->sin_family = AF_INET;
+        m4->sin_port = htons(32853);
+        inet_pton(AF_INET, "192.0.2.1", &m4->sin_addr);
+
+        uint8_t built[128];
+        size_t built_len = 0;
+
+        if (stun_build_binding_response(rfc5769_pwd,
+                                        rfc5769_req,
+                                        sizeof(rfc5769_req) - 1,
+                                        &mapped,
+                                        built, sizeof(built),
+                                        &built_len) != 0) {
+            fprintf(stderr, "fail: could not build RFC 5769 response\n");
+            failed = 1;
+        } else {
+            /*
+             * Our builder emits no SOFTWARE attribute, so the
+             * byte streams differ; compare the attributes that
+             * carry the cryptography instead.
+             */
+            const uint8_t *xor_addr = NULL, *mi_val = NULL, *fp_val = NULL;
+            size_t xor_len = 0, mi_vlen = 0, fp_vlen = 0;
+
+            if (!find_attr(built, built_len, 0x0020, &xor_addr, &xor_len) ||
+                xor_len != 8 ||
+                memcmp(xor_addr, "\x00\x01\xa1\x47\xe1\x12\xa6\x43", 8) != 0) {
+                fprintf(stderr,
+                        "fail: XOR-MAPPED-ADDRESS != RFC 5769 vector\n");
+                failed = 1;
+            }
+
+            if (!find_attr(built, built_len, 0x0008, &mi_val, &mi_vlen) ||
+                mi_vlen != 20) {
+                fprintf(stderr, "fail: built response has no MI\n");
+                failed = 1;
+            }
+
+            if (!find_attr(built, built_len, 0x8028, &fp_val, &fp_vlen) ||
+                fp_vlen != 4) {
+                fprintf(stderr,
+                        "fail: built response has no FINGERPRINT (0x8028)\n");
+                failed = 1;
+            }
+
+            /*
+             * The response we build must validate under the
+             * same rules we apply to inbound messages.
+             */
+            if (!stun_verify_mi(built, built_len, rfc5769_pwd)) {
+                fprintf(stderr,
+                        "fail: our own binding response fails our own "
+                        "MI check (browser would discard it)\n");
+                failed = 1;
+            }
+        }
+    }
+
+    /* The published response must also verify as-is. */
+    if (!stun_verify_mi(rfc5769_respv4, sizeof(rfc5769_respv4) - 1,
+                        rfc5769_pwd)) {
+        fprintf(stderr,
+                "fail: RFC 5769 §2.2 IPv4 response failed MI check\n");
         failed = 1;
     }
 

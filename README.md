@@ -1,817 +1,801 @@
+<div align="center">
+
 # camstream
 
-A low latency camera to browser streaming server written in C. The media
-path is real WebRTC: every viewer gets its own peer connection with ICE
-lite, DTLS 1.2, SRTP, RTP H.264 packetization (RFC 6184), NACK based
-retransmission and RTCP feedback. There is no WebSockets video transport
-and no other streaming framework: Mongoose is used only to serve the
-built in web page and the WebRTC signaling HTTP API.
+**A webcam-to-browser WebRTC server written in C11.**
 
-Three transport backends share the same capture/encoder/vision pipeline:
+Sub-frame latency on a LAN. No signaling server, no STUN, no TURN, no cloud,
+no containers, no JavaScript build step, and no video framework — a single
+static binary, one HTTP port, and a UDP socket per viewer.
 
-- **native** (default): the full WebRTC stack in C (below).
-- **libpeer**: sepfy/libpeer handles ICE/DTLS/SRTP (`build/camstream-libpeer`).
-- **janus**: camstream emits plain RTP H.264 over UDP to an external
-  [Janus gateway](#janus-transport); Janus does the WebRTC part for any
-  number of viewers (`build/camstream-janus`, no crypto dependencies).
+[![language](https://img.shields.io/badge/language-C11-blue.svg)](#)
+[![platform](https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi-lightgrey.svg)](#raspberry-pi)
+[![transport](https://img.shields.io/badge/transport-WebRTC%20%7C%20ICE--lite%20%7C%20DTLS%201.2%20%7C%20SRTP-green.svg)](#the-webrtc-stack)
+[![version](https://img.shields.io/badge/version-2.0.0-informational.svg)](#versioning)
 
-```
-[ webcam V4L2 or test pattern ]
-        |
-        v
-  source thread --> frame hub (keep newest mailbox per consumer)
-        |
-        v
-  encode thread --> H.264 access unit ring (overwrite oldest)
-        |
-        v
-  main thread --> per viewer: RTP packetizer --> SRTP --> UDP (ICE socket)
-                    Mongoose: web page + WebRTC signaling on one HTTP port
-```
+</div>
 
-## Start here: offline Pi to laptop WebRTC
+---
 
-This is the primary deployment path. The Raspberry Pi owns the camera and
-runs `camstream`. The laptop runs only a browser. The Ethernet cable carries
-HTTP signaling over TCP and WebRTC media over UDP. No Internet, cloud service,
-STUN server, TURN server, container or WebSocket video transport is required.
+## Contents
 
-Pi address:
+**Getting started** · [What this is](#what-this-is) · [Quick start](#quick-start) · [Install](#install) · [Build](#build)
 
-```text
-192.168.1.10/24
-```
+**Using it** · [CLI reference](#cli-reference) · [HTTP API](#http-api) · [Web UI](#web-ui)
 
-Laptop address:
+**Understanding it** · [Architecture](#architecture) · [The WebRTC stack](#the-webrtc-stack) · [Session lifecycle](#session-lifecycle) · [Multi-viewer](#multi-viewer-behaviour)
 
-```text
-192.168.1.20/24
-```
+**Operating it** · [Raspberry Pi](#raspberry-pi) · [Acceptance tests](#acceptance-tests) · [Troubleshooting](#troubleshooting)
 
-Build and run on the Pi:
+**Reference** · [Backends](#transport-backends) · [Janus](#janus-transport) · [Layout](#repository-layout) · [Tuning constants](#tuning-constants) · [Versioning](#versioning)
+
+---
+
+## What this is
+
+camstream captures from a V4L2 device, encodes H.264, and delivers it to a
+browser over **real WebRTC** — ICE, DTLS 1.2, SRTP, RTP — implemented directly
+in C against OpenSSL and libsrtp2. Mongoose is used *only* to serve the viewer
+page and the signaling `POST`; it carries no video.
+
+**Why not MJPEG-over-HTTP or WebSockets?** Those buffer. TCP head-of-line
+blocking turns a single lost packet into a visible stall, and every proxy in
+the path adds its own buffer. WebRTC over UDP drops what it cannot deliver on
+time and repairs selectively via NACK. That is the difference between "roughly
+live" and *live*.
+
+### Design commitments
+
+| | |
+|---|---|
+| **Freshness over completeness** | Every queue is a keep-newest mailbox or an overwrite-oldest ring. A slow consumer never makes the pipeline lag; it skips. |
+| **No allocation in the hot path** | Frame buffers are pooled and refcounted. `malloc` appears at startup and on viewer join, never per frame. |
+| **Encode once, fan out N times** | One encoder feeds all viewers. Per-viewer state is only RTP sequence numbers, SRTP keys, and a retransmission cache. |
+| **The main thread never blocks** | HTTP, ICE, DTLS timers, RTCP, and RTP packetization all run in one non-blocking poll loop. |
+| **Auditable** | ~11k lines of C. One vendored dependency (Mongoose). Every protocol decision is commented with its RFC. |
+
+---
+
+## Quick start
+
+### No camera, no hardware, 30 seconds
 
 ```sh
 sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev
-make -j2
-./build/camstream --device /dev/video0 --encoder auto --listen 0.0.0.0
-```
-
-Open this URL on the laptop:
-
-```text
-http://192.168.1.10:8080/
-```
-
-If the camera or hardware encoder is not ready, verify the WebRTC path first
-with the synthetic source:
-
-```sh
+make -j"$(nproc)"
 ./build/camstream --test --encoder sw --listen 0.0.0.0
 ```
 
-Allow TCP port `8080` and UDP ports `50000` through `50007` on the Pi. The
-browser must use the Pi Ethernet address, not `localhost`. For the complete
-procedure, read `docs/20_webrtc_zero_latency.md` and then
-`docs/17_troubleshooting.md` if a state does not become `streaming`.
+Open the URL it prints. You should see a test pattern with a scrolling clock.
+This exercises the entire pipeline except the camera driver — **always start
+here** when diagnosing a problem.
 
-## Table of contents
+### Real camera
 
-1. [Start here: offline Pi to laptop WebRTC](#start-here-offline-pi-to-laptop-webrtc)
-2. [Features](#features)
-3. [Requirements](#requirements)
-4. [Build](#build)
-5. [Run](#run)
-6. [Command line reference](#command-line-reference)
-7. [Web UI](#web-ui)
-8. [HTTP API](#http-api)
-9. [Architecture](#architecture)
-10. [WebRTC internals](#webrtc-internals)
-11. [Multi viewer behavior](#multi-viewer-behavior)
-12. [Raspberry Pi](#raspberry-pi)
-13. [Verification checklist](#verification-checklist)
-14. [Troubleshooting](#troubleshooting)
-15. [Janus transport](#janus-transport)
-16. [Repository layout](#repository-layout)
-17. [libpeer Phase 3](docs/18_libpeer_phase3.md)
-18. [libpeer Runtime - Fully Migrated](docs/21_libpeer_runtime.md)
-19. [Execution roadmap](docs/19_execution_roadmap.md)
-20. [Offline WebRTC deployment](docs/20_webrtc_zero_latency.md)
-21. [Janus transport (full)](docs/22_janus_transport.md)
-
-## Features
-
-- Real WebRTC media transport (RFC 8839 stack built natively in C):
-  ICE lite (RFC 5245/5389), DTLS 1.2 (RFC 6347/5764), SRTP (RFC 3711,
-  AES_CM_128_HMAC_SHA1_80), RTP H.264 (RFC 6184).
-- Hardware or software H.264 encoding: V4L2 memory-to-memory encoders
-  (bcm2835 on Raspberry Pi, cedrus, etc.) with automatic fallback to
-  libx264 when the hardware encoder is not available.
-- Up to 8 concurrent viewers, each with its own SRTP keys, RTP sequence
-  space, retransmission cache and DTLS session.
-- NACK (RFC 4588) retransmission from a per session cache, PLI/FIR key
-  frame requests with rate limiting, RTCP sender reports.
-- Built in web viewer (single file, no frameworks, no CDNs) with
-  auto connect, auto reconnect and live quality indicators.
-- No camera? The synthetic test pattern source (`--test`) gives a full
-  end to end pipeline for verification.
-- Small and auditable: about 6000 lines of C including the embedded
-  web page; the only third party code is Mongoose (HTTP server).
-
-## Requirements
-
-- Linux with a V4L2 video device (or `--test` for the synthetic
-  source).
-- C11 compiler with pthreads (GCC or Clang).
-- OpenSSL 1.1 or 3.x (DTLS).
-- libsrtp2 (SRTP).
-- libx264 (software encoder fallback; the build works without it but
-  then only hardware encoding is available).
-- Mongoose 7.x, vendored under `third_party/mongoose/`.
-
-### System packages
-
-Debian, Ubuntu, Raspberry Pi OS (including 64 bit):
-
+```sh
+./build/camstream --device /dev/video0 --encoder auto
 ```
+
+### The canonical deployment: Raspberry Pi → laptop, offline
+
+The Pi owns the camera; the laptop runs only a browser; one Ethernet cable
+between them. HTTP signaling over TCP, media over UDP. No internet, no STUN,
+no TURN.
+
+```text
+┌────────────────────────┐                      ┌────────────────────────┐
+│  Raspberry Pi          │   TCP 8080  signal   │  Laptop                │
+│  192.168.1.10/24       │◄────────────────────►│  192.168.1.20/24       │
+│  camera + camstream    │   UDP 50000+ media   │  browser only          │
+└────────────────────────┘◄────────────────────►└────────────────────────┘
+```
+
+```sh
+# On the Pi
+./build/camstream --device /dev/video0 --encoder auto --listen 0.0.0.0
+
+# On the laptop, open:
+http://192.168.1.10:8080/
+```
+
+Open TCP `8080` and UDP `50000-50007` on the Pi. Use the Pi's LAN address —
+**not** `localhost`, and **not** through a proxy (proxies cannot forward UDP).
+
+> **Latency check.** Point the camera at a screen showing a millisecond
+> stopwatch, then photograph the screen and the stream together. Glass-to-glass
+> on a wired LAN at 640×480/30 should land in the low tens of milliseconds.
+
+---
+
+## Install
+
+### Dependencies
+
+| Dependency | Purpose | Required |
+|---|---|---|
+| C11 compiler + pthreads | — | yes |
+| OpenSSL 1.1 or 3.x | DTLS 1.2, certificates, HMAC, CSPRNG | yes (native backend) |
+| libsrtp2 | SRTP/SRTCP | yes (native backend) |
+| libx264 | software H.264 encoder | optional |
+| Mongoose 7.x | HTTP server | vendored, no action |
+
+Without libx264 the build still succeeds, but only hardware encoding is
+available and `--encoder sw` will fail at startup.
+
+```sh
+# Debian · Ubuntu · Raspberry Pi OS
 sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
-```
 
-Fedora:
-
-```
+# Fedora · RHEL
 sudo dnf install gcc make openssl-devel libsrtp-devel x264-devel
-```
 
-Arch Linux:
-
-```
+# Arch
 sudo pacman -S gcc openssl libsrtp x264
-```
 
-openSUSE:
-
-```
+# openSUSE
 sudo zypper install gcc libopenssl-devel libsrtp-devel x264-devel
-```
 
-Alpine:
-
-```
+# Alpine
 sudo apk add build-base openssl-dev libsrtp-dev x264-dev
 ```
 
-Notes:
+The libsrtp2 package name varies: `libsrtp2-dev` (Debian/Ubuntu),
+`libsrtp-devel` (Fedora, 2.x), `libsrtp` (Arch), `libsrtp-dev` (Alpine).
 
-- The libsrtp2 package name differs between distributions: `libsrtp2-dev`
-  (Debian/Ubuntu), `libsrtp-devel` (Fedora/RHEL, 2.x), `libsrtp` (Arch),
-  `libsrtp-dev` (Alpine).
-- If you built the dependencies yourself, point the Makefile at them:
-
-```
-make OPENSSL_DIR=/opt/openssl SRTP_DIR=/opt/srtp X264_DIR=/opt/x264
-```
-
-- x264 detection: the Makefile auto detects `x264.h` in
-  `/usr/include`, `/usr/local/include` or `$X264_DIR/include`. Force it
-  with `HAVE_X264=1` or `HAVE_X264=0`. The final build line prints
-  whether x264 is in.
+---
 
 ## Build
 
-```
-make -j$(nproc)
-```
-
-Output: `build/camstream`.
-
-```
-make camstream-janus -j$(nproc)   # Janus RTP transport (no ssl/srtp)
-make test-janus                   # unit test for the Janus RTP sender
-make clean                        # remove build/
-make help                         # list targets and overrides
+```sh
+make -j"$(nproc)"          # → build/camstream
 ```
 
-The build compiles with `-std=c11 -Wall -Wextra -Wpedantic -O2` and
-links `-lssl -lcrypto -lsrtp2 -lpthread [-lx264] -lm`. No installation
-step is needed; run the binary from `build/`.
+Compiled with `-std=c11 -Wall -Wextra -Wpedantic -O2`, linked against
+`-lssl -lcrypto -lsrtp2 -lpthread [-lx264] -lm`. There is no install step —
+run the binary from `build/`.
 
-The `camstream-janus` binary links only `[-lx264] -lpthread -lm`: it
-contains no WebRTC crypto code, because Janus is a separate process.
+| Target | Result |
+|---|---|
+| `make` | `build/camstream` — native WebRTC stack |
+| `make camstream-janus` | `build/camstream-janus` — RTP to a Janus gateway, zero crypto deps |
+| `make libpeer && make camstream-libpeer` | `build/camstream-libpeer` — sepfy/libpeer backend |
+| `make test` | STUN, vision, and encoder-worker unit tests |
+| `make test-janus` | Janus RTP sender against a fake gateway |
+| `make vision-capture` | PGM/OBJ mosaic smoke tool |
+| `make clean` · `make help` | — |
 
-## Run
+**Dependencies in non-standard prefixes:**
 
-```
-./build/camstream --test -e sw        # no camera: test pattern, software encode
-./build/camstream -d /dev/video0      # real camera, auto encoder
-./build/camstream -e hw:/dev/video11  # force a specific V4L2 M2M encoder
-```
-
-Startup log (abridged):
-
-```
-camstream 2.0.0
-source        : test pattern
-resolution    : 640x480 @ 30 fps
-encoder       : sw (libx264), 2500 kbps, keyframe every 2s
-http          : http://0.0.0.0:8080/  (web UI + WebRTC signaling)
-udp media     : ports from 50000
-
-camstream 2.0.0 ready
-open http://192.168.1.34:8080/   (wlan0)
+```sh
+make OPENSSL_DIR=/opt/openssl SRTP_DIR=/opt/srtp X264_DIR=/opt/x264
 ```
 
-Open the printed URL in a browser. When the video appears the server
-logs (per viewer session, id in hex):
+x264 is auto-detected by probing for `x264.h` in `$X264_DIR/include`,
+`/usr/include`, and `/usr/local/include`. Override with `HAVE_X264=1` or
+`HAVE_X264=0`. The final build line reports whether x264 was linked in.
 
-```
-rtc a1b2c3d4: signaling complete (slot 0, 192.168.1.34)
-rtc a1b2c3d4: ICE validated (192.168.1.35:51234)
-rtc a1b2c3d4: DTLS connected, SRTP keys derived
-rtc a1b2c3d4: streaming video
-```
+---
 
-Janus backend (after installing `config/janus/*.jcfg` into `/etc/janus/`
-and starting Janus, see [Janus transport](#janus-transport)):
+## CLI reference
 
-```
-./build/camstream-janus --test -e sw
-open http://192.168.1.34:8080/   (dashboard connects to Janus on 127.0.0.1:8188)
-```
-
-## Command line reference
-
-Defaults in parentheses. Both `-x value` and `-x=value` forms work.
+Both `--opt value` and `--opt=value` are accepted. Defaults in the right column.
 
 ### Source
 
 | Option | Meaning | Default |
-| --- | --- | --- |
+|---|---|---|
 | `-d, --device PATH` | V4L2 capture device | `/dev/video0` |
 | `-t, --test` | Synthetic test pattern instead of a camera | off |
-| `-W, --width N` | Capture width in pixels | 640 |
-| `-H, --height N` | Capture height in pixels | 480 |
-| `-F, --fps N` | Capture frame rate | 30 |
+| `-W, --width N` | Capture width | `640` |
+| `-H, --height N` | Capture height | `480` |
+| `-F, --fps N` | Capture frame rate | `30` |
 
-The source is opened in YUYV 4:2:2 at the requested resolution when the
-device supports it; otherwise it falls back to the best planar (YU12)
-mode at or near the requested size. The test pattern generates YUYV
-directly: SMPTE style color bars, a scrolling clock and a sweeping
-marker so dropped frames are visible.
+The device is opened as YUYV 4:2:2 when supported, otherwise the nearest
+planar (YU12) mode. The test pattern emits YUYV directly: SMPTE-style bars, a
+scrolling clock, and a sweeping marker that makes dropped frames obvious.
 
 ### Network
 
 | Option | Meaning | Default |
-| --- | --- | --- |
-| `-l, --listen ADDR` | HTTP listen address | `0.0.0.0` |
-| `-p, --http-port N` | HTTP port (web UI + signaling) | 8080 |
-| `-u, --udp-port N` | Base UDP port for media | 50000 |
+|---|---|---|
+| `-l, --listen ADDR` | HTTP bind address | `0.0.0.0` |
+| `-p, --http-port N` | HTTP port (UI + signaling) | `8080` |
+| `-u, --udp-port N` | Base UDP port for media | `50000` |
 
-Viewer `i` binds UDP port `N+i` (0 to 7). The SDP candidate advertises
-the IP the browser used to reach the server (from the HTTP `Host`
-header) when that IP is one of the local interfaces, otherwise the
-first private IPv4 address.
+Viewer *i* binds UDP port `N+i` for `i` in `0..7`. The advertised ICE candidate
+is the address the browser used to reach the server (from the HTTP `Host`
+header) when that address belongs to a local interface; otherwise the first
+private IPv4 address found.
 
 ### Encoding
 
 | Option | Meaning | Default |
-| --- | --- | --- |
-| `-e, --encoder MODE` | Encoder selection: `auto`, `hw`, `hw:/dev/videoNN`, `sw` | `auto` |
-| `-b, --bitrate KBPS` | Target bitrate in kbps | 2500 |
-| `-K, --keyframe SEC` | Keyframe interval in seconds | 2 |
+|---|---|---|
+| `-e, --encoder MODE` | `auto` · `hw` · `hw:/dev/videoNN` · `sw` | `auto` |
+| `-b, --bitrate KBPS` | Target bitrate | `2500` |
+| `-K, --keyframe SEC` | Keyframe interval | `2` |
 
-Encoder selection:
+- **`auto`** — try V4L2 M2M hardware, fall back to libx264.
+- **`hw`** — hardware only; fail if unavailable.
+- **`hw:/dev/videoNN`** — pin a specific M2M node.
+- **`sw`** — libx264 only; fail if not compiled in.
 
-- `auto` (default): try the V4L2 memory-to-memory H.264 encoder first,
-  fall back to libx264.
-- `hw`: V4L2 M2M only, fail if none works.
-- `hw:/dev/videoNN`: force a specific device node.
-- `sw`: libx264 only, fail if it was not compiled in.
-
-The hardware backend probes the device for an input format (NV12
-preferred, YU12 accepted and interleaved on the fly) and a matching
-output format, and sets the bitrate/keyframe interval where the driver
-supports it. The software backend is tuned for latency: zero latency
-preset, no reference reordering, CBR rate control, keyframes forced
-every `K` seconds plus on demand (PLI/FIR/new viewer).
-
-### Transport (Janus backend)
-
-The `camstream-janus` build uses these (the native/libpeer builds ignore
-them; `--webrtc janus` is validated so a misconfigured build fails fast):
-
-| Option | Meaning | Default |
-| --- | --- | --- |
-| `--webrtc janus` | Transport backend (fixed per binary build) | `janus` |
-| `--janus-host ADDR` | Janus RTP/RTCP destination host | `127.0.0.1` |
-| `--janus-rtp-port N` | Janus RTP port (mountpoint `videoport`) | 5004 |
-| `--janus-rtcp-port N` | Janus RTCP port (mountpoint `videortcpport`) | 5005 |
-| `--janus-rtcp-listen N` | Local port for RTCP feedback (PLI/FIR) from Janus | 5006 |
-
-The camera, encoder and network options above apply unchanged.
+The hardware path negotiates NV12 (preferred) or YU12, interleaving I420→NV12
+on the fly, and programs bitrate and GOP length where the driver allows.
+The software path is latency-tuned: `zerolatency`, no B-frames, no reference
+reordering, CBR, with IDRs forced every `K` seconds *and* on demand (PLI, FIR,
+or a new viewer).
 
 ### Misc
 
 | Option | Meaning |
-| --- | --- |
-| `-v, --verbose` | Verbose Mongoose logging |
+|---|---|
+| `-v, --verbose` | Verbose Mongoose + protocol logging |
 | `-V, --version` | Print version and exit |
 | `-h, --help` | Print usage and exit |
 
-## Web UI
+### Janus-only options
 
-`GET /` serves a single embedded HTML page (`src/app/web_ui.c`). No
-frameworks, no external assets, no CDNs. It:
+Accepted by `build/camstream-janus`; validated (and rejected) elsewhere so a
+misconfigured build fails immediately rather than silently.
 
-- connects with the browser `RTCPeerConnection` on load
-  (`iceTransportPolicy: all`, UDP candidate gathering, host candidates
-  preferred for lowest latency),
-- POSTs the SDP offer to `/rtc/offer`, applies the answer,
-- shows connection state (offer, connecting, streaming, failed) plus
-  bytes/s and the session id,
-- auto reconnects: polls every 1.5 s while not streaming, gives up
-  after 10 s, retries every 5 s after a failure,
-- polls `/status` every 2 s and shows server side session statistics,
-- offers a `Close` button (POST `/rtc/close`).
+| Option | Meaning | Default |
+|---|---|---|
+| `--webrtc janus` | Backend selector, fixed per binary | `janus` |
+| `--janus-host ADDR` | RTP/RTCP destination | `127.0.0.1` |
+| `--janus-rtp-port N` | Mountpoint `videoport` | `5004` |
+| `--janus-rtcp-port N` | Mountpoint `videortcpport` | `5005` |
+| `--janus-rtcp-listen N` | Local port for PLI/FIR feedback | `5006` |
 
-The page uses relative URLs, so it works over plain HTTP on a LAN
-without TLS (WebRTC media is end to end secured by DTLS/SRTP
-independently of the transport scheme).
+---
 
 ## HTTP API
 
-All endpoints are on the HTTP port (default 8080).
+Four routes. Everything else returns `404`.
 
 ### `POST /rtc/offer`
 
-Start a WebRTC session.
+```jsonc
+// request
+{ "type": "offer", "sdp": "<browser SDP offer>" }
 
-Request body:
-
-```
-{"type":"offer","sdp":"<SDP offer from the browser>"}
-```
-
-Response `200`:
-
-```
-{"type":"answer","session_id":2716354772,"udp_port":50000,"sdp":"<SDP answer>"}
+// 200
+{ "type": "answer", "session_id": 2716354772, "udp_port": 50000, "sdp": "<SDP answer>" }
 ```
 
-Errors: `400` (missing or unparsable SDP), `503` (all 8 session slots
-occupied), `500` (session create failed, usually a busy UDP port).
+`400` malformed or missing SDP · `503` all 8 slots busy · `500` session
+creation failed (usually a UDP port already bound).
+
+> Request bodies are capped at 512 bytes for `/rtc/close`; offers use the full
+> body. Oversized close requests are rejected rather than truncated.
 
 ### `POST /rtc/close`
 
-```
-{"session_id":2716354772}
+```jsonc
+{ "session_id": 2716354772 }   // → { "closed": true }
 ```
 
-Response `200`: `{"closed":true}`. The server sends a DTLS
-close_notify and releases the slot.
+Sends DTLS `close_notify` and frees the slot immediately.
 
 ### `GET /status`
 
-Server and per session statistics as JSON:
+Abridged — the live response also carries encoder-worker diagnostics
+(`frames_seen`, `skipped_idle`, `skipped_mismatch`, `no_output`) and
+`sessions_total`. The `transport` field reads `webrtc`, `webrtc-libpeer`, or
+`janus-rtp` depending on the binary.
 
-```
-{"version":"2.0.0","uptime_sec":412,
- "source":{"name":"test pattern","kind":"test","width":640,"height":480,"fps":30},
- "encoder":{"name":"sw (libx264)","preference":"sw","bitrate_kbps":2500,"keyframe_seconds":2},
- "http_port":8080,"transport":"webrtc",
- "captured_frames":12345,"encoded_frames":12340,"au_dropped":0,
- "sessions":[{"id":2716354772,"state":"streaming","udp_port":50000,
-              "packets_sent":98765,"bytes_sent":12345678,
-              "pli":0,"nacks":3,"retx":3}],
- "interfaces":[{"name":"wlan0","ip":"192.168.1.34"}]}
+```jsonc
+{
+  "version": "2.0.0", "uptime_sec": 412,
+  "source":  { "name": "test pattern", "kind": "test", "width": 640, "height": 480, "fps": 30 },
+  "encoder": { "name": "sw (libx264)", "preference": "sw", "bitrate_kbps": 2500, "keyframe_seconds": 2 },
+  "http_port": 8080, "transport": "webrtc",
+  "captured_frames": 12345, "encoded_frames": 12340, "au_dropped": 0,
+  "sessions": [
+    { "id": 2716354772, "state": "streaming", "udp_port": 50000,
+      "packets_sent": 98765, "bytes_sent": 12345678,
+      "pli": 0, "nacks": 3, "retx": 3 }
+  ],
+  "interfaces": [ { "name": "wlan0", "ip": "192.168.1.34" } ]
+}
 ```
 
-Session states: `new`, `ice`, `dtls`, `streaming`, `closed`.
+Session states: `new` → `ice` → `dtls` → `streaming` → `closed`.
 
 ### `GET /`
 
-The web UI.
+The embedded viewer page.
 
-Everything else returns `404`.
+---
+
+## Web UI
+
+A single HTML page compiled into the binary (`src/app/web_ui.c`) — no
+frameworks, no CDN, no external assets, so it works fully offline.
+
+- Creates an `RTCPeerConnection` on load and `POST`s its offer to `/rtc/offer`.
+- Displays state, throughput, and session id.
+- Reconnects on its own: polls every 1.5 s while not streaming, gives up after
+  10 s, retries every 5 s after a failure.
+- Polls `/status` every 2 s for server-side counters.
+- `Close` button issues `POST /rtc/close`.
+
+All URLs are relative, so plain HTTP on a LAN is fine: WebRTC media is secured
+end-to-end by DTLS-SRTP regardless of the page's transport.
+
+---
 
 ## Architecture
 
-### Threading model
+```
+  ┌─────────────────┐
+  │ V4L2 / test src │
+  └────────┬────────┘
+           │  source thread — grab, never block
+           ▼
+  ┌─────────────────┐   keep-newest mailbox: a late consumer
+  │   frame hub     │   jumps to the freshest frame, never
+  └────────┬────────┘   drains a stale backlog
+           │  encode thread — YUV convert, H.264
+           ▼
+  ┌─────────────────┐   overwrite-oldest ring
+  │  AU ring (8 ×   │   8 slots × 512 KiB
+  │  512 KiB)       │
+  └────────┬────────┘
+           │  main thread — one non-blocking poll loop
+           ▼
+  ┌──────────────────────────────────────────────────┐
+  │ per viewer:  RTP packetize → SRTP → UDP          │
+  │ shared:      Mongoose HTTP (UI + signaling)      │
+  │              ICE · DTLS timers · RTCP · NACK     │
+  └──────────────────────────────────────────────────┘
+```
 
-| Thread | Responsibility |
-| --- | --- |
-| Main | Mongoose HTTP loop (web UI, signaling), poll loop over viewer UDP sockets, DTLS retransmission timers, RTCP sender reports, access unit fan out to all viewers |
-| Source | V4L2 (or test pattern) frame grabs into the frame hub |
-| Encode | I420 conversion, H.264 encode, push access units to the ring |
+### Threads
 
-There are no other threads. The main thread never blocks on media.
+Exactly three. No thread pool, no work queues.
 
-### Pipeline data structures
+| Thread | Owns |
+|---|---|
+| **Source** | V4L2 `DQBUF`/`QBUF` (or pattern synthesis) into the frame hub |
+| **Encode** | I420 conversion, H.264 encode, push access units to the ring |
+| **Main** | Mongoose HTTP, viewer UDP sockets, DTLS retransmit timers, RTCP sender reports, AU fan-out |
 
-- **Frame pool** (`frame_pool.c`): fixed number of pre allocated
-  buffers with reference counting. No malloc/free in the hot capture
-  path.
-- **Frame hub** (`frame_hub.c`): one per source. Each consumer (today:
-  the encoder) gets a keep newest mailbox protected by a condition
-  variable: late consumers always jump to the freshest frame instead of
-  draining stale ones.
-- **Access unit ring** (`au_ring.c`): single producer (encoder thread),
-  single consumer (main thread) ring of encoded H.264 access units.
-  When full, the oldest slot is overwritten: live video prefers
-  freshness over completeness. 8 slots of 512 KiB by default.
+### Data structures
 
-### Access unit contract
+- **Frame pool** (`frame_pool.c`) — fixed pre-allocated refcounted buffers. No
+  allocation in the capture path.
+- **Frame hub** (`frame_hub.c`) — one keep-newest mailbox per consumer, guarded
+  by a condition variable.
+- **AU ring** (`au_ring.c`) — SPSC ring of encoded access units, 8 × 512 KiB.
+  Full ring overwrites the oldest slot.
 
-An access unit is one H.264 picture in Annex B form: a sequence of
-`00 00 00 01` prefixed NAL units (SPS/PPS before keyframes). Both
-encoder backends produce Annex B; the RTP packetizer relies on that to
-find NAL boundaries.
+### The access-unit contract
 
-## WebRTC internals
+An access unit is **one H.264 picture in Annex B form**: NAL units prefixed
+with `00 00 00 01`, SPS and PPS preceding every keyframe. Both encoder backends
+guarantee this, and the RTP packetizer depends on it to find NAL boundaries.
 
-### Signaling (HTTP)
+---
 
-The browser creates an `RTCPeerConnection`, adds one transceiver
-(`sendonly` video, `H264`), sets local description and POSTs the offer
-to `/rtc/offer`. The server parses ICE ufrag/pwd, the fingerprint and
-the H.264 payload type, answers with an SDP answer and the browser sets
-it as remote description. That is all; no WebSocket and no TURN.
+## The WebRTC stack
+
+### Signaling
+
+The browser adds one `sendonly` H.264 transceiver, sets a local description,
+and `POST`s the offer. The server parses ICE ufrag/pwd, the DTLS fingerprint,
+and the negotiated H.264 payload type, then replies with an answer. One HTTP
+round trip. No WebSocket, no trickle exchange, no TURN.
 
 ### SDP answer
 
-The answer advertises exactly one ICE candidate and one media line:
-
-```
+```sdp
 v=0
-o=- 0 0 IN IP4 192.168.1.34
+o=- 1 1 IN IP4 192.168.1.10
 s=camstream
 t=0 0
+a=ice-lite
+a=ice-options:trickle
 a=group:BUNDLE 0
+a=msid-semantic: WMS camstream
+a=fingerprint:sha-256 EF:0C:40:…
+a=setup:passive
+a=ice-ufrag:LCcIVVeF
+a=ice-pwd:…
 m=video 9 UDP/TLS/RTP/SAVPF 96
-c=IN IP4 192.168.1.34
+c=IN IP4 192.168.1.10
 a=mid:0
 a=sendonly
-a=ice-ufrag:<16 random bytes>
-a=ice-pwd:<32 random bytes>
-a=fingerprint:sha-256 <cert digest>
+a=rtcp-mux
+a=msid:camstream camstream-video
+a=ssrc:… cname:camstream
 a=rtpmap:96 H264/90000
-a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1
+a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1
 a=rtcp-fb:96 nack
-a=candidate:1 1 udp 2113667327 192.168.1.34 50000 typ host generation 0
+a=rtcp-fb:96 nack pli
+a=rtcp-fb:96 ccm fir
+a=candidate:1 1 udp 2130706431 192.168.1.10 50000 typ host generation 0
 ```
 
-Details that matter for browser compatibility:
+Details that exist because a browser rejected the alternative:
 
-- The candidate is `a=candidate:1 1 udp ...` with component id `1` and
-  a trailing `generation 0` extension, the exact form Chromium and
-  Firefox accept.
-- The fingerprint is `a=fingerprint:sha-256 <digest>` (RFC 8842/7999
-  format, digest in colon separated uppercase hex), the form modern
-  browsers require.
-- ICE credentials: 16 byte ufrag, 32 byte pwd, from `RAND_bytes`.
-- Payload type 96 is offered with `nack` RTCP feedback; the packetizer
-  uses 90 kHz clock as H.264 requires.
+- **`a=ice-lite` is session-level only** (RFC 8839 §5.4). Placing it on the
+  m-line made some browsers treat the server as a full ICE agent and wait
+  forever for checks it never sends.
+- **Unused audio is rejected with port 0** (JSEP §5.3.1). Port 9 plus
+  `a=inactive` is *accepted-but-inactive* and demands its own ICE transport
+  when it is not bundled.
+- **Candidates carry `generation 0`** and component id `1` — the exact form
+  Chromium and Firefox parse.
+- **Fingerprint** is `sha-256` in colon-separated uppercase hex.
+- Payload type and mid are echoed from the offer rather than hard-coded.
 
-### ICE lite
+### ICE-lite
 
-The server is an ICE lite agent (RFC 5245 section 6.1.1): it does not
-gather candidates, it only answers the browser's connectivity checks
-and remembers the validated peer address.
+The server is an ICE-lite agent (RFC 5245 §6.1.1): it gathers nothing and
+initiates nothing. It answers connectivity checks and records the peer.
 
-- UDP demultiplexing per RFC 7983: first byte 0 to 3 = STUN, 20 to 63
-  = DTLS, 128 to 191 = RTP/RTCP, anything else ignored.
-- STUN binding requests (RFC 5389) are validated (magic cookie,
-  USERNAME must start with `<server-ufrag>:`) and answered with
-  XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY (HMAC-SHA1 with the local
-  ice-pwd) and FINGERPRINT (CRC32).
-- The first valid check locks the remote address. DTLS data is only
-  processed after that, as ICE requires.
+- **Demultiplexing** per RFC 7983 on the first byte: `0–3` STUN, `20–63` DTLS,
+  `≥128` RTP/RTCP.
+- **Binding requests** are authenticated before they are acted on: magic
+  cookie, `USERNAME` bound to the local ufrag, and **`MESSAGE-INTEGRITY`
+  verified** (HMAC-SHA1 over the local ice-pwd) — because the ufrag is public
+  in the SDP answer, so without MI any host on the LAN could claim the peer
+  slot. Failures are answered with a STUN `401`, not dropped silently.
+- **Responses** carry `XOR-MAPPED-ADDRESS`, `MESSAGE-INTEGRITY`, and
+  `FINGERPRINT` (CRC32, attribute `0x8028`).
+- **The peer address follows the latest valid check.** Locking the first one
+  breaks NAT rebinds (Wi-Fi↔cellular, router restart) by leaving media aimed
+  at a dead 5-tuple.
+
+> **MESSAGE-INTEGRITY is exact, and easy to get wrong.** The HMAC covers the
+> message up to but *not including* the MI attribute, with the header length
+> field set as if MI were present. A trailing `FINGERPRINT` makes the
+> on-the-wire length 8 bytes larger than the value the sender hashed, so
+> verification must hash a length-patched copy. `tests/test_stun.c` pins all of
+> this against the **RFC 5769** published vectors.
 
 ### DTLS 1.2
 
-- The server acts as the DTLS server on a self signed P-256 EC
-  certificate (generated at startup, one per process).
-- The browser verifies the certificate SHA-256 fingerprint against the
-  SDP answer; the server verifies the browser's fingerprint from the
-  offer (RFC 7999). Mismatch fails the handshake.
-- OpenSSL drives the handshake through a custom BIO pair: inbound
-  datagrams are queued, outbound records go straight to the UDP socket.
-  Retransmission timers are served from the poll loop.
-- After the handshake, 60 bytes of keying material are exported with
-  the label `EXTRACTOR-dtls_srtp` (RFC 5764) and split into
-  client/server SRTP master keys and salts.
+- Self-signed P-256 certificate, generated once per process.
+- The browser checks the server's SHA-256 fingerprint against the answer; the
+  server checks the browser's against the offer. Either mismatch aborts.
+- OpenSSL is driven through a BIO pair: inbound datagrams queued, outbound
+  records written straight to the UDP socket, retransmission timers serviced
+  from the poll loop.
+- 60 bytes of keying material are exported with label `EXTRACTOR-dtls_srtp`
+  (RFC 5764) and split into client/server master keys (16 B) and salts (14 B).
 
 ### SRTP
 
-One libsrtp2 session per direction per viewer, AES_CM_128_HMAC_SHA1_80.
-Keys never leave the process; the DTLS layer is the only source of
-keying material.
+One libsrtp2 session per direction per viewer,
+`SRTP_AES128_CM_SHA1_80`. Keys are derived only from the DTLS exporter and
+never leave the process.
 
-### RTP (RFC 6184)
+### RTP — RFC 6184
 
-- Payload type 96, 90 kHz timestamp derived from the frame capture
-  timestamp (CLOCK_MONOTONIC microseconds).
-- NALs that fit in the MTU budget (1200 byte max packet) go out as
-  single NAL unit packets; larger NALs are fragmented with FU-A.
-- The last RTP packet of each picture carries the marker bit.
-- Each session has its own 16 bit sequence number space and an
-  SSRC from `RAND_bytes`.
+- 90 kHz clock, timestamps derived from `CLOCK_MONOTONIC` capture time.
+- NALs within the 1200-byte packet budget go out as single-NAL packets; larger
+  ones are fragmented **FU-A**.
+- Marker bit set on the last packet of each picture.
+- Per-session 16-bit sequence space and an SSRC from `RAND_bytes`.
 
 ### RTCP
 
-- Sender report every second while a viewer is connected (NTP mapping
-  is CLOCK_REALTIME based, offset 2208988800).
-- Parsed from the viewer: PLI and FIR trigger a rate limited keyframe
-  request (atomic flag read by the encoder thread), Generic NACK
-  (PT 200, FMT 1) is answered from the per session retransmission
-  cache, BYE closes the session.
+- **Sender reports** every 1 s per connected viewer (NTP epoch offset
+  2208988800).
+- **PLI** (PT 206 FMT 1) and **FIR** (PT 206 FMT 4) raise a single atomic
+  `force_idr` flag. The encoder thread consumes it with `atomic_exchange`, so a
+  burst of requests from several viewers coalesces into **one** IDR rather than
+  a storm of them.
+- **Generic NACK** (PT 205 FMT 1) is served from a 512-packet per-session
+  retransmission cache, up to 128 sequence numbers per report.
+- **BYE** (PT 203) closes the session.
 
-### Session life cycle
+---
 
-```
-POST /rtc/offer --> RTC_NEW (answer sent, UDP port bound)
-first valid STUN check --> RTC_ICE (peer address locked, DTLS waits)
-first ClientHello --> RTC_DTLS (handshake in progress)
-handshake done, RFC 5764 keys exported --> RTC_STREAMING (video flows)
-BYE, idle 15 s, DTLS watchdog 30 s, fatal error, or server shutdown
---> RTC_CLOSED (slot freed)
-```
-
-Every state transitions to `RTC_CLOSED` on fatal errors. A session that
-never produces even the first STUN check is reaped after 15 s of
-silence, so a vanished browser cannot hold a slot forever.
-
-## Multi viewer behavior
-
-- Up to 8 viewers, one session (and one UDP port) each.
-- All viewers receive the same encoded access units: encode once,
-  fan out. The main thread pops each access unit from the ring and
-  packetizes it per viewer (each viewer has its own sequence numbers,
-  timestamp is the same, RTP payload type is per offer but fixed at 96
-  here).
-- A new viewer always gets a forced keyframe: the server sets the
-  force IDR flag when a session is created and when a viewer connects
-  past DTLS; the encoder emits an IDR on its next frame.
-- Keyframe requests (PLI/FIR) are global (one encoder) and rate
-  limited to one per 500 ms.
-- Viewer drop out: BYE, idle timeout or the 30 s DTLS watchdog. The
-  slot is freed in the same loop iteration, `rtc_active` goes back to
-  0 when the last viewer leaves, and the encoder idles. The source
-  thread keeps grabbing frames into the hub meanwhile, so when the
-  next viewer joins it gets fresh frames, never a stale backlog.
-
-## Raspberry Pi
-
-camstream runs on Raspberry Pi OS (32 or 64 bit, bookworm).
+## Session lifecycle
 
 ```
-sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
-make -j4
-sudo usermod -aG video $USER     # if /dev/video0 is not readable
-./build/camstream -e hw:/dev/video11   # Pi hardware encoder
+POST /rtc/offer ─────────────► NEW        answer sent, UDP port bound
+first authenticated STUN ────► ICE        peer locked; DTLS now accepted
+first ClientHello ───────────► DTLS       handshake in flight
+RFC 5764 keys exported ──────► STREAMING  RTP flowing
+BYE · idle 15 s · DTLS watchdog 30 s · fatal error · shutdown
+                             ► CLOSED     slot freed same loop iteration
 ```
 
-Notes:
+Any state can fail directly to `CLOSED`. A session that never produces a valid
+STUN check is reaped after **15 s**; one that reaches ICE but never completes
+DTLS is reaped after **30 s**. A vanished browser cannot hold a slot.
 
-- The bcm2835 hardware encoder exposes `/dev/video11` (memory-to-memory H.264
-  M2M). It accepts NV12 (preferred) or YU12; the code handles both and
-  interleaves I420 to NV12 in the input path. Output is Annex B
-  directly from the capture queue.
-- On 32 bit Raspberry Pi OS the V4L2 M2M API works with the 32 bit
-  userspace; the 64 bit Pi OS image works the same way.
-- The Pi camera module is managed by libcamera. On recent Raspberry
-  Pi OS the sensor shows up as a V4L2 device, usually `/dev/video0`.
-  List what is present with:
+---
 
-```
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video0 --list-formats-ext
-```
+## Multi-viewer behaviour
 
-Only one process can use the sensor at a time, so stop any running
-camera application (`libcamera-hello`, `still`, etc.) before starting
-camstream:
+- **8 concurrent viewers**, one session and one UDP port each.
+- **Encode once, fan out.** The main thread pops each AU and packetizes it per
+  viewer — independent sequence numbers and SRTP contexts, shared timestamp.
+- **Every new viewer forces an IDR**, so nobody waits up to `-K` seconds for a
+  first picture.
+- **PLI/FIR are global** — there is one encoder, and concurrent requests
+  coalesce into a single IDR.
+- **Departure** is by BYE, idle timeout, or the DTLS watchdog. When the last
+  viewer leaves the encoder idles, but the source thread keeps filling the hub
+  — so the next arrival gets a *fresh* frame, never a stale backlog.
 
-```
-./build/camstream -d /dev/video0 -e hw:/dev/video11
-```
+---
 
-- CPU: with `-e sw` the Pi can encode 480p/30 comfortably; 720p/30 is
-  possible but warm. Prefer `-e hw` for 1080p.
-- The test pattern works without a camera for a full pipeline check:
+## Transport backends
 
-```
-./build/camstream --test -e hw:/dev/video11
-./build/camstream --test -e sw
-```
+Three binaries share one capture/encode/vision pipeline and differ only in how
+pixels reach the browser.
 
-## Verification checklist
+| Backend | Binary | WebRTC by | Deps | Use when |
+|---|---|---|---|---|
+| **Native** | `camstream` | own C code | openssl, srtp2, x264 | Default. Lowest latency, smallest surface. |
+| **libpeer** | `camstream-libpeer` | sepfy/libpeer | mbedTLS, bundled srtp/usrsctp/cJSON | You want a third-party spec-compliance reference. |
+| **Janus** | `camstream-janus` | external Janus | **none** (`-lx264 -lpthread -lm`) | Many viewers, or you already run Janus. |
 
-1. Build:
-
-```
-make -j$(nproc)
-# expect: built build/camstream (x264: yes)
-```
-
-2. No camera, software encode:
-
-```
-./build/camstream --test -e sw
-```
-
-3. Open `http://<server-ip>:8080/` in a browser on the same LAN.
-   Expect the test pattern within about 2 s. The server log must show
-   `ICE validated`, `DTLS connected, SRTP keys derived`,
-   `streaming video`.
-
-4. Check `/status` in a second browser tab or with curl:
-
-```
-curl -s http://<server-ip>:8080/status | head -c 400
-```
-
-   The session state should be `streaming` and `packets_sent` should
-   be growing.
-
-5. Real camera:
-
-```
-./build/camstream -d /dev/video0
-```
-
-6. Second viewer: open the URL in another browser (or a second
-   machine). Both must stream; `/status` lists both sessions on UDP
-   ports 50000 and 50001.
-
-7. Refresh the page a few times: each reload creates a new session,
-   the old one is closed, a fresh keyframe arrives within the keyframe
-   interval.
-
-## Troubleshooting
-
-Full reference: `docs/17_troubleshooting.md`. The short version:
-
-| Symptom | Likely cause | Check |
-| --- | --- | --- |
-| Server starts, browser shows `waiting for offer` / nothing | Wrong URL or firewall | curl the UI from the client machine; open the HTTP port |
-| `session create failed (UDP port busy?)` | Port in use or limit | `ss -ulnp | grep 500`, use `-u` to change the base port |
-| Offer accepted, no video, log stops after `signaling complete` | ICE never validated | Firewall between the machines dropping UDP 50000 to 50007; candidate IP not reachable from the browser (multi homed server: check `Host` header IP) |
-| `ICE validated` but no `DTLS connected` | Fingerprint mismatch or DTLS blocked | UDP must be open both ways; server clock not relevant (no timestamps in DTLS); check `verbose` output |
-| `DTLS connected` but no video | Encoder produced nothing | Run with `--test` to isolate; check `/status` `encoded_frames` grows; `-e sw` needs x264 built in |
-| Video but choppy | Bitrate for the link | Lower `-b`, or lower resolution; check `nacks`/`retx` counters in `/status` |
-| `no usable encoder` | Hardware encoder not found, no x264 | `v4l2-ctl -d /dev/video11 --list-formats-ext`; rebuild with x264 or `-e sw` |
-| Camera won't open | Permissions or busy | `video` group, `v4l2-ctl -d /dev/video0 --list-formats-ext`, close other users of the device |
-| Works in Firefox, not Chromium (or vice versa) | Should not happen after 2.0 | Check the server log candidate and fingerprint lines; both must be well formed |
-| Only first viewer gets video | Keyframe gap | Second viewer joins between keyframes: wait up to `-K` seconds, or reload |
-
-Server log messages worth knowing:
-
-- `rtc <id>: ICE validated (ip:port)`: first valid STUN check, peer
-  locked.
-- `rtc <id>: DTLS connected, SRTP keys derived`: media can flow.
-- `rtc <id>: streaming video`: first RTP packets sent.
-- `rtc <id>: keyframe requested (pli/fir)`: viewer asked for a refresh.
-- `rtc <id>: idle timeout` / `closed`: session ended.
-
-## libpeer Phase 3 - Fully Migrated Runtime
-
-Three backends are now available:
-
-- **Native** (`build/camstream`): ICE-lite + DTLS 1.2 + SRTP + RTP H.264 in own C code,
-  deps `libssl-dev`, `libsrtp2-dev`, `libx264-dev`, vendored `mongoose.c` - **minimal**
-- **libpeer** (`build/camstream-libpeer`): sepfy/libpeer PeerConnection (mbedTLS + bundled
-  libsrtp, usrsctp, cJSON), same V4L2/test pipeline and Mongoose signaling - **spec compliant**
-- **Janus** (`build/camstream-janus`): plain RTP H.264 over UDP to an external Janus
-  gateway process; no crypto/transport deps in the binary - **gateway multi-viewer**
-
-Build native (minimal):
 ```sh
-sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev
-make -j2
-./build/camstream --test --encoder sw --listen 0.0.0.0 --http-port 8080
-```
-
-Build libpeer (fully migrated runtime per Phase 3 spec):
-```sh
+# libpeer
 sudo apt install -y git cmake build-essential libx264-dev
-make libpeer
-make camstream-libpeer -j2
+make libpeer && make camstream-libpeer -j2
 ./build/camstream-libpeer --test --encoder sw --listen 0.0.0.0 --http-port 8000
 ```
 
-The libpeer binary:
-- Uses `src/webrtc/webrtc_session_libpeer.c` + `libpeer_global.c` (peer_init, PeerConnection per viewer)
-- Video path: V4L2/test -> FrameHub -> H264 (V4L2 M2M or x264) -> AU ring -> `peer_connection_send_video()`
-- Signaling: Mongoose `POST /rtc/offer` with raw SDP, answer from `peer_connection_create_answer()`
-- Media: libpeer manages UDP, ICE host candidates, DTLS-SRTP internally, `peer_connection_loop()` in main tick
-- Browser: same `RTCPeerConnection` JS, works offline RJ45 `192.168.1.10 <-> 192.168.1.20`
+The libpeer build routes V4L2/test → FrameHub → H.264 → AU ring →
+`peer_connection_send_video()`, with Mongoose still handling `POST /rtc/offer`
+and libpeer owning UDP, ICE, and DTLS-SRTP internally.
+See `docs/21_libpeer_runtime.md` and `docs/18_libpeer_phase3.md`.
 
-Details: `docs/21_libpeer_runtime.md` (new) and `docs/18_libpeer_phase3.md` (original evaluation).
+---
 
 ## Janus transport
 
-`build/camstream-janus` replaces only the browser-transport path: the same
-C capture/frame/encoder/vision code feeds an AU ring, and a dedicated
-`janus_rtp_sender` thread packetizes it (reusing `rtp_h264.c`, RFC 6184:
-single-NAL + FU-A, PT 96, 90 kHz clock) and `sendto()`s RTP to an external
-**Janus gateway** process, which does ICE/DTLS/SRTP/SDP and serves any
-number of WebRTC viewers.
+`camstream-janus` swaps only the browser-facing transport. The same C pipeline
+feeds an AU ring; a dedicated sender thread packetizes with the *same*
+`rtp_h264.c` and `sendto()`s plain RTP to a Janus gateway, which terminates
+WebRTC for arbitrarily many viewers.
 
 ```
-capture/encode (unchanged) -> AU ring -> janus_rtp_sender
-    -> RTP H.264 udp -> Janus streaming plugin (mountpoint "camstream")
-    -> WebRTC -> browser
-    <- RTCP PLI/FIR (Janus relays viewer keyframe requests -> force_idr)
+capture/encode (unchanged) → AU ring → janus_rtp_sender
+   → RTP H.264 / UDP → Janus streaming plugin (mountpoint "camstream")
+   → WebRTC → browsers
+   ← RTCP PLI/FIR relayed back → force_idr
 ```
 
-- **Zero crypto dependencies** in the app binary (`[-lx264] -lpthread -lm`).
-- **Keyframes stay in camstream**: Janus relays viewer PLI/FIR to a local RTCP
-  port; the sender parses it (reusing `rtcp.c`) and sets the same `force_idr`
-  flag the encoder worker already consumes. Sender reports every 5 s (first
-  immediately) also let Janus learn camstream's RTCP address.
-- **Mongoose keeps the dashboard**: `/status` shows Janus stats; the page and
-  its WebSocket client (`janus-client.js`, official `streamingtest.js` flow:
-  create → attach → list → watch → answer+start) are embedded at build time.
-- **Config**: `config/janus/janus.jcfg` (HTTP 8088, WS 8188) and
-  `config/janus/janus.plugin.streaming.jcfg` (mountpoint, RTP 5004 / RTCP
-  5005, PT 96). Copy into `/etc/janus/` and (re)start Janus. Ports used:
-  camstream→Janus RTP 5004, RTCP 5005; Janus→camstream RTCP 5006 (local);
-  camstream HTTP 8080.
-- **Unit test** (no camera/Janus needed): `make test-janus` runs the sender
-  against a fake Janus (UDP sockets) and checks packetization, FU-A
-  reconstruction, PLI→`force_idr`, SR contents and stats.
+- **No crypto in the binary** — links `[-lx264] -lpthread -lm`.
+- **Keyframe control stays in camstream**: Janus relays viewer PLI/FIR to a
+  local RTCP port, parsed by `rtcp.c`, raising the same `force_idr` flag the
+  encoder already honours. Sender reports every 5 s also teach Janus the
+  return address.
+- **Dashboard preserved**: `/status` reports Janus stats; `index.html` and
+  `janus-client.js` are embedded at build time via `tools/embed_assets.c`.
 
 ```sh
-sudo apt install -y janus-gateway        # or build Janus from source
+sudo apt install -y janus-gateway
 sudo cp config/janus/*.jcfg /etc/janus/ && sudo systemctl restart janus
 make camstream-janus -j2
-./build/camstream-janus --test -e sw     # browser: http://<host>:8080/?janus=<host>:8188&stream=1
+./build/camstream-janus --test -e sw
+# browser: http://<host>:8080/?janus=<host>:8188&stream=1
 ```
 
-Full details, port table and troubleshooting: `docs/22_janus_transport.md`.
+| Flow | Port |
+|---|---|
+| camstream → Janus RTP | 5004 |
+| camstream → Janus RTCP | 5005 |
+| Janus → camstream RTCP | 5006 |
+| camstream HTTP | 8080 |
+| Janus HTTP / WebSocket | 8088 / 8188 |
+
+`make test-janus` validates packetization, FU-A reassembly, PLI→`force_idr`,
+and SR contents against a fake gateway — no camera and no Janus required.
+Full detail: `docs/22_janus_transport.md`.
+
+---
+
+## Raspberry Pi
+
+Runs on Raspberry Pi OS bookworm, 32- or 64-bit.
+
+```sh
+sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
+make -j4
+sudo usermod -aG video "$USER"          # then log out and back in
+./build/camstream -d /dev/video0 -e hw:/dev/video11
+```
+
+- The **bcm2835 M2M H.264 encoder is `/dev/video11`**. It takes NV12
+  (preferred) or YU12; camstream interleaves I420→NV12 as needed and reads
+  Annex B straight off the capture queue.
+- The **camera module is managed by libcamera** and usually also appears as a
+  V4L2 node, typically `/dev/video0`. Enumerate with:
+
+  ```sh
+  v4l2-ctl --list-devices
+  v4l2-ctl -d /dev/video0 --list-formats-ext
+  ```
+
+- **Only one process may hold the sensor.** Stop `libcamera-hello`,
+  `rpicam-still`, and friends first.
+- **CPU budget**: `-e sw` handles 480p30 comfortably and 720p30 warm. Use
+  `-e hw` for 1080p.
+
+---
+
+## Acceptance tests
+
+Run in order; each isolates one layer.
+
+**1 — Build**
+
+```sh
+make -j"$(nproc)"     # expect: built build/camstream (x264: yes)
+make test             # STUN (incl. RFC 5769 vectors), vision, encoder worker
+```
+
+**2 — Pipeline without hardware**
+
+```sh
+./build/camstream --test -e sw
+```
+
+**3 — End-to-end** — open `http://<server-ip>:8080/` from another machine.
+Picture within ~2 s, and the log must reach:
+
+```
+rtc <id>: ICE validated (…)
+rtc <id>: DTLS connected, SRTP keys derived
+rtc <id>: streaming video
+```
+
+**4 — Telemetry**
+
+```sh
+curl -s http://<server-ip>:8080/status | head -c 400
+```
+
+State `streaming`, `packets_sent` climbing.
+
+**5 — Real camera** — `./build/camstream -d /dev/video0`
+
+**6 — Second viewer** — both stream; `/status` shows two sessions on UDP
+50000 and 50001.
+
+**7 — Churn** — reload several times. Each reload opens a new session, retires
+the old one, and gets an immediate keyframe.
+
+---
+
+## Troubleshooting
+
+Full matrix: `docs/17_troubleshooting.md`.
+
+### Read the log first
+
+| Line | Meaning |
+|---|---|
+| `signaling complete` | Answer sent; waiting for the browser's first check |
+| `ICE validated (ip:port)` | Authenticated STUN check; peer locked |
+| `DTLS connected, SRTP keys derived` | Media may now flow |
+| `streaming video` | First RTP packets sent |
+| `peer moved … (NAT rebind)` | Peer address changed; media followed |
+| `STUN MESSAGE-INTEGRITY invalid … sending 401` | Check failed authentication — see below |
+| `idle timeout` / `closed` | Session reaped |
+
+### Symptom → cause
+
+| Symptom | Likely cause | Check |
+|---|---|---|
+| Browser shows nothing, no session in log | Wrong URL or blocked TCP | `curl http://<ip>:8080/status` from the *client* |
+| `session create failed (UDP port busy?)` | Port occupied | `ss -ulnp \| grep 500` · change `-u` |
+| Log stops at `signaling complete`, **no UDP logged** | UDP genuinely blocked, or page opened via a proxy | Open TCP 8080 + UDP 50000-50007; use the LAN IP directly |
+| Log stops at `signaling complete`, **UDP arriving** | Checks received but rejected — read the next line | If it says `401`, ICE auth is failing, not the firewall |
+| `ICE validated` but no `DTLS connected` | Fingerprint mismatch or one-way UDP | UDP must pass **both** directions; run `-v` |
+| `DTLS connected` but no video | Encoder produced nothing | `/status` → `encoded_frames`; retry with `--test`; `-e sw` needs x264 |
+| Video stutters | Link cannot carry the bitrate | Lower `-b`, lower resolution; watch `nacks`/`retx` |
+| `no usable encoder` | No M2M node and no x264 | `v4l2-ctl -d /dev/video11 --list-formats-ext`; rebuild with x264 |
+| Camera will not open | Permissions or in use | `video` group; stop other camera apps |
+| Only the first viewer sees video | Keyframe gap | Should not occur — new viewers force an IDR; file a bug with `/status` |
+
+> **"ICE failed" does not imply a firewall.** If the log shows
+> `UDP STUN … bytes from …`, UDP is already arriving and the network is fine —
+> the packets are being *rejected*. Look at the line immediately after.
+
+---
 
 ## Repository layout
 
 ```
 include/
-  app/          app_config.h, app_server.h
-  media/        frame_pool.h, frame_hub.h, au_ring.h, video_source.h,
-                yuv_convert.h, h264_encoder.h,
-                source_worker.h, encoder_worker.h
-  webrtc/       ice_lite.h, dtls_srtp.h, rtp_h264.h, rtcp.h, sdp.h,
-                webrtc_session.h
-  janus/         janus_rtp_sender.h (RTP sender thread for Janus transport)
-  vision/       frame_matrix.h, vision_worker.h (profiles, motion search,
-                newest-frame mosaic worker)
+  app/        app_config.h · app_server.h
+  media/      frame_pool · frame_hub · au_ring · video_source · yuv_convert
+              h264_encoder · source_worker · encoder_worker
+  webrtc/     ice_lite · dtls_srtp · rtp_h264 · rtcp · sdp · webrtc_session
+  janus/      janus_rtp_sender.h
+  vision/     frame_matrix.h · vision_worker.h
+
 src/
-  camstream_main.c   entry point, signal handling
-  app/               app_config.c (CLI), app_server.c (HTTP + main loop),
-                     web_ui.c (embedded viewer page)
-  media/             frame_pool.c, frame_hub.c, au_ring.c,
-                     v4l2_source.c, test_source.c, yuv_convert.c,
-                     h264_encoder.c (dispatcher), encoder_x264.c,
-                     encoder_v4l2m2m.c, source_worker.c, encoder_worker.c
-  webrtc/            ice_lite.c (STUN, UDP demux), dtls_srtp.c (OpenSSL
-                     DTLS + RFC 5764 export + libsrtp2), rtp_h264.c
-                     (RFC 6184 packetizer), rtcp.c (SR/RR/PLI/FIR/NACK),
-                     sdp.c (offer parse, answer build),
-                     webrtc_session.c (session state machine)
-  janus/             janus_rtp_sender.c (RTP send thread, RTCP PLI/SR)
-tools/
-  embed_assets.c     build-time: files -> C byte arrays (Janus web assets)
-web/
-  janus/             index.html (dashboard), janus-client.js (WS client)
-config/
-  janus/             janus.jcfg, janus.plugin.streaming.jcfg (gateway side)
-third_party/
-  mongoose/        Mongoose 7.x (HTTP only)
-docs/
-  10_architecture.md      detailed data flow and threading
-  11_webrtc_internals.md  protocol layer by layer
-  12_build_reference.md   dependency and build notes
-  13_lan_two_laptops.md   LAN setup walkthrough
-  14_raspberry_pi.md      Pi setup in depth
-  15_optimization_notes.md
-  16_protocol_reference.md  SDP/STUN/DTLS/SRTP/RTP/RTCP tables
-  17_troubleshooting.md   symptom by symptom guide
-  18_libpeer_phase3.md     libpeer build and migration boundary
-  19_execution_roadmap.md  phases 1 through 5 and acceptance checklist
-  20_webrtc_zero_latency.md offline Pi-to-laptop WebRTC deployment
-  22_janus_transport.md     Janus gateway transport (ports, RTCP, troubleshooting)
-Makefile
+  camstream_main.c        entry point, signal handling
+  app/                    app_config.c   CLI parsing
+                          app_server.c   HTTP routes + main poll loop
+                          web_ui.c       embedded viewer page
+  media/                  frame_pool · frame_hub · au_ring
+                          v4l2_source · test_source · yuv_convert
+                          h264_encoder (dispatch) · encoder_x264 · encoder_v4l2m2m
+                          source_worker · encoder_worker
+  webrtc/                 ice_lite.c     STUN + UDP demux
+                          dtls_srtp.c    OpenSSL DTLS, RFC 5764 export, libsrtp2
+                          rtp_h264.c     RFC 6184 packetizer
+                          rtcp.c         SR / RR / PLI / FIR / NACK / BYE
+                          sdp.c          offer parse, answer build
+                          webrtc_session.c  per-viewer state machine
+                          webrtc_session_libpeer.c · libpeer_global.c
+  janus/                  janus_rtp_sender.c
+  vision/                 frame_matrix · vision_capture · vision_worker
+
+tests/      test_stun.c (incl. RFC 5769 vectors) · test_vision.c
+            test_encoder_worker.c · test_janus_sender.c
+tools/      embed_assets.c        build-time asset → C array
+web/janus/  index.html · janus-client.js
+config/janus/  janus.jcfg · janus.plugin.streaming.jcfg
+third_party/mongoose/   Mongoose 7.x (HTTP only)
+docs/       10_architecture · 11_webrtc_internals · 12_build_reference
+            13_lan_two_laptops · 14_raspberry_pi · 15_optimization_notes
+            16_protocol_reference · 17_troubleshooting · 18_libpeer_phase3
+            19_execution_roadmap · 20_webrtc_zero_latency · 21_libpeer_runtime
+            22_janus_transport
 ```
 
-Vision smoke pipeline:
+Vision smoke tool:
 
-```
+```sh
 make vision-capture
 ./build/vision-capture --test -W 640 -H 480 -F 30 -s 10 -o build/mosaic
 ```
 
-This writes a grayscale PGM and an intensity-derived OBJ mosaic.
+Writes a grayscale PGM and an intensity-derived OBJ mosaic.
 
-## Version
+---
 
-2.0.0. WebRTC only: the 1.x WebSocket/HTTP chunked video transport is
-gone; if a page, script or note in your setup still references
-`/stream` or `ws://` it belongs to 1.x.
+## Tuning constants
+
+Compile-time, with the file that owns each.
+
+| Constant | Value | Where |
+|---|---|---|
+| `MAX_RTC_SESSIONS` | 8 | `src/app/app_server.c` |
+| `AU_RING_SLOTS` × `AU_SLOT_CAPACITY` | 8 × 512 KiB | `src/app/app_server.c` |
+| `RTP_MAX_PACKET` | 1200 B | `include/webrtc/rtp_h264.h` |
+| `RETX_CACHE_SIZE` | 512 packets | `src/webrtc/webrtc_session.c` |
+| `SESSION_IDLE_TIMEOUT_MS` | 15000 | `src/webrtc/webrtc_session.c` |
+| `SESSION_DTLS_WATCHDOG_MS` | 30000 | `src/webrtc/webrtc_session.c` |
+| `RTCP_SR_INTERVAL_MS` | 1000 | `src/webrtc/webrtc_session.c` |
+| `SRTP_KEY_MATERIAL_LEN` | 60 B | `src/webrtc/dtls_srtp.c` |
+
+---
+
+## Standards implemented
+
+| RFC | What |
+|---|---|
+| 3711 | SRTP — `AES_CM_128_HMAC_SHA1_80` |
+| 3550 / 3551 | RTP and RTCP |
+| 4585 / 5104 | RTCP feedback: PLI, FIR |
+| 4588 | Retransmission / NACK |
+| 5245 · 8445 | ICE, ICE-lite |
+| 5389 · 5769 | STUN, and its published test vectors |
+| 5764 | DTLS-SRTP key export |
+| 6184 | RTP payload for H.264 — single-NAL, FU-A |
+| 6347 | DTLS 1.2 |
+| 7983 | Multiplexing STUN / DTLS / RTP on one port |
+| 8839 · 8842 | SDP for ICE and DTLS-SRTP |
+
+---
+
+## Versioning
+
+**2.0.0.** WebRTC-only. The 1.x WebSocket / HTTP-chunked video transport has
+been removed — if any page, script, or note still references `/stream` or a
+`ws://` video URL, it belongs to 1.x and will not work.
