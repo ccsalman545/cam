@@ -1,5 +1,7 @@
 # Build reference
 
+[camstream docs](README.md) / 12. Build reference &nbsp;·&nbsp; [README](../README.md)
+
 ## Toolchain
 
 - C11 compiler (gcc 8+ or clang 10+)
@@ -25,10 +27,26 @@ sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
 ## Targets
 
 ```bash
-make                # build/camstream, the WebRTC server (default)
-make clean          # remove build/
-make help           # quick reference
+make                      # build/camstream, the WebRTC server (default)
+make camstream-janus      # build/camstream-janus, RTP to an external Janus gateway
+make camstream-libpeer    # build/camstream-libpeer, the libpeer backend
+make libpeer              # clone and build upstream libpeer under build/ (needs network)
+make libpeer-backend      # alias for camstream-libpeer
+make test                 # run test_stun, test_vision, test_encoder_worker
+make test-janus           # run the Janus RTP sender test against a fake gateway
+make vision-capture       # build the PGM/OBJ mosaic smoke tool
+make vision-test          # build and run the vision unit test alone
+make clean                # remove build/
+make help                 # quick reference
 ```
+
+| Target | Needs a camera | Needs network | External libraries |
+|---|---|---|---|
+| `camstream` | no | no | OpenSSL, libsrtp2, optional x264 |
+| `camstream-janus` | no | no | optional x264 only |
+| `camstream-libpeer` | no | yes, to fetch libpeer once | cmake, git, optional x264 |
+| `test`, `vision-test` | no | no | `libcrypto` for `test_stun` |
+| `test-janus` | no | no | none beyond libc and pthread |
 
 ## Make variables
 
@@ -61,7 +79,14 @@ libsrtp2 can be compiled directly from source without autotools: compile `srtp/s
 
 ## Compile time switches
 
-`-DHAVE_X264=1` is the only project switch, set by the Makefile. Feature macros (`_DEFAULT_SOURCE`, `_POSIX_C_SOURCE=200809L`) come from the Makefile as well, so sources stay plain C11.
+All of them come from the Makefile, so the sources stay plain C11.
+
+| Macro | Set by | Effect |
+|---|---|---|
+| `HAVE_X264=0/1` | every target | Enables the libx264 software encoder. Autodetected, or forced with `HAVE_X264=` |
+| `USE_JANUS_TRANSPORT=1` | `camstream-janus` | Swaps the WebRTC transport for the Janus RTP sender and the Janus dashboard |
+| `USE_LIBPEER=1` | `camstream-libpeer` | Swaps the native stack for the libpeer runtime |
+| `_DEFAULT_SOURCE`, `_POSIX_C_SOURCE=200809L` | every target | POSIX feature macros |
 
 ## Cross compiling
 
@@ -80,3 +105,9 @@ make CC=aarch64-linux-gnu-gcc \
 | Raspberry Pi OS Bullseye and Bookworm | fully supported, hardware encoder auto-detected |
 | 32 bit ARM | supported (compile time checks pass), hardware encoder recommended |
 | macOS and Windows | not supported (V4L2 is Linux only) |
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[11. WebRTC internals](11_webrtc_internals.md) | **Index**<br>[docs](README.md) | **Next**<br>[13. Two laptops, one cable](13_lan_two_laptops.md) |

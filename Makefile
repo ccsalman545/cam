@@ -313,6 +313,11 @@ test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_
 test-janus: $(BUILD_DIR)/test_janus_sender
 	$(BUILD_DIR)/test_janus_sender
 
+# Documentation lint: dash style, link resolution, anchor and index coverage.
+.PHONY: check-docs
+check-docs:
+	./tools/check_docs.sh
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -323,7 +328,11 @@ help:
 	@echo "  make camstream-libpeer build build/camstream-libpeer (libpeer runtime, Phase 3 fully migrated)"
 	@echo "  make libpeer          clone/build upstream libpeer in build/ (needs network)"
 	@echo "  make libpeer-backend  alias for camstream-libpeer"
+	@echo "  make test             run the STUN, vision and encoder-worker unit tests"
 	@echo "  make test-janus       unit test for the Janus RTP sender (no camera/Janus needed)"
+	@echo "  make vision-capture   build the PGM/OBJ mosaic smoke tool"
+	@echo "  make vision-test      build and run the vision unit test alone"
+	@echo "  make check-docs       lint README.md and docs/ (dash style, links, index)"
 	@echo "  make clean            remove build/"
 	@echo ""
 	@echo "examples:"

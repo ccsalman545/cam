@@ -1,5 +1,7 @@
 # WebRTC internals
 
+[camstream docs](README.md) / 11. WebRTC internals &nbsp;·&nbsp; [README](../README.md)
+
 This document explains every protocol step the C server implements, and where each piece lives in the code.
 
 ## Protocol stack
@@ -123,3 +125,9 @@ x264 honors the flag with `X264_TYPE_IDR`; the hardware path uses `V4L2_BUF_FLAG
 | out | RTP H.264 (SRTP protected) | 1200 byte ceiling, FU-A for large NALs |
 
 Full byte layouts: see [16_protocol_reference.md](16_protocol_reference.md).
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[10. Architecture](10_architecture.md) | **Index**<br>[docs](README.md) | **Next**<br>[12. Build reference](12_build_reference.md) |

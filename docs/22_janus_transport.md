@@ -1,4 +1,6 @@
-# Janus Transport (`camstream-janus`)
+# Janus transport (`camstream-janus`)
+
+[camstream docs](README.md) / 22. Janus transport &nbsp;·&nbsp; [README](../README.md)
 
 This document describes the **Janus gateway transport**, a third transport
 backend that streams H.264 to browsers via the [Janus WebRTC gateway](https://janus.conf.meetecho.com/)
@@ -10,7 +12,7 @@ as an **external native C process**.
 |---------|-------------------------|-------------------|--------------|--------|
 | **native** (`build/camstream`) | ICE-lite + DTLS 1.2 + SRTP + RTP H.264 (own C implementation) | WebRTC (camstream is the peer) | `libssl-dev`, `libsrtp2-dev`, `libx264-dev` | `build/camstream` |
 | **libpeer** (`build/camstream-libpeer`) | libpeer PeerConnection | WebRTC (libpeer is the peer) | cmake, git, libpeer | `build/camstream-libpeer` |
-| **janus** (`build/camstream-janus`) | **Plain RTP over UDP** — no ICE, no DTLS, no SRTP in camstream | WebRTC (Janus is the peer) | none beyond libc/libpthread (Janus installed separately) | `build/camstream-janus` |
+| **janus** (`build/camstream-janus`) | **Plain RTP over UDP**, with no ICE, no DTLS, and no SRTP in camstream | WebRTC (Janus is the peer) | none beyond libc/libpthread (Janus installed separately) | `build/camstream-janus` |
 
 The capture, frame, encoder and vision pipelines are **identical** across all
 three. Only the transport changes. In Janus mode camstream does exactly what a
@@ -33,7 +35,7 @@ Benefits:
 
 ## Architecture
 
-```
+```text
 +---------------------------------------------------------------+
 | camstream-janus (this repo, plain C)                          |
 |                                                               |
@@ -72,8 +74,8 @@ Benefits:
 The browser keeps **two independent connections**:
 
 1. HTTP to camstream's Mongoose (`:8080`) for the dashboard, `/status` and the
-   client script — same as the native backend.
-2. WebSocket to Janus (`:8188`) for the WebRTC session — same flow as the
+   client script, same as the native backend.
+2. WebSocket to Janus (`:8188`) for the WebRTC session, the same flow as the
    official Janus `streamingtest.js` example (see below).
 
 ## Ports
@@ -100,7 +102,7 @@ A single dedicated thread:
   20 ms timeout. The socket is **non-blocking**; the handler drains the queue
   and returns to poll(), so a stop request is always honored within ~20 ms.
 - **Drain the AU ring** and packetize each access unit with the existing
-  `rtp_h264.c` packetizer (single-NAL units + FU-A per RFC 6184 — no new
+  `rtp_h264.c` packetizer (single-NAL units and FU-A per RFC 6184, no new
   packetizer was written), using a sink that `sendto()`s each complete RTP
   packet to Janus.
 - **Sender Reports**: one RTCP SR every 5 s (first one immediately at start),
@@ -114,12 +116,12 @@ count, send errors) exposed through `/status`.
 
 ### Reused, untouched
 
-- `src/webrtc/rtp_h264.c` — packetization (SSRC/PT/sequence/timestamp are
-  configured for the Janus stream: PT 96, 90 kHz).
-- `src/webrtc/rtcp.c` — SR builder + RTCP feedback parser.
-- `src/media/au_ring.c`, `src/media/encoder_worker.c`, `src/media/v4l2_source.c`
-  — no changes.
-- `src/app/web_ui.c` — in the janus build it serves the Janus dashboard and
+- `src/webrtc/rtp_h264.c`: packetization. SSRC, payload type, sequence, and
+  timestamp are configured for the Janus stream (PT 96, 90 kHz).
+- `src/webrtc/rtcp.c`: SR builder and RTCP feedback parser.
+- `src/media/au_ring.c`, `src/media/encoder_worker.c`,
+  `src/media/v4l2_source.c`: no changes.
+- `src/app/web_ui.c`: in the janus build it serves the Janus dashboard and
   client script (embedded at build time by `tools/embed_assets.c`, which turns
   `web/janus/index.html` and `web/janus/janus-client.js` into C byte arrays).
 
@@ -149,9 +151,9 @@ query parameters, so the same dashboard works on the Pi or a laptop.
 
 Two files in `config/janus/`:
 
-- **`janus.jcfg`** — minimal core config: listen on `0.0.0.0`, HTTP API on
+- **`janus.jcfg`**: minimal core config. Listen on `0.0.0.0`, HTTP API on
   `8088`, WebSockets on `8188`.
-- **`janus.plugin.streaming.jcfg`** — the mountpoint camstream feeds.
+- **`janus.plugin.streaming.jcfg`**: the mountpoint camstream feeds.
   (Filename follows Janus's real plugin-config convention.)
 
 ```ini
@@ -178,7 +180,7 @@ sudo systemctl restart janus
 
 Notes:
 
-- Janus **binds the mountpoint ports at plugin load** — restart Janus after
+- Janus **binds the mountpoint ports at plugin load**, so restart Janus after
   changing them.
 - `videofmtp` is kept minimal (`packetization-mode=1` only, no
   `profile-level-id`) so the offer stays valid for any encoder level; the
@@ -191,7 +193,7 @@ Notes:
 New CLI options (Janus build; the `--webrtc` flag is build-validated so a
 wrong value fails fast with a helpful message):
 
-```
+```text
 --webrtc janus             transport backend (this build: janus only)
 --janus-host 127.0.0.1     Janus RTP/RTCP destination host
 --janus-rtp-port 5004      Janus RTP port (mountpoint videoport)
@@ -217,14 +219,14 @@ On a Pi with the V4L2 M2M H.264 encoder:
 Open `http://<pi>:8080/` (the dashboard auto-connects to the Janus on the same
 host) or be explicit:
 
-```
+```text
 http://<pi>:8080/?janus=<pi>:8188&stream=1
 ```
 
-## RTCP and keyframes — how it works
+## RTCP and keyframes: how it works
 
 Janus's streaming plugin relays viewer keyframe requests (PLI/FIR) to the RTP
-source by sending a 12-byte RTCP PLI to the source's RTCP address — **but it
+source by sending a 12-byte RTCP PLI to the source's RTCP address, **but it
 only learns that address from datagrams it receives on the mountpoint RTCP
 port (5005)**. That is why the sender reports matter:
 
@@ -238,7 +240,7 @@ port (5005)**. That is why the sender reports matter:
    for the native backend's per-session IDR requests.
 
 Without the SR, step 2 never happens and keyframe requests are silently
-dropped by Janus — a new viewer would wait up to the keyframe interval
+dropped by Janus, so a new viewer would wait up to the keyframe interval
 (default 2 s) for a sync point.
 
 ## Building and testing
@@ -257,7 +259,7 @@ sockets) and verifies, with synthetic access units:
 - PLI → `force_idr` (same FMT=1 layout Janus uses),
 - SR contents (PT 200, SSRC, packet count) and sender stats.
 
-```
+```text
 $ make test-janus
 ...
 65 checks, 0 failures
@@ -270,8 +272,8 @@ $ make test-janus
 | No video, dashboard shows `janus: connected`, stream `preparing` | Janus log: `journalctl -u janus -f`. The mountpoint must be loaded (check `videoport`/`videortcpport` in the log). |
 | `EADDRINUSE` at startup | Port 5004/5005 already used (e.g. another Janus) or 5006 busy. Change `--janus-rtp-port`/`--janus-rtcp-port`/`--janus-rtcp-listen` **and** the matching values in the jcfg, then restart Janus. |
 | Janus log says it got media but browser shows nothing | Browser console: WebSocket open to Janus? `watch` sent? answer sent only after ICE gathering completes. Try `?stun=` if NAT is involved. |
-| First frame takes ~2 s | Expected if Janus hadn't sent a PLI at connect (keyframe interval). PLIs after that should be sub-second — check `/status` `janus.pli_received` increments when you reload the page. |
-| PLI never arrives (`pli_received` stays 0) | The SR must be reaching Janus first (port 5005 open in the firewall — Janus only learns camstream's RTCP address from the SR datagram). |
+| First frame takes ~2 s | Expected if Janus hadn't sent a PLI at connect (keyframe interval). PLIs after that should be sub-second. Check that `/status` `janus.pli_received` increments when you reload the page. |
+| PLI never arrives (`pli_received` stays 0) | The SR must be reaching Janus first (port 5005 open in the firewall, because Janus only learns camstream's RTCP address from the SR datagram). |
 | `make camstream-janus` says `x264: no` | No libx264 in this environment. On a Pi use `-e hw` (V4L2 M2M) or install `libx264-dev` and pass `X264_DIR=...`. |
 | `/status` shows send errors | `sendto` ECONNREFUSED once at startup is normal if Janus hasn't bound 5004 yet; persistent errors mean the RTP port/host don't match the mountpoint. |
 
@@ -284,3 +286,9 @@ $ make test-janus
 - **No audio**: the mountpoint carries the H.264 video stream only.
 - **Single RTP source per mountpoint**: one camstream process per mountpoint
   (multiple camstreams need multiple mountpoints/ids).
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[21. libpeer runtime](21_libpeer_runtime.md) | **Index**<br>[docs](README.md) | **Next**<br>end of the series |

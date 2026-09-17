@@ -1,5 +1,7 @@
 # Raspberry Pi guide
 
+[camstream docs](README.md) / 14. Raspberry Pi guide &nbsp;·&nbsp; [README](../README.md)
+
 camstream targets Raspberry Pi OS (Bookworm, Bullseye) on Pi 3, 4, 5 and Zero 2 W. 64 bit OS is recommended: libx264 and OpenSSL packages are faster and fully supported there.
 
 ## Why the hardware encoder matters
@@ -143,3 +145,9 @@ journalctl -u camstream -f
 | video stutters on Pi 3 | USB bandwidth plus software encode | use `-e hw`, lower resolution and fps |
 | session drops after 15 s idle log line | keepalive packets not reaching the Pi | check firewall for the UDP range, see troubleshooting doc |
 | encoder probe opens the CSI camera node | pointed at a capture node that is not M2M | use `-e hw:/dev/video11` with the exact encoder node |
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[13. Two laptops, one cable](13_lan_two_laptops.md) | **Index**<br>[docs](README.md) | **Next**<br>[15. Optimization notes](15_optimization_notes.md) |

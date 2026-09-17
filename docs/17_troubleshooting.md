@@ -1,5 +1,7 @@
 # Troubleshooting
 
+[camstream docs](README.md) / 17. Troubleshooting &nbsp;·&nbsp; [README](../README.md)
+
 Start at the top of the decision tree and follow the first failing step.
 
 ```mermaid
@@ -12,7 +14,6 @@ flowchart TB
     D -- no --> D1["check server log for\n'offer is missing' errors\nuse a recent browser"]
     D -- yes --> E{"ICE step green?"}
     E -- no --> E1["firewall UDP 50000 to 50008\nno proxy between browser and server"]
-    E -- no2["red"] --> E1
     E -- yes --> F{"DTLS step green?"}
     F -- no --> F1["very old browser or MTU path\nverify UDP is not filtered after the\nfirewall (router, VPN, proxy)"]
     F -- yes --> G{"stats show frames decoded?"}
@@ -85,3 +86,9 @@ Include:
 3. `curl -s http://server:8080/status`
 4. what the dashboard timeline showed when it failed
 5. `chrome://webrtc-internals` dump if the failure is media side
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[16. Protocol reference](16_protocol_reference.md) | **Index**<br>[docs](README.md) | **Next**<br>[18. libpeer phase 3](18_libpeer_phase3.md) |

@@ -1,5 +1,7 @@
 # Architecture
 
+[camstream docs](README.md) / 10. Architecture &nbsp;·&nbsp; [README](../README.md)
+
 camstream 2.0 is a single process with three long lived threads and a strictly layered data path:
 
 ```mermaid
@@ -43,7 +45,7 @@ Dependency rule: media never calls webrtc, webrtc never calls mongoose, only app
 
 | Thread | Owns | Blocking behavior |
 |---|---|---|
-| main (network) | Mongoose loop, all RTC sessions, WS sender | poll() with 10 ms ceiling, plus DTLS timer deadlines |
+| main (network) | Mongoose loop, all RTC sessions, RTP fan-out to every viewer | poll() with 10 ms ceiling, plus DTLS timer deadlines |
 | source worker | VideoSource, hub publish | blocks in poll(DQBUF) up to 200 ms |
 | encode worker | hub consumer, converter, encoder, AU ring | sleeps 2 ms when no new frame |
 
@@ -60,7 +62,7 @@ sequenceDiagram
     participant S as source worker
     participant H as hub
     participant E as encoder worker
-    participant W as WS sender
+    participant W as consumer N
     S->>H: publish (copies once into pooled frame, refcount 1)
     H->>E: mailbox slot (refcount 2)
     H->>W: mailbox slot (refcount 2, replaces stale frame)
@@ -68,9 +70,13 @@ sequenceDiagram
     W->>H: unref after send (refcount 0, buffer freed to pool)
 ```
 
+The hub is written for N subscribers. Version 2.0 subscribes exactly one, the
+encoder worker, because the raw frames no longer travel to a viewer: only
+encoded access units do.
+
 **au_ring**: 8 slots x 512 KB for encoded access units. Producer overwrites the oldest slot under pressure: for live video, freshness beats completeness.
 
-Keep-newest semantics apply end to end. A slow consumer sees the newest frame and never accumulates a backlog; the previous frame is dropped and counted (`au_dropped`, `frames_dropped` in `/status`).
+Keep-newest semantics apply end to end. A slow consumer sees the newest frame and never accumulates a backlog. The frame a mailbox replaces is discarded silently; overwrites in the AU ring are counted and reported as `au_dropped` in `/status`.
 
 ## Video source abstraction
 
@@ -105,3 +111,9 @@ The network thread owns sessions exclusively: no locks needed anywhere in src/we
 `src/app/web_ui.c` embeds the complete dashboard as one C string: no external asset loading, no CDN, works on an isolated LAN. It contains the WebRTC player with `getStats()` polling, sparkline charts, the six step connection timeline, the viewer table and the server card.
 
 WebRTC is the only media transport in this project: there is no second streaming protocol, no MJPEG, no RTSP and no raw-frame WebSocket channel. Mongoose serves the page and the WebRTC signaling (`/rtc/offer`, `/rtc/close`) over HTTP; all video goes over the WebRTC stack (ICE, DTLS, SRTP, RTP) on UDP.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>start of the series | **Index**<br>[docs](README.md) | **Next**<br>[11. WebRTC internals](11_webrtc_internals.md) |

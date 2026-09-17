@@ -1,7 +1,12 @@
-# WebRTC-first offline Ethernet deployment
+# Offline Ethernet deployment
 
-The WebRTC path is the primary product path for this project. The matrix and
-libpeer work must not be allowed to interfere with it.
+[camstream docs](README.md) / 20. Offline Ethernet deployment &nbsp;·&nbsp; [README](../README.md)
+
+This is the reference deployment for camstream: a Raspberry Pi with a camera,
+wired directly to a laptop that runs only a browser, with no internet in the
+path. It defines the media route, the latency budget that route is held to, and
+the checks that prove both. The vision and libpeer work sits beside this path
+and must never interfere with it.
 
 ## Actual media path
 
@@ -119,10 +124,11 @@ The target is minimum practical glass-to-glass latency, not a zero timestamp.
 When the page connects, the server log should progress through:
 
 ```text
-signaling complete
-ICE validated
-DTLS connected, SRTP keys derived
-streaming video
+rtc <id>: signaling complete (slot 0, <advertise-ip>)
+rtc <id>: ICE validated (<peer-ip>:<port>) username=…
+rtc <id>: state -> dtls
+rtc <id>: state -> streaming
+rtc <id>: streaming video
 ```
 
 The browser dashboard should show:
@@ -190,3 +196,9 @@ src/app/web_ui.c
 The libpeer build is optional and isolated. The vision worker is also an
 optional separate consumer. Neither should replace, block or initialize a
 second WebRTC stack in the production `camstream` process.
+
+---
+
+| | | |
+|---|---|---|
+| **Previous**<br>[19. Execution roadmap](19_execution_roadmap.md) | **Index**<br>[docs](README.md) | **Next**<br>[21. libpeer runtime](21_libpeer_runtime.md) |
