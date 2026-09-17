@@ -110,6 +110,21 @@ static socklen_t peer_socklen(const struct sockaddr_storage *peer)
     return sizeof(struct sockaddr_storage);
 }
 
+static void stun_send_error(const RtcSession *session,
+                            const uint8_t tid[12],
+                            uint16_t code,
+                            const struct sockaddr_storage *source)
+{
+    uint8_t err[64];
+    size_t err_len = 0;
+
+    if (stun_build_error_response(tid, code, err, sizeof(err), &err_len) == 0) {
+        sendto(session->udp_fd, err, err_len, 0,
+               (const struct sockaddr *) source,
+               peer_socklen(source));
+    }
+}
+
 static void format_peer(const struct sockaddr_storage *source,
                         char *ip, size_t ip_size, uint16_t *port)
 {
@@ -479,27 +494,71 @@ void rtc_session_on_udp(RtcSession *session,
         stun_copy_username(buffer, length, username, sizeof(username));
 
         if (!stun_is_binding_request(buffer, length, tid)) {
+            /*
+             * STUN Binding *indication* (0x0011, RFC 5245 §10
+             * keepalive) is a legitimate packet that needs no
+             * response; count it quietly instead of logging
+             * one line every 15 s per viewer.
+             */
+            uint16_t stype = (uint16_t) (((uint16_t) buffer[0] << 8) |
+                                         (uint16_t) buffer[1]);
+
+            if (stype == 0x0011 && length >= STUN_HEADER_SIZE) {
+                session->stats.stun_ok++;
+                break;
+            }
+
             printf("rtc %08x: STUN ignored (not a binding request) "
                    "from %s:%u len=%zu\n",
                    session->config.id, ip, port, length);
             break;
         }
 
+        /*
+         * RFC 5389 §7.2 / RFC 5245: verify MESSAGE-INTEGRITY
+         * before acting on the request.  The ice-ufrag is in
+         * the public SDP answer, so without this any host on
+         * the network can forge a "valid" check from its own
+         * address and claim the peer slot.  Answer 401 per
+         * RFC 5245 §16.5 instead of dropping silently.
+         */
+        if (!stun_verify_mi(buffer, length, session->local_pwd)) {
+            session->stats.stun_bad_user++;
+            printf("rtc %08x: STUN MESSAGE-INTEGRITY invalid from %s:%u "
+                   "(user '%s'); sending 401\n",
+                   session->config.id, ip, port,
+                   username[0] ? username : "(missing)");
+            stun_send_error(session, tid, 401, source);
+            break;
+        }
+
         if (!stun_username_matches(buffer, length, session->local_ufrag)) {
             session->stats.stun_bad_user++;
             printf("rtc %08x: STUN username mismatch from %s:%u "
-                   "(got '%s', want '%s:<peer-ufrag>')\n",
+                   "(got '%s', want '%s:<peer-ufrag>'); sending 401\n",
                    session->config.id, ip, port,
                    username[0] ? username : "(missing)",
                    session->local_ufrag);
+            stun_send_error(session, tid, 401, source);
             break;
         }
 
         session->stats.stun_ok++;
 
         /*
-         * Valid connectivity check: lock the peer address
-         * and answer.
+         * Valid connectivity check (or RFC 7675 consent
+         * freshness check): record the peer address and
+         * answer.
+         *
+         * ICE-lite (RFC 8445 §6.2) tracks the peer as the
+         * source of the LATEST valid check: when the client's
+         * NAT rebinds (Wi-Fi <-> cellular, router restart,
+         * per-flow mapping changes) the browser's keepalives,
+         * DTLS and RTCP all arrive from the new source
+         * address.  Locking the first check's address would
+         * keep sending media into a dead 5-tuple and the
+         * stream dies silently, so the peer follows every
+         * valid check.
          */
         if (!session->have_remote) {
             session->remote = *source;
@@ -507,6 +566,24 @@ void rtc_session_on_udp(RtcSession *session,
 
             printf("rtc %08x: ICE validated (%s:%u) username=%s\n",
                    session->config.id, ip, port, username);
+        } else {
+            const struct sockaddr_in *s4 = (const struct sockaddr_in *) source;
+            const struct sockaddr_in *r4 =
+                (const struct sockaddr_in *) &session->remote;
+
+            if (s4->sin_addr.s_addr != r4->sin_addr.s_addr ||
+                s4->sin_port != r4->sin_port) {
+                char old_ip[INET6_ADDRSTRLEN];
+                uint16_t old_port = 0;
+
+                format_peer(&session->remote, old_ip, sizeof(old_ip),
+                            &old_port);
+                printf("rtc %08x: peer moved %s:%u -> %s:%u (NAT rebind); "
+                       "media follows latest valid check\n",
+                       session->config.id, old_ip, old_port, ip, port);
+                session->remote = *source;
+                session->stats.peer_moved++;
+            }
         }
 
         if (session->state == RTC_NEW) {
@@ -573,7 +650,15 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
      * too (otherwise a vanished browser would hold the slot
      * forever).
      */
-    if (now - session->last_rx_ms > SESSION_IDLE_TIMEOUT_MS) {
+    /*
+     * A future timestamp means "fresh" (the clock source can lag
+     * behind the value a just created session was stamped with),
+     * so treat underflow as zero instead of as a huge age.
+     */
+    uint64_t idle_ms = now >= session->last_rx_ms ?
+        now - session->last_rx_ms : 0;
+
+    if (idle_ms > SESSION_IDLE_TIMEOUT_MS) {
         printf("rtc %08x: idle timeout (stun_rx=%u stun_ok=%u stun_bad_user=%u)\n",
                session->config.id,
                session->stats.stun_rx,
@@ -584,10 +669,14 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
     }
 
     /*
-     * Handshake watchdog.
+     * Handshake watchdog. Same underflow guard as the idle
+     * timeout above.
      */
+    uint64_t age_ms = now >= session->created_ms ?
+        now - session->created_ms : 0;
+
     if (session->state == RTC_ICE &&
-        now - session->created_ms > SESSION_DTLS_WATCHDOG_MS) {
+        age_ms > SESSION_DTLS_WATCHDOG_MS) {
         printf("rtc %08x: DTLS never started\n", session->config.id);
         rtc_session_close(session);
         return;
@@ -599,7 +688,15 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
      * Sender reports.
      */
     if (session->state == RTC_STREAMING && now >= session->next_sr_ms) {
-        uint8_t sr[RTCP_SR_SIZE];
+        /*
+         * srtp_protect_rtcp() works in place and expands the 32 bit
+         * RTCP header to a 64 bit SRTCP header (+4 bytes) while
+         * appending the auth tag (+10 bytes), so the buffer needs
+         * 14 bytes of headroom beyond the RTCP payload. Sizing it
+         * to exactly RTCP_SR_SIZE overflowed the stack on every
+         * sender report.
+         */
+        uint8_t sr[RTCP_SR_SIZE + 16];
 
         rtcp_build_sender_report(sr,
                                  rtp_h264_ssrc(session->rtp),
@@ -710,9 +807,16 @@ void rtc_session_close(RtcSession *session)
         return;
     }
 
-    dtls_srtp_close(session->dtls);
-
+    /*
+     * Mark the session closed BEFORE tearing down DTLS:
+     * dtls_srtp_close() fires the state callback, which calls
+     * rtc_session_close() back. With the state still open, that
+     * re-entrant call would run the whole close sequence (and the
+     * on_closed callback) a second time.
+     */
     set_state(session, RTC_CLOSED);
+
+    dtls_srtp_close(session->dtls);
 
     if (session->config.on_closed != NULL) {
         session->config.on_closed(session->config.server, session);

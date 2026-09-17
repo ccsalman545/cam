@@ -83,4 +83,33 @@ int stun_build_binding_response(const char *local_pwd,
                                 size_t out_capacity,
                                 size_t *out_len);
 
+/*
+ * Verify the MESSAGE-INTEGRITY attribute of a received STUN
+ * message using RFC 5389 short-term credentials: HMAC-SHA1
+ * keyed with password (the ice-pwd) over the message bytes
+ * from the start of the header up to and including the MI
+ * attribute. Returns 1 when the MI attribute is present and
+ * verifies, 0 otherwise (missing, malformed or bad MAC).
+ *
+ * RFC 5389 §7.2 / RFC 5245: a STUN server MUST verify MI
+ * before acting on a binding request; otherwise anyone who
+ * can read the public SDP answer (and thus the ice-ufrag)
+ * can forge a "valid" check from their own address.
+ */
+int stun_verify_mi(const uint8_t *buf, size_t len,
+                   const char *password);
+
+/*
+ * Build a STUN Binding Error Response (type 0x0111) echoing
+ * the request's transaction id, with SOFTWARE and ERROR-CODE
+ * attributes (RFC 5389 §6.2 / §15.6). Used to answer
+ * unauthenticated or malformed binding requests with 401 per
+ * RFC 5245 §16.5. Returns 0 on success.
+ */
+int stun_build_error_response(const uint8_t tid[12],
+                              uint16_t error_code,
+                              uint8_t *out,
+                              size_t out_capacity,
+                              size_t *out_len);
+
 #endif

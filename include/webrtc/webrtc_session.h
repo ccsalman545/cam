@@ -74,7 +74,8 @@ typedef struct {
     uint32_t rtcp_sent;
     uint32_t stun_rx;           /* datagrams classified as STUN */
     uint32_t stun_ok;           /* binding requests we answered */
-    uint32_t stun_bad_user;     /* USERNAME did not match local ufrag */
+    uint32_t stun_bad_user;     /* USERNAME or MI rejected (401 sent) */
+    uint32_t peer_moved;        /* peer address changed (NAT rebind) */
 } RtcSessionStats;
 
 /*

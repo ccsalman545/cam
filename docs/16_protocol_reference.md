@@ -18,8 +18,12 @@ Byte level formats of everything camstream puts on the wire or accepts.
 |---|---|---|
 | 0 to 3 | STUN | binding checks answered, username validated |
 | 20 to 63 | DTLS | routed into the session DTLS engine |
-| 128 to 191 with second byte 192 to 223 | RTCP | SRTP unprotect, feedback parsed |
-| 128 to 191 otherwise | RTP | sendonly server, dropped |
+| >= 128 with second byte 192 to 223 | SRTCP (RTCP) | SRTP unprotect, feedback parsed |
+| >= 128 otherwise | RTP | sendonly server, dropped |
+
+(SRTCP packets carry V=2 in the first byte, i.e. 192 to 255 with the
+padding bit clear; plain RTP is 128 to 191. Both must be classified as
+the RTP class or browser NACK/PLI/FIR/BYE feedback is dropped.)
 
 ## STUN binding (RFC 5389)
 

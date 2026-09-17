@@ -1248,7 +1248,16 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
 
         /*
          * 3. Session housekeeping.
+         *
+         * Re-sample the clock: a session created during the
+         * signaling poll above carries a timestamp newer than
+         * the 'now' captured at the top of this iteration, and
+         * feeding the stale value into rtc_session_tick()
+         * underflows the idle timeout and reaps the session
+         * before its first STUN check.
          */
+        now = now_ms();
+
         for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
             RtcSession *session = server->sessions[i];
 
