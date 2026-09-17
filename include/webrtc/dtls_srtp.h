@@ -98,6 +98,11 @@ int dtls_srtp_next_timeout_ms(const DtlsSrtp *session);
 int dtls_srtp_send_rtp(DtlsSrtp *session, uint8_t *pkt, size_t *len);
 
 /* Same for RTCP packets (SR, SDES, BYE). */
+/*
+ * Protect and send an RTCP packet. The buffer must hold the RTCP
+ * payload plus 14 bytes of headroom (4 for the 64 bit SRTCP header
+ * expansion and 10 for the auth tag): protection is in place.
+ */
 int dtls_srtp_send_rtcp(DtlsSrtp *session, uint8_t *pkt, size_t *len);
 
 /* Unprotect one inbound RTCP datagram. */

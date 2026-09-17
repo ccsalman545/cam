@@ -573,7 +573,15 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
      * too (otherwise a vanished browser would hold the slot
      * forever).
      */
-    if (now - session->last_rx_ms > SESSION_IDLE_TIMEOUT_MS) {
+    /*
+     * A future timestamp means "fresh" (the clock source can lag
+     * behind the value a just created session was stamped with),
+     * so treat underflow as zero instead of as a huge age.
+     */
+    uint64_t idle_ms = now >= session->last_rx_ms ?
+        now - session->last_rx_ms : 0;
+
+    if (idle_ms > SESSION_IDLE_TIMEOUT_MS) {
         printf("rtc %08x: idle timeout (stun_rx=%u stun_ok=%u stun_bad_user=%u)\n",
                session->config.id,
                session->stats.stun_rx,
@@ -584,10 +592,14 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
     }
 
     /*
-     * Handshake watchdog.
+     * Handshake watchdog. Same underflow guard as the idle
+     * timeout above.
      */
+    uint64_t age_ms = now >= session->created_ms ?
+        now - session->created_ms : 0;
+
     if (session->state == RTC_ICE &&
-        now - session->created_ms > SESSION_DTLS_WATCHDOG_MS) {
+        age_ms > SESSION_DTLS_WATCHDOG_MS) {
         printf("rtc %08x: DTLS never started\n", session->config.id);
         rtc_session_close(session);
         return;
@@ -599,7 +611,15 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
      * Sender reports.
      */
     if (session->state == RTC_STREAMING && now >= session->next_sr_ms) {
-        uint8_t sr[RTCP_SR_SIZE];
+        /*
+         * srtp_protect_rtcp() works in place and expands the 32 bit
+         * RTCP header to a 64 bit SRTCP header (+4 bytes) while
+         * appending the auth tag (+10 bytes), so the buffer needs
+         * 14 bytes of headroom beyond the RTCP payload. Sizing it
+         * to exactly RTCP_SR_SIZE overflowed the stack on every
+         * sender report.
+         */
+        uint8_t sr[RTCP_SR_SIZE + 16];
 
         rtcp_build_sender_report(sr,
                                  rtp_h264_ssrc(session->rtp),

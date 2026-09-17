@@ -43,7 +43,14 @@ RtcPacketClass rtc_classify_packet(const uint8_t *buf, size_t len)
         return RTC_PKT_DTLS;
     }
 
-    if (buf[0] >= 128 && buf[0] <= 191) {
+    /*
+     * First byte >= 128 covers both plain RTP (V=2, P=0, X=0:
+     * 128 to 191) and SRTCP (V=2 plus padding/RR bits: 192 to
+     * 255). Limiting the range to 128 to 191 dropped every
+     * inbound SRTCP packet, so browser NACK/PLI/FIR/BYE never
+     * reached the RTCP handler.
+     */
+    if (buf[0] >= 128) {
         return RTC_PKT_RTP;
     }
 
