@@ -13,6 +13,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
@@ -244,11 +246,14 @@ int stun_username_matches(const uint8_t *buf, size_t len,
     size_t ufrag_len = strlen(local_ufrag);
 
     /*
-     * RFC 8445 §7.3: the first component is the RECEIVER's
-     * ufrag. A browser check therefore arrives as
-     * "<server-ufrag>:<browser-ufrag>". Treating our ufrag as
-     * the second component (the usual ICE-role mix-up) would
-     * drop every well-formed check.
+     * RFC 8445 §7.3.1.1: USERNAME is
+     * "<controlling-ufrag>:<controlled-ufrag>". A browser is
+     * the controlling agent (offerer), so its checks arrive
+     * as "<browser-ufrag>:<server-ufrag>" — our ufrag is the
+     * SECOND component. Some stacks send the reverse. Either
+     * order is accepted; what matters is that our ufrag
+     * appears exactly once, which is what short-term
+     * credentials bind the check to.
      */
     if (username_len > ufrag_len &&
         username[ufrag_len] == ':' &&
@@ -388,6 +393,101 @@ int stun_build_binding_response(const char *local_pwd,
         payload += 8;
     }
 
+    *out_len = STUN_HEADER_SIZE + payload;
+
+    return 0;
+}
+
+int stun_verify_mi(const uint8_t *buf, size_t len,
+                   const char *password)
+{
+    if (buf == NULL || password == NULL || password[0] == 0 ||
+        len < STUN_HEADER_SIZE + 24) {
+        return 0;
+    }
+
+    const uint8_t *mi = NULL;
+    size_t mi_len = 0;
+
+    if (!stun_find_attribute(buf, len, 0x0008, &mi, &mi_len) ||
+        mi_len != 20) {
+        return 0;
+    }
+
+    /*
+     * The MAC covers the message from the start of the header
+     * up to the start of the MI value (mi points at the 20
+     * byte value itself, which is the MAC output and not part
+     * of the input; RFC 5389 §15.5).  A FINGERPRINT attribute
+     * after it (RFC 5389 §15.7) is excluded.
+     */
+    size_t mi_end = (size_t) (mi - buf);
+
+    if (mi_end < STUN_HEADER_SIZE + 24 || mi_end > len) {
+        return 0;
+    }
+
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0;
+
+    if (HMAC(EVP_sha1(), password, (int) strlen(password),
+             buf, mi_end, mac, &mac_len) == NULL || mac_len != 20) {
+        return 0;
+    }
+
+    /* constant-time compare: this MAC guards the peer slot */
+    return CRYPTO_memcmp(mac, mi, 20) == 0;
+}
+
+int stun_build_error_response(const uint8_t tid[12],
+                              uint16_t error_code,
+                              uint8_t *out,
+                              size_t out_capacity,
+                              size_t *out_len)
+{
+    /* 20 header + 4+8 SOFTWARE + 4+8 ERROR-CODE */
+    if (out == NULL || out_len == NULL || out_capacity < 44) {
+        return -1;
+    }
+
+    memset(out, 0, 44);
+
+    out[0] = 0x01;
+    out[1] = 0x11;                       /* binding error response */
+    out[4] = 0x21;
+    out[5] = 0x12;
+    out[6] = 0xA4;
+    out[7] = 0x42;                       /* magic cookie */
+    if (tid != NULL) {
+        memcpy(out + 8, tid, 12);
+    }
+
+    size_t payload = 0;
+
+    /* SOFTWARE (RFC 5389 §6.2: SHOULD be present on errors) */
+    {
+        const char sw[] = "camstream";
+        uint8_t *attr = out + STUN_HEADER_SIZE;
+
+        write_be16(attr, 0x8022);
+        write_be16(attr + 2, (uint16_t) (sizeof(sw) - 1));
+        memcpy(attr + 4, sw, sizeof(sw) - 1);
+        payload += 4 + ((sizeof(sw) - 1 + 3) & ~3u);
+    }
+
+    /* ERROR-CODE: 1 reserved byte, 1 class, 2 reason, 4 pad */
+    {
+        uint8_t *attr = out + STUN_HEADER_SIZE + payload;
+
+        write_be16(attr, 0x0009);
+        write_be16(attr + 2, 8);
+        attr[4] = 0;
+        attr[5] = (uint8_t) (error_code / 100);           /* class */
+        write_be16(attr + 6, (uint16_t) (error_code % 100)); /* reason */
+        payload += 12;
+    }
+
+    write_be16(out + 2, (uint16_t) payload);
     *out_len = STUN_HEADER_SIZE + payload;
 
     return 0;
