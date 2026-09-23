@@ -130,8 +130,12 @@ H264Encoder *h264_encoder_open(const char *preference,
 
         if (path == NULL) {
             if (find_m2m_device(device_path, sizeof(device_path)) != 0) {
-                fprintf(stderr,
-                        "encoder: no V4L2 M2M H.264 encoder detected\n");
+                if (!want_sw) {
+                    fprintf(stderr,
+                            "encoder: no V4L2 M2M H.264 encoder detected\n");
+                } else {
+                    printf("encoder: no V4L2 M2M H.264 hardware encoder detected; falling back to software (libx264)\n");
+                }
             } else {
                 path = device_path;
             }

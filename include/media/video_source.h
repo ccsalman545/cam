@@ -64,6 +64,25 @@ VideoSource *test_source_create(uint32_t width,
                                 uint32_t fps);
 
 /*
+ * CSI camera source: spawns rpicam-vid (or libcamera-vid) as a subprocess,
+ * capturing raw YUV420 (I420) frames through a direct pipe.
+ * Zero v4l2loopback, zero FFmpeg, zero shell invocation.
+ */
+VideoSource *csi_source_create(const char *rpicam_bin,
+                               uint32_t width,
+                               uint32_t height,
+                               uint32_t fps,
+                               int verbose);
+
+/*
+ * Raw YUV420 stdin pipe source: reads uncompressed WxH YUV420 frames
+ * directly from standard input (fd 0).
+ */
+VideoSource *stdin_source_create(uint32_t width,
+                                 uint32_t height,
+                                 uint32_t fps);
+
+/*
  * Helper: stop and free any source.
  */
 void video_source_close(VideoSource *source);
