@@ -114,6 +114,9 @@ int rtc_session_send_access_unit(RtcSession *session,
                                  uint64_t pts_us,
                                  int is_idr);
 
+/* Add a remote ICE candidate (trickle ICE). Returns 0 on success, -1 on error. */
+int rtc_session_add_ice_candidate(RtcSession *session, const char *candidate);
+
 /* Ask the encoder for a keyframe (rate limited internally). */
 void rtc_session_request_idr(RtcSession *session);
 

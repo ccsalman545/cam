@@ -844,6 +844,13 @@ void rtc_session_destroy(RtcSession *session)
     free(session);
 }
 
+int rtc_session_add_ice_candidate(RtcSession *session, const char *candidate)
+{
+    (void) session;
+    (void) candidate;
+    return 0; /* Native ICE-lite responds to STUN checks directly */
+}
+
 int rtc_session_dtls_timeout_ms(const RtcSession *session)
 {
     if (session == NULL) {

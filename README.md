@@ -225,14 +225,19 @@ default. Run `./build/camstream --help` for the same text from the binary.
 
 | Option | Meaning | Default |
 |---|---|---|
+| `-s, --source KIND` | Input source kind: `csi`, `v4l2`, `stdin`, `test` | `v4l2` |
 | `-d, --device PATH` | V4L2 capture device | `/dev/video0` |
-| `-t, --test` | Synthetic test pattern instead of a camera | off |
+| `--stdin-yuv420` | Read uncompressed YUV420 from stdin (alias for `-s stdin`) | off |
+| `--rpicam-bin PATH` | Path to `rpicam-vid` or `libcamera-vid` binary | auto |
+| `-t, --test` | Synthetic test pattern instead of a camera (alias for `-s test`) | off |
 | `-W, --width N` | Capture width | `640` |
 | `-H, --height N` | Capture height | `480` |
 | `-F, --fps N` | Capture frame rate | `30` |
 
-The device is opened as YUYV 4:2:2 when supported, otherwise the nearest planar
-(YU12) mode. The test pattern emits YUYV directly: SMPTE-style bars, a
+The V4L2 device is opened as YUYV 4:2:2 when supported, otherwise the nearest planar
+(YU12) mode. In CSI mode (`-s csi`), camstream directly spawns `rpicam-vid` as a child
+process and reads raw uncompressed YUV420 frames over a pipe without requiring
+v4l2loopback or FFmpeg. The test pattern emits YUYV directly: SMPTE-style bars, a
 scrolling clock, and a sweeping marker that makes dropped frames obvious.
 
 ### Network
@@ -727,29 +732,28 @@ Runs on Raspberry Pi OS Bookworm or Bullseye, 32- or 64-bit, on Pi 3, 4, 5, and
 Zero 2 W.
 
 ```sh
-sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
+sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev rpicam-apps
 make -j4
 sudo usermod -aG video "$USER"          # then log out and back in
-./build/camstream -d /dev/video0 -e hw:/dev/video11
 ```
 
-- The **bcm2835 M2M H.264 encoder is `/dev/video11`**. It takes NV12 (preferred)
-  or YU12; camstream interleaves I420 to NV12 as needed and reads Annex B
-  straight off the capture queue.
-- The **camera module is managed by libcamera** and usually also appears as a
-  V4L2 node, typically `/dev/video0`. Enumerate with:
-
+- **Raspberry Pi 5 with CSI camera**: Uses direct CSI capture and software H.264
+  encoding (`libx264`):
   ```sh
-  v4l2-ctl --list-devices
-  v4l2-ctl -d /dev/video0 --list-formats-ext
+  ./build/camstream --source csi -W 1280 -H 720 -F 30 -e sw -b 2500
   ```
-
+- **Raspberry Pi 4 with CSI camera**: Uses hardware H.264 encoder:
+  ```sh
+  ./build/camstream --source csi -W 1280 -H 720 -F 30 -e hw -b 3000
+  ```
+- **USB webcam**: Works across all Pi models with `-s v4l2 -d /dev/video0`.
+- The **bcm2835 M2M H.264 encoder is `/dev/video11`** on Pi 3 and Pi 4. Pi 5 does
+  not include this hardware block; camstream automatically probes encoder
+  capabilities and selects `libx264` software encoding on Pi 5.
 - **Only one process may hold the sensor.** Stop `libcamera-hello`,
   `rpicam-still`, and friends first.
-- **CPU budget.** `-e sw` handles 480p30 comfortably and 720p30 warm; use
-  `-e hw` for 1080p.
 
-Per-model invocations, a systemd unit, and the CSI camera bridge are in
+Per-model invocations, a systemd unit, and full CSI architecture details are in
 [`docs/14_raspberry_pi.md`](docs/14_raspberry_pi.md).
 
 ---

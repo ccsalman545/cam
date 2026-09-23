@@ -14,6 +14,9 @@
 
 void app_config_defaults(AppConfig *config)
 {
+    config->source_kind = SOURCE_V4L2;
+    config->source_name = "v4l2";
+    config->rpicam_bin = NULL;
     config->device = "/dev/video0";
     config->use_test_source = 0;
 
@@ -124,6 +127,42 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
 
         if (strcmp(arg, "-t") == 0 || strcmp(arg, "--test") == 0) {
             config->use_test_source = 1;
+            config->source_kind = SOURCE_TEST;
+            config->source_name = "test";
+            continue;
+        }
+
+        if (strcmp(arg, "--stdin-yuv420") == 0) {
+            config->source_kind = SOURCE_STDIN;
+            config->source_name = "stdin";
+            continue;
+        }
+
+        if (match_opt(arg, "-s", "--source", &value, argc, argv, &i)) {
+            if (strcmp(value, "csi") == 0) {
+                config->source_kind = SOURCE_CSI;
+                config->source_name = "csi";
+            } else if (strcmp(value, "v4l2") == 0) {
+                config->source_kind = SOURCE_V4L2;
+                config->source_name = "v4l2";
+            } else if (strcmp(value, "stdin") == 0) {
+                config->source_kind = SOURCE_STDIN;
+                config->source_name = "stdin";
+            } else if (strcmp(value, "test") == 0) {
+                config->source_kind = SOURCE_TEST;
+                config->source_name = "test";
+                config->use_test_source = 1;
+            } else {
+                fprintf(stderr,
+                        "invalid --source '%s' (csi, v4l2, stdin or test)\n",
+                        value);
+                return -1;
+            }
+            continue;
+        }
+
+        if (match_opt(arg, NULL, "--rpicam-bin", &value, argc, argv, &i)) {
+            config->rpicam_bin = value;
             continue;
         }
 
@@ -284,7 +323,12 @@ void app_config_print_usage(const char *program)
         "Usage: %s [options]\n"
         "\n"
         "Source:\n"
+        "  -s, --source MODE     csi (Raspberry Pi CSI camera via rpicam-vid),\n"
+        "                        v4l2 (USB/V4L2 capture, default),\n"
+        "                        stdin (raw YUV420 pipe), or test\n"
         "  -d, --device PATH     V4L2 device (default /dev/video0)\n"
+        "      --stdin-yuv420    convenience alias for --source stdin\n"
+        "      --rpicam-bin PATH path to rpicam-vid or libcamera-vid\n"
         "  -t, --test            use the synthetic test pattern source\n"
         "  -W, --width N         capture width (default 640)\n"
         "  -H, --height N        capture height (default 480)\n"
@@ -325,9 +369,9 @@ void app_config_print_usage(const char *program)
         "  -h, --help            this help\n"
         "\n"
         "Examples:\n"
-        "  %s -t                          run with the test pattern\n"
-        "  %s -d /dev/video0 -W 1280 -H 720 -b 4000\n"
-        "  %s -e hw:/dev/video11 -p 8080 -u 50000\n"
+        "  %s --source csi -W 1280 -H 720 -e sw   Raspberry Pi 5 CSI camera\n"
+        "  %s -d /dev/video0 -W 1280 -H 720       USB webcam\n"
+        "  %s -t -e sw                            synthetic test pattern\n"
 #ifdef USE_JANUS_TRANSPORT
         "  %s -t -e hw --janus-host 127.0.0.1 "
         "--janus-rtp-port 5004\n"
@@ -344,8 +388,18 @@ void app_config_print_usage(const char *program)
 
 void app_config_print_summary(const AppConfig *config)
 {
-    printf("source        : %s\n",
-           config->use_test_source ? "test pattern" : config->device);
+    const char *source_desc = "unknown";
+    if (config->source_kind == SOURCE_TEST) {
+        source_desc = "test pattern";
+    } else if (config->source_kind == SOURCE_CSI) {
+        source_desc = "CSI camera (rpicam-vid)";
+    } else if (config->source_kind == SOURCE_STDIN) {
+        source_desc = "stdin (raw YUV420 pipe)";
+    } else {
+        source_desc = config->device;
+    }
+
+    printf("source        : %s [%s]\n", source_desc, config->source_name);
     printf("resolution    : %ux%u @ %u fps\n",
            config->width, config->height, config->fps);
     printf("encoder       : %s, %u kbps, keyframe every %us\n",

@@ -96,6 +96,7 @@ APP_COMMON = \
 	src/media/source_worker.c \
 	src/media/encoder_worker.c \
 	src/media/v4l2_source.c \
+	src/media/csi_source.c \
 	src/media/test_source.c \
 	src/media/yuv_convert.c \
 	src/media/h264_encoder.c \
@@ -222,7 +223,10 @@ camstream-libpeer: $(BUILD_DIR)/camstream-libpeer
 
 libpeer-backend: camstream-libpeer
 
-$(BUILD_DIR)/camstream-libpeer: $(APP_OBJECTS_LIBPEER)
+$(LIBPEER_DIST)/lib/libpeer.a:
+	tools/setup-libpeer.sh
+
+$(BUILD_DIR)/camstream-libpeer: $(LIBPEER_DIST)/lib/libpeer.a $(APP_OBJECTS_LIBPEER)
 	@mkdir -p $(dir $@)
 	$(CC) $(APP_CFLAGS_LIBPEER) $(APP_OBJECTS_LIBPEER) -o $@ $(APP_LIBS_LIBPEER)
 	@echo ""
@@ -278,6 +282,11 @@ $(BUILD_DIR)/test_encoder_worker: tests/test_encoder_worker.c \
 	  src/media/frame_hub.c src/media/frame_pool.c \
 	  src/media/au_ring.c src/media/yuv_convert.c -o $@ -lpthread
 
+$(BUILD_DIR)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c src/media/test_source.c include/media/video_source.h
+	@mkdir -p $(dir $@)
+	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
+	  tests/test_csi_source.c src/media/csi_source.c src/media/test_source.c -o $@ -lpthread
+
 # Janus sender test: synthetic AUs through the real sender against
 # a local fake-Janus UDP socket. No camera, no x264, no Janus needed.
 $(BUILD_DIR)/test_janus_sender: tests/test_janus_sender.c \
@@ -305,10 +314,11 @@ vision-capture: $(BUILD_DIR)/vision-capture
 vision-test: $(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_vision
 
-test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_worker
+test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_worker $(BUILD_DIR)/test_csi_source
 	$(BUILD_DIR)/test_stun
 	$(BUILD_DIR)/test_vision
 	$(BUILD_DIR)/test_encoder_worker
+	$(BUILD_DIR)/test_csi_source
 
 test-janus: $(BUILD_DIR)/test_janus_sender
 	$(BUILD_DIR)/test_janus_sender
@@ -319,6 +329,9 @@ check-docs:
 	./tools/check_docs.sh
 
 clean:
+	rm -rf $(BUILD_DIR)/camstream $(BUILD_DIR)/camstream-janus $(BUILD_DIR)/camstream-libpeer $(BUILD_DIR)/src $(BUILD_DIR)/third_party $(BUILD_DIR)/janus $(BUILD_DIR)/libpeer/src $(BUILD_DIR)/libpeer/third_party
+
+distclean:
 	rm -rf $(BUILD_DIR)
 
 help:

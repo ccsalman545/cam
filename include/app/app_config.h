@@ -11,7 +11,17 @@
 
 #define APP_VERSION "2.0.0"
 
+typedef enum {
+    SOURCE_V4L2 = 0,
+    SOURCE_CSI,
+    SOURCE_STDIN,
+    SOURCE_TEST
+} SourceKind;
+
 typedef struct {
+    SourceKind source_kind;     /* SOURCE_V4L2 | SOURCE_CSI | SOURCE_STDIN | SOURCE_TEST */
+    const char *source_name;    /* "v4l2", "csi", "stdin", "test" */
+    const char *rpicam_bin;     /* optional path to rpicam-vid / libcamera-vid */
     const char *device;         /* V4L2 device path */
     int use_test_source;        /* synthetic pattern instead of a camera */
 

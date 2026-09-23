@@ -220,6 +220,23 @@ static void choose_advertise_ip(const char *host_header,
 /* JSON helpers                                                        */
 /* ------------------------------------------------------------------ */
 
+static const char *json_find_key(const char *body, const char *field)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", field);
+    size_t plen = strlen(pattern);
+    const char *pos = body;
+    while ((pos = strstr(pos, pattern)) != NULL) {
+        const char *p = pos + plen;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == ':') {
+            return p + 1;
+        }
+        pos += plen;
+    }
+    return NULL;
+}
+
 /*
  * Extract a top level JSON string field. Handles the common
  * escape sequences that appear in SDP payloads.
@@ -227,19 +244,13 @@ static void choose_advertise_ip(const char *host_header,
 static int json_get_string(const char *body, const char *field,
                            char *out, size_t out_size)
 {
-    char pattern[64];
-
-    snprintf(pattern, sizeof(pattern), "\"%s\"", field);
-
-    const char *pos = strstr(body, pattern);
+    const char *pos = json_find_key(body, field);
 
     if (pos == NULL) {
         return -1;
     }
 
-    pos += strlen(pattern);
-
-    while (*pos == ' ' || *pos == ':') {
+    while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n') {
         pos++;
     }
 
@@ -298,19 +309,13 @@ static int json_get_string(const char *body, const char *field,
 
 static int json_get_int(const char *body, const char *field, long *out)
 {
-    char pattern[64];
-
-    snprintf(pattern, sizeof(pattern), "\"%s\"", field);
-
-    const char *pos = strstr(body, pattern);
+    const char *pos = json_find_key(body, field);
 
     if (pos == NULL) {
         return -1;
     }
 
-    pos += strlen(pattern);
-
-    while (*pos == ' ' || *pos == ':') {
+    while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n') {
         pos++;
     }
 
@@ -672,6 +677,206 @@ static void handle_rtc_close(Server *server,
                   "{\"closed\":true}");
 }
 
+static void handle_rtc_candidate(Server *server,
+                                 struct mg_connection *connection,
+                                 struct mg_http_message *message)
+{
+    char request_body[2048];
+    if (message->body.len >= sizeof(request_body)) {
+        mg_http_reply(connection, 413, "Content-Type: application/json\r\n",
+                      "{\"error\":\"candidate request is too large\"}");
+        return;
+    }
+    memcpy(request_body, message->body.buf, message->body.len);
+    request_body[message->body.len] = 0;
+
+    char cand[512] = "";
+    if (json_get_string(request_body, "candidate", cand, sizeof(cand)) != 0) {
+        mg_http_reply(connection, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"missing candidate field\"}");
+        return;
+    }
+
+    long id = 0;
+    json_get_int(request_body, "session_id", &id);
+
+    RtcSession *target = NULL;
+    for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+        if (server->sessions[i] != NULL) {
+            if (id == 0 || rtc_session_id(server->sessions[i]) == (uint32_t) id) {
+                target = server->sessions[i];
+                break;
+            }
+        }
+    }
+
+    if (target != NULL) {
+        rtc_session_add_ice_candidate(target, cand);
+        mg_http_reply(connection, 200, "Content-Type: application/json\r\n",
+                      "{\"status\":\"ok\"}");
+    } else {
+        mg_http_reply(connection, 404, "Content-Type: application/json\r\n",
+                      "{\"error\":\"session not found\"}");
+    }
+}
+
+static void handle_ws_message(Server *server,
+                              struct mg_connection *connection,
+                              struct mg_ws_message *wm)
+{
+    char request_body[16384];
+    if (wm->data.len >= sizeof(request_body)) {
+        mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"error\":\"message too large\"}");
+        return;
+    }
+    memcpy(request_body, wm->data.buf, wm->data.len);
+    request_body[wm->data.len] = 0;
+
+    char type[32] = "";
+    if (json_get_string(request_body, "type", type, sizeof(type)) != 0) {
+        mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"error\":\"missing type field\"}");
+        return;
+    }
+
+    if (strcmp(type, "offer") == 0) {
+        char sdp[8192];
+        if (json_get_string(request_body, "sdp", sdp, sizeof(sdp)) != 0) {
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"error\":\"missing sdp field\"}");
+            return;
+        }
+
+        SdpOffer offer;
+        if (sdp_parse_offer(sdp, strlen(sdp), &offer) != 0) {
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT,
+                         "{\"error\":\"offer is missing ICE credentials, fingerprint or H264 codec\"}");
+            return;
+        }
+
+        size_t slot = MAX_RTC_SESSIONS;
+        for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+            if (server->sessions[i] == NULL) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == MAX_RTC_SESSIONS) {
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"error\":\"session limit reached\"}");
+            return;
+        }
+
+        char advertise_ip[INET_ADDRSTRLEN];
+        choose_advertise_ip(NULL, advertise_ip, sizeof(advertise_ip));
+
+        InterfaceInfo all_ifaces[16];
+        size_t all_count = collect_interfaces(all_ifaces, 16);
+        const char *extra_ip_ptrs[16];
+        char extra_ip_storage[16][INET_ADDRSTRLEN];
+        size_t extra_count = 0;
+        for (size_t i = 0; i < all_count && extra_count < 16; i++) {
+            if (strcmp(all_ifaces[i].ip, advertise_ip) == 0) continue;
+            int dup = 0;
+            for (size_t j = 0; j < extra_count; j++) {
+                if (strcmp(extra_ip_storage[j], all_ifaces[i].ip) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
+            snprintf(extra_ip_storage[extra_count], sizeof(extra_ip_storage[0]), "%s", all_ifaces[i].ip);
+            extra_ip_ptrs[extra_count] = extra_ip_storage[extra_count];
+            extra_count++;
+        }
+
+        uint32_t session_id = 0;
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) { fread(&session_id, 1, sizeof(session_id), f); fclose(f); }
+        if (session_id == 0) {
+            session_id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)server ^ (uint32_t)slot;
+            session_id = session_id * 2654435761u;
+        }
+        if (session_id == 0) session_id = 1;
+
+        RtcSessionConfig session_config = {
+            .id = session_id,
+            .udp_port = (uint16_t) (server->config->udp_base_port + slot),
+            .advertise_ip = advertise_ip,
+            .extra_ips = extra_count ? extra_ip_ptrs : NULL,
+            .extra_ip_count = extra_count,
+            .offer = offer,
+            .remote_sdp = sdp,
+            .server = server,
+            .on_idr_request = session_on_idr_request,
+            .on_closed = session_on_closed
+        };
+
+        RtcSession *session = NULL;
+        char answer[8192];
+        size_t answer_length = 0;
+
+        if (rtc_session_create(&session_config, &session,
+                               answer, sizeof(answer), &answer_length) != 0) {
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"error\":\"session create failed\"}");
+            return;
+        }
+
+        server->sessions[slot] = session;
+        server->sessions_total++;
+        atomic_store(&server->rtc_active, 1);
+        atomic_store(&server->force_idr, 1);
+
+        char payload[24576];
+        size_t offset = 0;
+        int n = snprintf(payload + offset, sizeof(payload) - offset,
+                         "{\"type\":\"answer\",\"session_id\":%u,\"udp_port\":%u,\"sdp\":\"",
+                         session_id, (unsigned) session_config.udp_port);
+        if (n > 0) offset += (size_t) n;
+        size_t esc = json_escape_append(answer, payload + offset, sizeof(payload) - offset);
+        offset += esc;
+        n = snprintf(payload + offset, sizeof(payload) - offset, "\"}");
+        if (n > 0) offset += (size_t) n;
+
+        mg_ws_send(connection, payload, offset, WEBSOCKET_OP_TEXT);
+        printf("rtc %08x [ws]: signaling complete (slot %zu, %s)\n",
+               session_id, slot, advertise_ip);
+        return;
+    }
+
+    if (strcmp(type, "candidate") == 0) {
+        char cand[512] = "";
+        json_get_string(request_body, "candidate", cand, sizeof(cand));
+        long sid = 0;
+        json_get_int(request_body, "session_id", &sid);
+
+        RtcSession *target = NULL;
+        for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+            if (server->sessions[i] != NULL) {
+                if (sid == 0 || rtc_session_id(server->sessions[i]) == (uint32_t) sid) {
+                    target = server->sessions[i];
+                    break;
+                }
+            }
+        }
+        if (target && cand[0]) {
+            rtc_session_add_ice_candidate(target, cand);
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"type\":\"candidate_ack\",\"status\":\"ok\"}");
+        } else {
+            mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"type\":\"candidate_ack\",\"status\":\"not_found\"}");
+        }
+        return;
+    }
+
+    if (strcmp(type, "close") == 0) {
+        long sid = 0;
+        json_get_int(request_body, "session_id", &sid);
+        for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+            if (server->sessions[i] != NULL &&
+                (sid == 0 || rtc_session_id(server->sessions[i]) == (uint32_t) sid)) {
+                rtc_session_close(server->sessions[i]);
+                break;
+            }
+        }
+        mg_ws_printf(connection, WEBSOCKET_OP_TEXT, "{\"type\":\"closed\",\"session_id\":%ld}", sid);
+        return;
+    }
+}
+
 #endif /* !USE_JANUS_TRANSPORT */
 
 /* ------------------------------------------------------------------ */
@@ -727,7 +932,7 @@ static void handle_status(Server *server,
         APP_VERSION,
         (unsigned long long) uptime_s,
         server->source->name,
-        server->config->use_test_source ? "test" : "v4l2",
+        server->config->source_name,
         server->source->width,
         server->source->height,
         server->source->fps,
@@ -788,7 +993,7 @@ static void handle_status(Server *server,
         APP_VERSION,
         (unsigned long long) uptime_s,
         server->source->name,
-        server->config->use_test_source ? "test" : "v4l2",
+        server->config->source_name,
         server->source->width,
         server->source->height,
         server->source->fps,
@@ -875,13 +1080,33 @@ static void http_event_handler(struct mg_connection *connection,
 
     switch (event) {
 
+#ifndef USE_JANUS_TRANSPORT
+    case MG_EV_WS_MSG: {
+        struct mg_ws_message *wm = (struct mg_ws_message *) event_data;
+        handle_ws_message(server, connection, wm);
+        return;
+    }
+#endif
+
     case MG_EV_HTTP_MSG: {
         struct mg_http_message *message =
             (struct mg_http_message *) event_data;
 
 #ifndef USE_JANUS_TRANSPORT
+        if (mg_match(message->uri, mg_str("/ws"), NULL) ||
+            mg_match(message->uri, mg_str("/signaling"), NULL) ||
+            mg_match(message->uri, mg_str("/rtc/ws"), NULL)) {
+            mg_ws_upgrade(connection, message, NULL);
+            return;
+        }
+
         if (mg_match(message->uri, mg_str("/rtc/offer"), NULL)) {
             handle_rtc_offer(server, connection, message);
+            return;
+        }
+
+        if (mg_match(message->uri, mg_str("/rtc/candidate"), NULL)) {
+            handle_rtc_candidate(server, connection, message);
             return;
         }
 
@@ -896,7 +1121,8 @@ static void http_event_handler(struct mg_connection *connection,
             return;
         }
 
-        if (mg_match(message->uri, mg_str("/"), NULL)) {
+        if (mg_match(message->uri, mg_str("/"), NULL) ||
+            mg_match(message->uri, mg_str("/index.html"), NULL)) {
 #ifdef USE_JANUS_TRANSPORT
             /*
              * The Janus dashboard: video fed by the Janus gateway,
@@ -907,10 +1133,17 @@ static void http_event_handler(struct mg_connection *connection,
                           "Cache-Control: no-store\r\n",
                           "%s", web_janus_html);
 #else
-            mg_http_reply(connection, 200,
-                          "Content-Type: text/html; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\n",
-                          "%s", web_ui_html);
+            struct mg_http_serve_opts opts = { .root_dir = "web" };
+            FILE *f = fopen("web/index.html", "r");
+            if (f) {
+                fclose(f);
+                mg_http_serve_file(connection, message, "web/index.html", &opts);
+            } else {
+                mg_http_reply(connection, 200,
+                              "Content-Type: text/html; charset=utf-8\r\n"
+                              "Cache-Control: no-store\r\n",
+                              "%s", web_ui_html);
+            }
 #endif
             return;
         }
@@ -965,21 +1198,53 @@ int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag)
     /*
      * Source.
      */
-    if (config->use_test_source) {
+    /*
+     * Source creation:
+     *   SOURCE_TEST  -> test_source_create
+     *   SOURCE_CSI   -> csi_source_create
+     *   SOURCE_STDIN -> stdin_source_create
+     *   SOURCE_V4L2  -> v4l2_source_create
+     */
+    switch (config->source_kind) {
+    case SOURCE_TEST:
         server->source = test_source_create(config->width,
                                             config->height,
                                             config->fps);
-    } else {
+        break;
+    case SOURCE_CSI:
+        server->source = csi_source_create(config->rpicam_bin,
+                                           config->width,
+                                           config->height,
+                                           config->fps,
+                                           config->verbose);
+        break;
+    case SOURCE_STDIN:
+        server->source = stdin_source_create(config->width,
+                                             config->height,
+                                             config->fps);
+        break;
+    case SOURCE_V4L2:
+    default:
         server->source = v4l2_source_create(config->device,
                                             config->width,
                                             config->height,
                                             config->fps);
+        break;
     }
 
     if (server->source == NULL) {
-        fprintf(stderr,
-            "server: cannot open video source. Without a camera run\n"
-            "        with --test to use the synthetic test pattern.\n");
+        if (config->source_kind == SOURCE_CSI) {
+            fprintf(stderr,
+                "server: failed to initialize Raspberry Pi CSI camera source.\n"
+                "        Make sure a CSI camera is connected and rpicam-vid is installed.\n");
+        } else if (config->source_kind == SOURCE_STDIN) {
+            fprintf(stderr,
+                "server: failed to initialize stdin frame source.\n");
+        } else {
+            fprintf(stderr,
+                "server: cannot open video source. Without a camera run\n"
+                "        with --test to use the synthetic test pattern.\n");
+        }
         free(server);
         return 1;
     }

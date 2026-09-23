@@ -140,13 +140,6 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-static uint64_t wall_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
 static void set_state(RtcSession* session, RtcSessionState state)
 {
     if (session->state == state) return;
@@ -174,7 +167,6 @@ static void on_ice_state_change(PeerConnectionState pc_state, void* userdata)
         set_state(session, RTC_ICE);
         break;
     case PEER_CONNECTION_CONNECTED:
-    case PEER_CONNECTION_COMPLETED:
         set_state(session, RTC_STREAMING);
         session->last_rx_ms = now_ms();
         if (!session->streaming_announced) {
@@ -212,13 +204,7 @@ static void on_request_keyframe(void* userdata)
     rtc_session_request_idr(session);
 }
 
-/* Global init handled in libpeer_global.c, but also ensure peer_init called */
-__attribute__((constructor))
-static void ensure_peer_init(void)
-{
-    /* peer_init is idempotent in libpeer */
-    peer_init();
-}
+/* Global init handled in libpeer_global.c */
 
 /* API */
 
@@ -257,7 +243,7 @@ int rtc_session_create(const RtcSessionConfig* config,
     pc_config.on_request_keyframe = on_request_keyframe;
     pc_config.user_data = session;
     /* No STUN/TURN for direct LAN - host candidates only */
-    pc_config.ice_servers[0].urls = "";
+    pc_config.ice_servers[0].urls = NULL;
 
     session->pc = peer_connection_create(&pc_config);
     if (!session->pc) {
@@ -469,6 +455,15 @@ void rtc_session_destroy(RtcSession* session)
     free(session);
 }
 
+int rtc_session_add_ice_candidate(RtcSession* session, const char* candidate)
+{
+    if (!session || !session->pc || !candidate || !candidate[0]) return -1;
+    char cand_buf[512];
+    strncpy(cand_buf, candidate, sizeof(cand_buf) - 1);
+    cand_buf[sizeof(cand_buf) - 1] = '\0';
+    return peer_connection_add_ice_candidate(session->pc, cand_buf);
+}
+
 int rtc_session_dtls_timeout_ms(const RtcSession* session)
 {
     (void)session;
@@ -490,6 +485,7 @@ void rtc_session_on_udp(RtcSession *s, uint8_t *b, size_t l, const struct sockad
 void rtc_session_tick(RtcSession *s, uint64_t n){(void)s;(void)n;}
 int rtc_session_send_access_unit(RtcSession *s, const uint8_t *a, size_t l, uint64_t p, int i){(void)s;(void)a;(void)l;(void)p;(void)i;return 0;}
 void rtc_session_request_idr(RtcSession *s){(void)s;}
+int rtc_session_add_ice_candidate(RtcSession *s, const char *c){(void)s;(void)c;return 0;}
 RtcSessionState rtc_session_state(const RtcSession *s){(void)s;return RTC_CLOSED;}
 const char *rtc_session_state_name(const RtcSession *s){(void)s;return "closed";}
 void rtc_session_get_stats(const RtcSession *s, RtcSessionStats *o){(void)s;(void)o;}
