@@ -637,6 +637,25 @@ test through the API instead of being faked.
 Not covered: a real camera, a real hardware encoder, real browsers, and
 long-run stability beyond the process lifetime of a test.
 
+Memory errors and thread races are checked with the same suite rather than by
+inspection. Both commands were run against this tree and passed with no
+report:
+
+```sh
+# Leaks, use after free, out of bounds, undefined behaviour
+make clean
+make -j4 OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+ASAN_OPTIONS=detect_leaks=1 make test
+
+# Races between the capture, encode and HTTP threads
+make clean
+make -j4 OPT="-O1 -g -fsanitize=thread"
+./build/camstream --test --encoder sw --http-port 8080
+```
+
+The sanitizer flags reach the link line as well as the compile lines, which
+is why `OPT` is repeated there.
+
 ## Deployment
 
 `make install` (as root) copies three files: the binary to

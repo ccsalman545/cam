@@ -176,9 +176,11 @@ EMBED_TOOL := $(BUILD)/embed_assets
 
 all: $(BINARY)
 
+# $(OPT) is repeated on the link line: a sanitizer or LTO build needs its
+# runtime flags while linking, and a plain -O2 link costs nothing extra.
 $(BINARY): $(OBJECTS) $(WEB_ASSETS)
 	@mkdir -p $(dir $@)
-	$(CC) $(OBJECTS) -o $@ $(LDFLAGS) $(DEP_LDFLAGS) $(DEP_LIBS)
+	$(CC) $(OPT) $(OBJECTS) -o $@ $(LDFLAGS) $(DEP_LDFLAGS) $(DEP_LIBS)
 	@echo "built $(BINARY) (libx264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
 
 $(BUILD)/obj/%.o: %.c $(FLAG_STAMP)
