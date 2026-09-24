@@ -484,6 +484,10 @@ static int m2m_acquire_input_buffer(struct M2mBackend *encoder)
     buffer.m.planes = planes;
 
     if (xioctl(encoder->fd, VIDIOC_DQBUF, &buffer) == -1) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            log_error("encode", "m2m: VIDIOC_DQBUF (output acquire): errno=%d (%s)", errno, strerror(errno));
+            encoder->errors++;
+        }
         return -1;
     }
 
@@ -618,6 +622,10 @@ static int m2m_encode(struct M2mBackend *encoder,
     }
 
     if (xioctl(encoder->fd, VIDIOC_QBUF, &out_buffer) == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY) {
+            log_debug("encode", "m2m: VIDIOC_QBUF (output) busy: errno=%d", errno);
+            return 0;
+        }
         log_error("encode", "m2m: VIDIOC_QBUF (output): errno=%d (%s)", errno, strerror(errno));
         encoder->errors++;
         return 0;
@@ -647,6 +655,10 @@ static int m2m_encode(struct M2mBackend *encoder,
         cap_buffer.m.planes = cap_planes;
 
         if (xioctl(encoder->fd, VIDIOC_DQBUF, &cap_buffer) == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_error("encode", "m2m: VIDIOC_DQBUF (capture): errno=%d (%s)", errno, strerror(errno));
+                encoder->errors++;
+            }
             break;
         }
 
@@ -675,7 +687,10 @@ static int m2m_encode(struct M2mBackend *encoder,
         cap_buffer.m.planes = cap_planes;
 
         if (xioctl(encoder->fd, VIDIOC_QBUF, &cap_buffer) == -1) {
-            log_error("encode", "m2m: VIDIOC_QBUF (capture): errno=%d (%s)", errno, strerror(errno));
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EBUSY) {
+                log_error("encode", "m2m: VIDIOC_QBUF (capture): errno=%d (%s)", errno, strerror(errno));
+                encoder->errors++;
+            }
             break;
         }
 
