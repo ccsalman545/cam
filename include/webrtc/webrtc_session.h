@@ -62,6 +62,7 @@ typedef struct {
     char candidate_ips[SDP_MAX_CANDIDATES][INET_ADDRSTRLEN];
     size_t candidate_count;
     SdpOffer offer;                 /* parsed browser offer */
+    char signaling_peer[48];        /* HTTP client that posted the offer */
 
     /* Server hooks. */
     void *server;
@@ -84,11 +85,22 @@ typedef struct {
     uint32_t stun_bad;              /* rejected: username or integrity */
     uint32_t peer_moved;            /* NAT rebinds observed */
 
+    uint64_t frames_sent;           /* access units packetized and sent */
+    uint64_t keyframes_sent;        /* of which IDR */
+    uint64_t frames_held;           /* withheld while waiting for an IDR */
+    uint64_t last_media_ms;         /* monotonic ms of the last sent AU, 0 = never */
+    uint32_t rr_received;           /* receiver report blocks about our SSRC */
+    uint64_t last_rr_ms;            /* monotonic ms of the last one, 0 = never */
+    int waiting_keyframe;           /* 1 until the first IDR went out */
+
     int rtt_ms;                     /* -1 until the peer reports on an SR */
     uint8_t fraction_lost;          /* 0..255, from the peer's last RR */
     uint32_t jitter;                /* RTP clock units, from the last RR */
 
-    char peer[32];                  /* "192.168.1.20:53124" or "-" */
+    char peer[32];                  /* ICE peer "192.168.1.20:53124" or "-" */
+    char signaling_peer[48];        /* HTTP client address of the offer */
+    uint8_t payload_type;           /* negotiated H.264 payload type */
+    char profile_level_id[8];       /* answered profile-level-id, hex */
 } RtcSessionStats;
 
 /*

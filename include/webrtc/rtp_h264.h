@@ -55,8 +55,15 @@ int rtp_h264_packetize(RtpH264 *packetizer,
 uint32_t rtp_h264_packet_count(const RtpH264 *packetizer);
 uint32_t rtp_h264_octet_count(const RtpH264 *packetizer);
 
-/* Stream identity and last timestamp, for RTCP sender reports. */
+/* Stream identity, for RTCP sender reports. */
 uint32_t rtp_h264_ssrc(const RtpH264 *packetizer);
-uint32_t rtp_h264_last_timestamp(const RtpH264 *packetizer);
+
+/*
+ * RTP timestamp that corresponds to 'clock_us' on the same monotonic
+ * clock as the pts values given to rtp_h264_packetize(). Used to pair
+ * the NTP and RTP timestamps of a sender report. 0 before the first
+ * packetized access unit.
+ */
+uint32_t rtp_h264_timestamp_at(const RtpH264 *packetizer, uint64_t clock_us);
 
 #endif

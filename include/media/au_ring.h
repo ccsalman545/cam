@@ -7,7 +7,13 @@
  * Single producer, single consumer ring of encoded H.264
  * access units. The producer (encoder thread) overwrites the
  * oldest slot when full: live video always prefers freshness
- * over completeness.
+ * over completeness. Because a lost access unit breaks the
+ * prediction chain, the next one popped after a loss carries
+ * 'discontinuity' so the consumer can ask for a keyframe.
+ *
+ * The ring owns an eventfd that becomes readable on every push,
+ * so the network thread can sleep in poll() and still send a
+ * frame the moment it is encoded.
  */
 
 #include <stddef.h>
@@ -19,6 +25,7 @@ typedef struct {
     uint64_t pts_us;
     uint64_t sequence;
     int is_idr;
+    int discontinuity;      /* access units were lost before this one */
     size_t size;
 } AuMeta;
 
@@ -43,7 +50,15 @@ int au_ring_pop(AuRing *ring,
                 size_t buffer_capacity,
                 AuMeta *meta);
 
+/* Access units overwritten or skipped before the consumer got them. */
 uint64_t au_ring_dropped(const AuRing *ring);
+
+/*
+ * Readable (POLLIN) while access units are waiting; -1 when eventfd
+ * is unavailable, in which case the consumer has to poll on a timer.
+ * au_ring_pop() clears it when the ring runs empty.
+ */
+int au_ring_fd(const AuRing *ring);
 
 void au_ring_destroy(AuRing *ring);
 

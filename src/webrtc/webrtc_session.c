@@ -225,7 +225,11 @@ static void dtls_on_connected(void *user)
 
     set_state(session, RTC_STREAMING);
 
-    /* A viewer that joins mid-GOP needs a keyframe before it can decode. */
+    /*
+     * A viewer that joins mid-GOP cannot decode delta frames: hold them
+     * back (rtc_session_send_access_unit) and ask for a keyframe.
+     */
+    session->stats.waiting_keyframe = 1;
     rtc_session_request_idr(session);
 
     session->next_sr_ms = now_ms() + RTCP_SR_INTERVAL_MS;
@@ -256,8 +260,9 @@ static void dtls_on_rtcp(void *user, uint8_t *packet, size_t len)
     RtcSession *session = user;
 
     RtcpFeedback feedback;
+    uint32_t ssrc = rtp_h264_ssrc(session->rtp);
 
-    rtcp_parse(packet, len, &feedback);
+    rtcp_parse(packet, len, ssrc, &feedback);
 
     if (feedback.bye) {
         log_info("rtc", "%08x: BYE received", session->config.id);
@@ -273,12 +278,24 @@ static void dtls_on_rtcp(void *user, uint8_t *packet, size_t len)
         rtc_session_request_idr(session);
     }
 
-    if (feedback.has_rr) {
+    /*
+     * Only a block about our own SSRC describes this stream; a browser
+     * that also receives something else reports on that too.
+     */
+    if (feedback.has_rr && feedback.rr_ssrc == ssrc) {
+        session->stats.rr_received++;
+        session->stats.last_rr_ms = now_ms();
         session->stats.fraction_lost = feedback.rr_fraction_lost;
         session->stats.jitter = feedback.rr_jitter;
-        session->stats.rtt_ms = rtcp_rtt_ms(ntp_msw(wall_us()),
-                                            feedback.rr_last_sr,
-                                            feedback.rr_delay_since_sr);
+
+        int rtt = rtcp_rtt_ms(ntp_msw(wall_us()),
+                              feedback.rr_last_sr,
+                              feedback.rr_delay_since_sr);
+
+        /* -1 (no SR echoed yet, or inconsistent) keeps the last value. */
+        if (rtt >= 0) {
+            session->stats.rtt_ms = rtt;
+        }
     }
 
     if (feedback.nack_seqs > 0) {
@@ -429,6 +446,9 @@ int rtc_session_create(const RtcSessionConfig *config,
     session->state = RTC_NEW;
     session->stats.rtt_ms = -1;
     snprintf(session->stats.peer, sizeof(session->stats.peer), "-");
+    snprintf(session->stats.signaling_peer,
+             sizeof(session->stats.signaling_peer), "%s",
+             config->signaling_peer[0] ? config->signaling_peer : "-");
 
     session->retx_data = malloc((size_t) RETX_CACHE_SIZE *
                                 (RTP_MAX_PACKET + 64));
@@ -530,8 +550,18 @@ int rtc_session_create(const RtcSessionConfig *config,
     *answer_length = built;
     *session_out = session;
 
-    log_info("rtc", "%08x: created, UDP %u, payload type %d, %zu candidates",
-             config->id, bound_port, config->offer.h264_payload_type,
+    session->stats.payload_type = (uint8_t) config->offer.h264_payload_type;
+    snprintf(session->stats.profile_level_id,
+             sizeof(session->stats.profile_level_id), "%s",
+             config->offer.h264_profile_level_id[0]
+                 ? config->offer.h264_profile_level_id : "42e01f");
+
+    log_info("rtc", "%08x: created for %s, UDP %u, H264 payload type %d "
+                    "(profile-level-id %s), %zu host candidates",
+             config->id, session->stats.signaling_peer, bound_port,
+             config->offer.h264_payload_type,
+             config->offer.h264_profile_level_id[0]
+                 ? config->offer.h264_profile_level_id : "42e01f",
              config->candidate_count);
 
     return 0;
@@ -610,8 +640,41 @@ static void handle_stun(RtcSession *session,
         snprintf(session->stats.peer, sizeof(session->stats.peer),
                  "%s:%u", ip, port);
 
-        log_info("ice", "%08x: ICE validated (%s:%u) user=%s",
-                 session->config.id, ip, port, username);
+        log_info("ice", "%08x: ICE validated, peer %s:%u (offer posted "
+                        "by %s)",
+                 session->config.id, ip, port, session->stats.signaling_peer);
+
+        /*
+         * The media peer and the HTTP client are the same browser, so
+         * they normally share an address. A difference points at a
+         * proxy, a VPN or a multi-homed client, which is worth a line
+         * when media does not arrive.
+         */
+        const char *signaling = session->config.signaling_peer;
+        size_t ip_len = strlen(ip);
+        int same_host = strncmp(signaling, ip, ip_len) == 0 &&
+                        signaling[ip_len] == ':';
+
+        if (signaling[0] != 0 && !same_host) {
+            log_info("ice", "%08x: note: ICE peer %s differs from the "
+                            "signaling client %s", session->config.id, ip,
+                     signaling);
+        }
+
+        /*
+         * A peer on one of our own addresses is a browser running on
+         * this machine (for example http://127.0.0.1:8080 on the Pi's
+         * desktop): its media arrives from the LAN address, which is
+         * correct, but it is not a remote viewer.
+         */
+        for (size_t i = 0; i < session->config.candidate_count; i++) {
+            if (strcmp(session->config.candidate_ips[i], ip) == 0) {
+                log_info("ice", "%08x: note: the viewer runs on this "
+                                "machine (peer %s is a local address)",
+                         session->config.id, ip);
+                break;
+            }
+        }
     } else {
         char old_ip[INET_ADDRSTRLEN];
         uint16_t old_port = 0;
@@ -778,16 +841,30 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
          */
         uint8_t sr[RTCP_SR_SIZE + 16];
 
+        /*
+         * The NTP and RTP timestamps of an SR must denote the same
+         * instant (RFC 3550 6.4.1), so the RTP time is extrapolated to
+         * "now" instead of reusing the last frame's timestamp.
+         */
+        struct timespec mono;
+
+        clock_gettime(CLOCK_MONOTONIC, &mono);
+
+        uint64_t mono_us = (uint64_t) mono.tv_sec * 1000000ULL +
+                           (uint64_t) mono.tv_nsec / 1000ULL;
+
         rtcp_build_sender_report(sr,
                                  rtp_h264_ssrc(session->rtp),
                                  wall_us(),
-                                 rtp_h264_last_timestamp(session->rtp),
+                                 rtp_h264_timestamp_at(session->rtp, mono_us),
                                  rtp_h264_packet_count(session->rtp),
                                  rtp_h264_octet_count(session->rtp));
 
         size_t len = RTCP_SR_SIZE;
 
-        if (dtls_srtp_send_rtcp(session->dtls, sr, &len) == 0) {
+        /* No SR before the first RTP packet: there is no timeline yet. */
+        if (session->stats.frames_sent > 0 &&
+            dtls_srtp_send_rtcp(session->dtls, sr, &len) == 0) {
             session->stats.rtcp_sent++;
         }
 
@@ -807,6 +884,16 @@ int rtc_session_send_access_unit(RtcSession *session,
 
     if (is_idr) {
         session->idr_requested = 0;
+        session->stats.waiting_keyframe = 0;
+    } else if (session->stats.waiting_keyframe) {
+        /*
+         * Undecodable without the keyframe: sending it would only cost
+         * bandwidth and provoke NACK/PLI storms. Re-ask (rate limited)
+         * in case the first request was satisfied before we connected.
+         */
+        session->stats.frames_held++;
+        rtc_session_request_idr(session);
+        return 0;
     }
 
     RtpSendContext ctx = {
@@ -817,9 +904,20 @@ int rtc_session_send_access_unit(RtcSession *session,
                                      access_unit, length, pts_us,
                                      rtp_packet_sink, &ctx);
 
+    if (packets > 0) {
+        session->stats.frames_sent++;
+        session->stats.last_media_ms = now_ms();
+
+        if (is_idr) {
+            session->stats.keyframes_sent++;
+        }
+    }
+
     if (!session->streaming_announced && packets > 0) {
         session->streaming_announced = 1;
-        log_info("rtc", "%08x: streaming video", session->config.id);
+        log_info("rtc", "%08x: first video frame sent (%s, %d RTP packets) "
+                        "to %s", session->config.id,
+                 is_idr ? "keyframe" : "delta", packets, session->stats.peer);
     }
 
     return packets;

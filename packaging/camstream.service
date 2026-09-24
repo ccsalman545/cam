@@ -8,8 +8,14 @@ Type=simple
 ExecStart=/usr/local/bin/camstream --config /etc/camstream.conf
 Restart=on-failure
 RestartSec=2
-# The camera and the encoder are reached through /dev nodes and V4L2
-# ioctls, so the process only needs video group membership, not root.
+# SIGTERM goes to camstream only; it stops its rpicam-vid child itself
+# (pipe closed first, then SIGTERM). Whatever is left after the timeout
+# is killed, so a restart never finds the camera or port 8080 still held.
+KillMode=mixed
+TimeoutStopSec=10
+# The camera (libcamera: /dev/media*, /dev/video*, /dev/dma_heap) and the
+# encoder are reached through /dev nodes, so the process only needs video
+# group membership, not root.
 # Uncomment the two lines below after creating the account:
 #   sudo useradd --system --no-create-home --groups video camstream
 #User=camstream

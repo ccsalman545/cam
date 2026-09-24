@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pi Web Server</title>
+<style>body{font-family:system-ui;margin:40px;max-width:700px}code{background:#eee;padding:2px 6px;border-radius:4px}</style>
+</head>
+<body>
+<h1>✓ Mongoose C Server Running</h1>
+<p>Serving from <code>./web_root</code> on <code>0.0.0.0:8000</code></p>
+<p>Embedded-ready, pure C, no container.</p>
+<ul>
+<li><a href="/hello.txt">hello.txt</a></li>
+<li><a href="/style.css">style.css</a></li>
+</ul>
+<script>fetch('/hello.txt').then(r=>r.text()).then(t=>{let p=document.createElement('pre');p.textContent=t;document.body.appendChild(p)})</script>
+</body>
+</html>

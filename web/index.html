@@ -126,6 +126,11 @@
   </section>
 
   <section>
+    <h2>Pipeline layers (first one not flowing is where to look)</h2>
+    <div class="grid" id="layer-grid"></div>
+  </section>
+
+  <section>
     <h2>Camera and encoder</h2>
     <div class="grid" id="camera-grid"></div>
   </section>
@@ -169,6 +174,10 @@ var state = {
   connecting: false,
   retried: false,
   lastStats: null,
+  /* Browser side of the pipeline, from RTCPeerConnection.getStats(). */
+  framesDecoded: 0,
+  lastDecodeProgressMs: 0,
+  inbound: null,
   /* Auto connect on load, and how many attempts are left. A manual
      disconnect stops it; a successful stream resets it. */
   autoConnect: true,
@@ -236,9 +245,13 @@ function connect() {
 
   pc.addTransceiver("video", { direction: "recvonly" });
 
+  /*
+   * A track only means the SDP was accepted. "streaming" is claimed once
+   * the video element actually plays decoded frames (see onVideoPlaying).
+   */
   pc.ontrack = function (event) {
     el("video").srcObject = event.streams[0];
-    el("placeholder").style.display = "none";
+    el("placeholder").textContent = "connected, waiting for the first frame...";
     /*
      * The video element is muted, which is what browsers require before
      * they allow a stream to start without a click. If a policy still
@@ -249,24 +262,34 @@ function connect() {
       setState("stream ready, press Connect to start playback", "warn");
     });
     el("disconnect").disabled = false;
-    state.autoRetries = 0;
-    setState("streaming", "ok");
   };
 
   pc.oniceconnectionstatechange = function () {
     var s = pc.iceConnectionState;
 
     if (s === "failed") {
-      setState("ICE failed, retrying", "bad");
+      setState("ICE failed (UDP " + udpRange() + " blocked?), retrying", "bad");
       teardown(250);
     } else if (s === "disconnected") {
       setState("ICE disconnected", "warn");
-    } else if (s === "connected" || s === "completed") {
-      setState("connected", "ok");
+    } else if ((s === "connected" || s === "completed") && !videoPlaying()) {
+      setState("ICE connected, DTLS handshake...", "warn");
     }
   };
 
-  pc.createOffer({ offerToReceiveVideo: true })
+  /* Covers DTLS: "connected" means ICE and DTLS are both done. */
+  pc.onconnectionstatechange = function () {
+    var s = pc.connectionState;
+
+    if (s === "connected" && !videoPlaying()) {
+      setState("connected, waiting for video", "warn");
+    } else if (s === "failed" && state.pc === pc) {
+      setState("connection failed (DTLS or ICE), retrying", "bad");
+      teardown(250);
+    }
+  };
+
+  pc.createOffer()
     .then(function (offer) { return pc.setLocalDescription(offer); })
     .then(function () {
       return postJson("/api/webrtc/offer", { sdp: pc.localDescription.sdp });
@@ -283,6 +306,78 @@ function connect() {
     });
 }
 
+function videoPlaying() {
+  var video = el("video");
+  return !!state.pc && video.videoWidth > 0 && !video.paused;
+}
+
+function onVideoPlaying() {
+  var video = el("video");
+
+  if (!state.pc || video.videoWidth === 0) {
+    return;
+  }
+
+  el("placeholder").style.display = "none";
+  state.autoRetries = 0;
+  setState("streaming " + video.videoWidth + "x" + video.videoHeight, "ok");
+}
+
+el("video").addEventListener("playing", onVideoPlaying);
+el("video").addEventListener("resize", onVideoPlaying);
+
+function udpRange() {
+  return el("udp-range").textContent;
+}
+
+/*
+ * Browser side counters: the one layer the server cannot see is whether
+ * the frames it sent were decoded. Report them back so /api/status and
+ * the server log show it, and flag a connection that stopped decoding.
+ */
+function pollClientStats() {
+  var pc = state.pc;
+
+  if (!pc || !state.sessionId) {
+    return;
+  }
+
+  pc.getStats().then(function (report) {
+    var inbound = null;
+
+    report.forEach(function (entry) {
+      if (entry.type === "inbound-rtp" && (entry.kind || entry.mediaType) === "video") {
+        inbound = entry;
+      }
+    });
+
+    if (!inbound || pc !== state.pc) {
+      return;
+    }
+
+    var decoded = inbound.framesDecoded || 0;
+    var now = Date.now();
+
+    if (decoded > state.framesDecoded) {
+      state.lastDecodeProgressMs = now;
+    } else if (videoPlaying() && state.lastDecodeProgressMs &&
+               now - state.lastDecodeProgressMs > 3000) {
+      setState("connected, but no frames decoded for " +
+               ((now - state.lastDecodeProgressMs) / 1000).toFixed(0) + " s", "warn");
+    }
+
+    state.framesDecoded = decoded;
+    state.inbound = inbound;
+
+    postJson("/api/webrtc/client-stats", {
+      session_id: state.sessionId,
+      frames_decoded: decoded,
+      frame_width: inbound.frameWidth || 0,
+      frame_height: inbound.frameHeight || 0
+    }).catch(function () {});
+  }).catch(function () {});
+}
+
 function teardown(delayMs) {
   var pc = state.pc;
   var sessionId = state.sessionId;
@@ -290,9 +385,11 @@ function teardown(delayMs) {
   state.pc = null;
   state.sessionId = null;
   state.connecting = false;
+  state.framesDecoded = 0;
+  state.lastDecodeProgressMs = 0;
+  state.inbound = null;
 
   if (pc) {
-    pc.getSenders().forEach(function () {});
     pc.close();
   }
 
@@ -374,10 +471,39 @@ function refreshStatus() {
     el("udp-range").textContent = status.webrtc.udp_base_port + " to " +
       (status.webrtc.udp_base_port + status.webrtc.sessions_max - 1);
 
-    if (status.last_error) {
-      setState(status.state + ": " + status.last_error, "bad");
-    } else if (!state.pc) {
-      setState(status.state);
+    var layers = status.layers || {};
+    var pipeline = status.pipeline || {};
+
+    el("layer-grid").innerHTML =
+      cell("capture", layers.capture || "-") +
+      cell("encoder", (layers.encoder || "-") + (encoder.kind ? " (" + encoder.kind + ")" : "")) +
+      cell("HTTP", layers.http || "-") +
+      cell("ICE", layers.ice + " / " + layers.sessions) +
+      cell("DTLS", layers.dtls + " / " + layers.sessions) +
+      cell("RTP sending", layers.rtp + " / " + layers.sessions) +
+      cell("RTCP acks", layers.rtcp + " / " + layers.sessions) +
+      cell("decoding", layers.browser_decode + " / " + layers.sessions) +
+      cell("this browser", state.inbound
+        ? num(state.inbound.framesDecoded || 0) + " decoded, " +
+          num(state.inbound.framesDropped || 0) + " dropped, " +
+          num(state.inbound.packetsLost || 0) + " lost"
+        : "-") +
+      cell("pipeline", pipeline.running ? "running" :
+        "down" + (pipeline.retry_in_sec ? ", retry in " + pipeline.retry_in_sec + " s" : "")) +
+      cell("TLS attempts", num((status.http || {}).tls_rejected || 0)) +
+      cell("last error", status.last_error ? escapeHtml(status.last_error) : "-");
+
+    /*
+     * The pill follows this browser's own connection while it has one;
+     * the server state (and its pipeline error) only when it has none.
+     * An old error in the log no longer pins it.
+     */
+    if (!state.pc && !state.connecting) {
+      if (status.state === "camera-error") {
+        setState("camera error: " + (pipeline.error || status.last_error || "see log"), "bad");
+      } else {
+        setState("server " + status.state);
+      }
     }
   }).catch(function (error) {
     setState("server unreachable: " + error.message, "bad");
@@ -473,7 +599,10 @@ el("reload-config").addEventListener("click", function () {
   }).catch(reportError);
 });
 
-window.addEventListener("pagehide", function () { teardown(0); });
+window.addEventListener("pagehide", function () {
+  state.autoConnect = false;
+  teardown(0);
+});
 
 /*
  * A page that is opened is a page that wants video: connecting on load
@@ -493,6 +622,7 @@ refreshLogs();
 window.setInterval(refreshStatus, 2000);
 window.setInterval(refreshStats, 1000);
 window.setInterval(refreshLogs, 3000);
+window.setInterval(pollClientStats, 2000);
 </script>
 </body>
 </html>

@@ -71,14 +71,16 @@ int frame_hub_publish(FrameHub *hub,
 Frame *frame_hub_take(FrameHubConsumer *consumer);
 
 /*
+ * As frame_hub_take(), but sleeps up to timeout_ms for a frame to
+ * arrive instead of returning NULL at once.
+ */
+Frame *frame_hub_take_wait(FrameHubConsumer *consumer, int timeout_ms);
+
+/*
  * Access the hub pool for frame_unref().
  */
 FramePool *frame_hub_pool(FrameHub *hub);
 
-/*
- * Monotonic publisher counter (frames that made it into the
- * hub). For /status reporting.
- */
 void frame_hub_destroy(FrameHub *hub);
 
 #endif

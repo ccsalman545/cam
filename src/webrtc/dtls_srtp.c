@@ -806,7 +806,8 @@ int dtls_srtp_next_timeout_ms(const DtlsSrtp *session)
         return -1;
     }
 
-    return (int) (tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    /* Round up: a sub-millisecond remainder must not become a 0 ms spin. */
+    return (int) (tv.tv_sec * 1000 + (tv.tv_usec + 999) / 1000);
 }
 
 int dtls_srtp_send_rtp(DtlsSrtp *session, uint8_t *pkt, size_t *len)

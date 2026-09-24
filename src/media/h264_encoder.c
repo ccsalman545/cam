@@ -36,7 +36,8 @@ int m2m_backend_encode(void *backend,
                        const uint8_t *y, const uint8_t *u, const uint8_t *v,
                        uint64_t pts_us, int force_idr,
                        uint8_t *out, size_t out_capacity,
-                       size_t *out_size, int *out_is_idr);
+                       size_t *out_size, int *out_is_idr,
+                       uint64_t *out_pts_us);
 int m2m_backend_set_bitrate(void *backend, uint32_t bitrate_kbps);
 void m2m_backend_close(void *backend);
 
@@ -46,13 +47,14 @@ void m2m_backend_close(void *backend);
 #if HAVE_X264
 void *x264_backend_open(uint32_t width, uint32_t height,
                         uint32_t fps, uint32_t bitrate_kbps,
-                        uint32_t gop_seconds,
+                        uint32_t gop_seconds, int single_slice,
                         char *name_out, size_t name_out_size);
 int x264_backend_encode(void *backend,
                         const uint8_t *y, const uint8_t *u, const uint8_t *v,
                         uint64_t pts_us, int force_idr,
                         uint8_t *out, size_t out_capacity,
-                        size_t *out_size, int *out_is_idr);
+                        size_t *out_size, int *out_is_idr,
+                        uint64_t *out_pts_us);
 int x264_backend_set_bitrate(void *backend, uint32_t bitrate_kbps);
 void x264_backend_close(void *backend);
 #endif
@@ -63,18 +65,34 @@ struct H264Encoder {
                   const uint8_t *y, const uint8_t *u, const uint8_t *v,
                   uint64_t pts_us, int force_idr,
                   uint8_t *out, size_t out_capacity,
-                  size_t *out_size, int *out_is_idr);
+                  size_t *out_size, int *out_is_idr,
+                  uint64_t *out_pts_us);
     int (*set_bitrate)(void *backend, uint32_t bitrate_kbps);
     void (*close)(void *backend);
+    H264EncoderKind kind;
 };
 
 #define MAX_VIDEO_DEVICE 64
 
+/*
+ * The Raspberry Pi encoder is /dev/video11 on every Pi up to the 4, so
+ * it is probed first; the scan covers other boards and renumbered
+ * nodes. A Pi 5 has no H.264 encoder block at all.
+ */
 static int find_m2m_device(char *path_out, size_t path_size)
 {
     char path[32];
 
+    if (m2m_backend_probe("/dev/video11")) {
+        snprintf(path_out, path_size, "/dev/video11");
+        return 0;
+    }
+
     for (unsigned int i = 0; i <= MAX_VIDEO_DEVICE; i++) {
+        if (i == 11) {
+            continue;
+        }
+
         snprintf(path, sizeof(path), "/dev/video%u", i);
 
         if (m2m_backend_probe(path)) {
@@ -95,6 +113,23 @@ H264Encoder *h264_encoder_open(const char *preference,
                                char *name_out,
                                size_t name_out_size)
 {
+    return h264_encoder_open_flags(preference, width, height, fps,
+                                   bitrate_kbps, gop_seconds, 0, name_out,
+                                   name_out_size);
+}
+
+H264Encoder *h264_encoder_open_flags(const char *preference,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t fps,
+                                     uint32_t bitrate_kbps,
+                                     uint32_t gop_seconds,
+                                     unsigned flags,
+                                     char *name_out,
+                                     size_t name_out_size)
+{
+    (void) flags;   /* only libx264 has options; unused without it */
+
     if (preference == NULL) {
         preference = "auto";
     }
@@ -138,10 +173,13 @@ H264Encoder *h264_encoder_open(const char *preference,
         if (path == NULL) {
             if (find_m2m_device(device_path, sizeof(device_path)) != 0) {
                 if (!want_sw) {
-                    log_error("encode", "no V4L2 M2M H.264 encoder detected");
+                    log_error("encode", "no V4L2 M2M H.264 encoder detected "
+                                        "(a Raspberry Pi 5 has none; use "
+                                        "--encoder sw)");
                 } else {
-                    log_info("encode", "no V4L2 M2M H.264 encoder detected, "
-                                       "using software encoding (libx264)");
+                    log_info("encode", "no V4L2 M2M H.264 encoder detected "
+                                       "(normal on a Raspberry Pi 5), using "
+                                       "libx264");
                 }
             } else {
                 path = device_path;
@@ -164,6 +202,7 @@ H264Encoder *h264_encoder_open(const char *preference,
                 encoder->encode = m2m_backend_encode;
                 encoder->set_bitrate = m2m_backend_set_bitrate;
                 encoder->close = m2m_backend_close;
+                encoder->kind = H264_ENCODER_HW;
 
                 log_info("encode", "hardware encoder: %s", selected);
 
@@ -174,11 +213,15 @@ H264Encoder *h264_encoder_open(const char *preference,
                 return encoder;
             }
 
-            log_error("encode", "hardware encoder %s failed to open", path);
-
             if (explicit_device != NULL || !want_sw) {
+                log_error("encode", "hardware encoder %s failed to open (see "
+                                    "the m2m message above)", path);
                 return NULL;
             }
+
+            log_warn("encode", "hardware encoder %s failed to open (see the "
+                               "m2m message above); falling back to libx264",
+                     path);
         }
     }
 
@@ -189,6 +232,8 @@ H264Encoder *h264_encoder_open(const char *preference,
     if (want_sw) {
         void *backend = x264_backend_open(width, height, fps,
                                           bitrate_kbps, gop_seconds,
+                                          (flags & H264_ENCODER_SINGLE_SLICE)
+                                              != 0,
                                           selected, sizeof(selected));
 
         if (backend != NULL) {
@@ -202,6 +247,7 @@ H264Encoder *h264_encoder_open(const char *preference,
             encoder->encode = x264_backend_encode;
             encoder->set_bitrate = x264_backend_set_bitrate;
             encoder->close = x264_backend_close;
+            encoder->kind = H264_ENCODER_SW;
 
             log_info("encode", "software encoder: %s", selected);
 
@@ -239,17 +285,27 @@ int h264_encoder_encode(H264Encoder *encoder,
                         uint8_t *out,
                         size_t out_capacity,
                         size_t *out_size,
-                        int *out_is_idr)
+                        int *out_is_idr,
+                        uint64_t *out_pts_us)
 {
     if (encoder == NULL || encoder->encode == NULL) {
         return -1;
     }
 
+    *out_size = 0;
+    *out_is_idr = 0;
+    *out_pts_us = pts_us;
+
     return encoder->encode(encoder->backend,
                            plane_y, plane_u, plane_v,
                            pts_us, force_idr,
                            out, out_capacity,
-                           out_size, out_is_idr);
+                           out_size, out_is_idr, out_pts_us);
+}
+
+H264EncoderKind h264_encoder_kind(const H264Encoder *encoder)
+{
+    return encoder != NULL ? encoder->kind : H264_ENCODER_SW;
 }
 
 int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps)

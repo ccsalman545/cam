@@ -60,7 +60,7 @@ RtcPacketClass rtc_classify_packet(const uint8_t *buf, size_t len)
 
 int udp_socket_create(uint16_t requested_port, uint16_t *actual_port)
 {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
     if (fd < 0) {
         return -1;

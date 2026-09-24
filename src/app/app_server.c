@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -60,10 +61,31 @@
 #define AU_SLOT_CAPACITY (512 * 1024)
 #define MAX_DATAGRAMS_PER_POLL 32
 #define RATE_WINDOW_MS 1000
-#define JSON_STATUS_CAPACITY 4096
-#define JSON_STATS_CAPACITY 8192
-#define JSON_LOGS_CAPACITY 16384
+#define JSON_STATUS_CAPACITY 8192
+#define JSON_STATS_CAPACITY 16384
+#define JSON_LOGS_CAPACITY 49152
 #define MAX_INTERFACES 16
+
+/* Poll set: HTTP connections, session sockets, mDNS, AU ring. */
+#define MAX_HTTP_POLL_FDS 64
+#define MAX_POLL_FDS (MAX_HTTP_POLL_FDS + MAX_RTC_SESSIONS + 2)
+
+/* Main loop wakeups when nothing is pending. */
+#define IDLE_WAKE_MS 100
+#define SESSION_WAKE_MS 20
+
+/* Automatic pipeline recovery: first retry, then doubling up to max. */
+#define PIPELINE_RETRY_MS 5000
+#define PIPELINE_RETRY_MAX_MS 60000
+
+/* Layer health: how recent an event must be to count as "flowing". */
+#define MEDIA_RECENT_MS 2000
+#define RR_RECENT_MS 6000
+#define CLIENT_REPORT_RECENT_MS 6000
+
+/* Rejected TLS connections on the plain HTTP port. */
+#define TLS_WARN_INTERVAL_MS 10000
+#define TLS_LINGER_MS 1000
 
 typedef struct {
     char name[IF_NAMESIZE + 1];
@@ -76,6 +98,10 @@ typedef struct {
 
     struct mg_mgr mgr;
     struct mg_connection *listener;
+    mg_event_handler_t http_protocol;   /* mongoose's HTTP pfn, see tls_guard */
+    char http_bound[80];                /* "0.0.0.0:8080" from getsockname */
+    uint64_t tls_rejected;              /* TLS ClientHellos on the HTTP port */
+    uint64_t tls_warned_ms;
 
     /* Media pipeline, rebuilt by media_pipeline_start/stop. */
     VideoSource *source;
@@ -88,6 +114,19 @@ typedef struct {
     atomic_int force_idr;
     atomic_int media_active;        /* encoder actively producing */
     int pipeline_running;
+
+    /*
+     * Runtime recovery. A failed capture or encoder thread is detected
+     * by media_supervise(), which tears the pipeline down and rebuilds
+     * it with a backoff. When a hardware encoder dies and the operator
+     * asked for "auto", the rebuild uses libx264 (encoder_override).
+     */
+    char encoder_override[8];
+    char pipeline_error[256];
+    uint64_t pipeline_retry_ms;     /* next rebuild attempt, 0 = none */
+    unsigned pipeline_failures;     /* consecutive, drives the backoff */
+    uint64_t pipeline_recoveries;
+    uint64_t au_discontinuities;    /* AUs lost between encoder and sender */
 
     /*
      * mDNS responder, NULL when it is off or could not be created. It
@@ -113,6 +152,16 @@ typedef struct {
     uint64_t session_sample_ms[MAX_RTC_SESSIONS];
     uint64_t session_sample_bytes[MAX_RTC_SESSIONS];
     double session_bitrate_kbps[MAX_RTC_SESSIONS];
+
+    /*
+     * What the browser itself reports (POST /api/webrtc/client-stats):
+     * the only layer the server cannot observe directly is decoding.
+     */
+    uint64_t client_frames_decoded[MAX_RTC_SESSIONS];
+    uint64_t client_report_ms[MAX_RTC_SESSIONS];
+    unsigned client_width[MAX_RTC_SESSIONS];
+    unsigned client_height[MAX_RTC_SESSIONS];
+    int client_decoding[MAX_RTC_SESSIONS];  /* count grew at the last report */
 
     uint64_t started_ms;
     uint64_t http_requests;
@@ -388,6 +437,13 @@ static VideoSource *create_source(const AppConfig *config)
 }
 
 /*
+ * Defined below media_pipeline_start(), whose failure path calls it to
+ * unwind a partially built pipeline. It only touches members that are
+ * non-NULL, so it is safe at any point of the build.
+ */
+static void media_pipeline_stop(Server *server);
+
+/*
  * Build the pipeline. On failure the caller gets a message that names
  * the subsystem and the setting that failed, and the partially built
  * pipeline is torn down again.
@@ -423,7 +479,11 @@ static int media_pipeline_start(Server *server, char *error, size_t error_size)
         goto fail;
     }
 
-    server->encoder = h264_encoder_open(config->encoder,
+    const char *preference = server->encoder_override[0] != 0
+                                 ? server->encoder_override
+                                 : config->encoder;
+
+    server->encoder = h264_encoder_open(preference,
                                         server->source->width,
                                         server->source->height,
                                         server->source->fps,
@@ -435,7 +495,7 @@ static int media_pipeline_start(Server *server, char *error, size_t error_size)
     if (server->encoder == NULL) {
         snprintf(error, error_size,
                  "encode: no usable encoder for preference '%s'",
-                 config->encoder);
+                 preference);
         goto fail;
     }
 
@@ -467,9 +527,14 @@ static int media_pipeline_start(Server *server, char *error, size_t error_size)
     server->pipeline_running = 1;
     atomic_store(&server->force_idr, 1);
 
-    log_info("media", "pipeline running: %s %ux%u -> %s",
-             server->source->name, server->source->width,
-             server->source->height, server->encoder_name);
+    log_info("media", "pipeline running: capture %s %ux%u @ %u fps -> "
+                      "%s encoder %s, keyframe every %u s",
+             server->source->name,
+             server->source->width, server->source->height,
+             server->source->fps,
+             h264_encoder_kind(server->encoder) == H264_ENCODER_HW
+                 ? "hardware" : "software",
+             server->encoder_name, config->keyframe_seconds);
 
     return 0;
 
@@ -522,6 +587,102 @@ static void media_pipeline_stop(Server *server)
     server->pipeline_running = 0;
     server->encoder_name[0] = 0;
     atomic_store(&server->media_active, 0);
+}
+
+/*
+ * Schedule the next automatic rebuild: 5 s, 10 s, 20 s ... capped at a
+ * minute, so a camera that is unplugged or held by another process does
+ * not flood the log.
+ */
+static void pipeline_schedule_retry(Server *server, uint64_t now)
+{
+    uint64_t delay = PIPELINE_RETRY_MS;
+
+    for (unsigned i = 1; i < server->pipeline_failures &&
+                         delay < PIPELINE_RETRY_MAX_MS; i++) {
+        delay *= 2;
+    }
+
+    if (delay > PIPELINE_RETRY_MAX_MS) {
+        delay = PIPELINE_RETRY_MAX_MS;
+    }
+
+    server->pipeline_retry_ms = now + delay;
+
+    log_warn("media", "next pipeline start attempt in %llu s",
+             (unsigned long long) (delay / 1000));
+}
+
+/*
+ * Runtime health of the capture and encode threads. Either one exiting
+ * (camera unplugged, rpicam-vid died, encoder fatal error or stalled)
+ * used to leave a pipeline that looked "running" but produced nothing;
+ * now it is torn down and rebuilt, and the viewers get a keyframe from
+ * the new encoder. Sessions survive the rebuild.
+ */
+static void media_supervise(Server *server, uint64_t now)
+{
+    if (server->pipeline_running) {
+        int encoder_failed = encoder_worker_failed(server->encoder_worker);
+        int source_failed = source_worker_failed(server->source_worker);
+
+        if (!encoder_failed && !source_failed) {
+            return;
+        }
+
+        if (encoder_failed) {
+            int hardware =
+                h264_encoder_kind(server->encoder) == H264_ENCODER_HW;
+
+            snprintf(server->pipeline_error, sizeof(server->pipeline_error),
+                     "encode: %s failed at runtime", server->encoder_name);
+
+            if (hardware && strcmp(server->config.encoder, "auto") == 0) {
+                snprintf(server->encoder_override,
+                         sizeof(server->encoder_override), "sw");
+                log_warn("media", "hardware encoder %s failed; rebuilding "
+                                  "the pipeline with libx264 (encoder=auto)",
+                         server->encoder_name);
+            } else {
+                log_error("media", "encoder %s failed; rebuilding the "
+                                   "pipeline", server->encoder_name);
+            }
+        } else {
+            snprintf(server->pipeline_error, sizeof(server->pipeline_error),
+                     "capture: %s stopped delivering frames",
+                     server->source->name);
+            log_error("media", "capture %s stopped; rebuilding the pipeline",
+                      server->source->name);
+        }
+
+        media_pipeline_stop(server);
+
+        /* An encoder switch is worth trying at once; a camera is not. */
+        server->pipeline_failures = encoder_failed ? 0 : 1;
+        server->pipeline_retry_ms =
+            encoder_failed ? now : now + PIPELINE_RETRY_MS;
+        return;
+    }
+
+    if (server->pipeline_retry_ms == 0 || now < server->pipeline_retry_ms) {
+        return;
+    }
+
+    char error[256] = "";
+
+    if (media_pipeline_start(server, error, sizeof(error)) == 0) {
+        server->pipeline_retry_ms = 0;
+        server->pipeline_failures = 0;
+        server->pipeline_error[0] = 0;
+        server->pipeline_recoveries++;
+        log_info("media", "pipeline recovered");
+        return;
+    }
+
+    snprintf(server->pipeline_error, sizeof(server->pipeline_error), "%s",
+             error);
+    server->pipeline_failures++;
+    pipeline_schedule_retry(server, now);
 }
 
 /* ------------------------------------------------------------------ */
@@ -608,6 +769,194 @@ static uint32_t next_session_id(const Server *server)
     log_error("http", "RAND_bytes failed for session ids; using a counter");
 
     return (uint32_t) (server->sessions_total + 1) * 2654435761u;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP transport                                                      */
+/* ------------------------------------------------------------------ */
+
+/* "192.168.0.20:53124" / "[fe80::1]:53124" for logs and diagnostics. */
+static void format_mg_addr(const struct mg_addr *addr, char *out, size_t size)
+{
+    char ip[INET6_ADDRSTRLEN] = "?";
+
+    if (addr->is_ip6) {
+        inet_ntop(AF_INET6, addr->addr.ip, ip, sizeof(ip));
+        snprintf(out, size, "[%s]:%u", ip, (unsigned) ntohs(addr->port));
+    } else {
+        inet_ntop(AF_INET, addr->addr.ip, ip, sizeof(ip));
+        snprintf(out, size, "%s:%u", ip, (unsigned) ntohs(addr->port));
+    }
+}
+
+/*
+ * Mongoose reports a failed listen only as a NULL return (its own log
+ * is compiled out), which used to surface as "cannot listen" with no
+ * reason. Bind a throwaway socket with the same options first so the
+ * operator gets the errno and the usual fix. Only IPv4 literals are
+ * probed; anything else is left to mongoose.
+ */
+static int http_probe_bind(const char *listen_ip, uint16_t port,
+                           char *error, size_t error_size)
+{
+    struct sockaddr_in address;
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, listen_ip, &address.sin_addr) != 1) {
+        return 0;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd < 0) {
+        snprintf(error, error_size, "socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    int one = 1;
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    int result = bind(fd, (struct sockaddr *) &address, sizeof(address));
+    int saved = errno;
+
+    close(fd);
+
+    if (result == 0) {
+        return 0;
+    }
+
+    switch (saved) {
+    case EADDRINUSE:
+        snprintf(error, error_size,
+                 "TCP port %u is already in use (camstream service "
+                 "running?). Check: sudo ss -ltnp 'sport = :%u'. Stop it: "
+                 "sudo systemctl stop camstream",
+                 (unsigned) port, (unsigned) port);
+        break;
+    case EACCES:
+        snprintf(error, error_size,
+                 "permission denied for TCP port %u (ports below 1024 need "
+                 "root or CAP_NET_BIND_SERVICE)", (unsigned) port);
+        break;
+    case EADDRNOTAVAIL:
+        snprintf(error, error_size,
+                 "%s is not an address of this machine; use 0.0.0.0 to "
+                 "listen on every interface", listen_ip);
+        break;
+    default:
+        snprintf(error, error_size, "bind %s:%u failed: %s", listen_ip,
+                 (unsigned) port, strerror(saved));
+        break;
+    }
+
+    return -1;
+}
+
+/* Mongoose's hexdump and error output go through this: keep it quiet. */
+static void mongoose_log_discard(char c, void *param)
+{
+    (void) c;
+    (void) param;
+}
+
+/*
+ * TLS on the plain HTTP port.
+ *
+ * Browsers upgrade typed addresses to https:// (HTTPS-First / HTTPS-Only
+ * modes, HSTS for a name, or a bookmarked https:// URL). The first bytes
+ * are then a TLS ClientHello (record type 0x16, version 0x03 0xNN), which
+ * mongoose used to hexdump to stdout before closing the socket with the
+ * rest of the hello unread. The kernel answers that with a RST, so the
+ * browser showed PR_END_OF_FILE_ERROR or "connection was reset".
+ *
+ * This protocol filter runs before mongoose's HTTP parser on every
+ * accepted connection. A TLS hello gets a TLS alert (protocol_version),
+ * which browsers turn into a clear "can't connect securely" page, then
+ * an orderly shutdown after the peer's data is drained, and one
+ * rate-limited log line telling the operator to use http://.
+ *
+ * c->data[0]: 0 = undecided, 1 = HTTP, 2 = TLS rejected.
+ * c->data[8..15]: monotonic ms of the rejection (for the linger bound).
+ */
+enum { CONN_UNDECIDED = 0, CONN_HTTP = 1, CONN_TLS_REJECTED = 2 };
+
+static void tls_reject(Server *server, struct mg_connection *connection)
+{
+    static const uint8_t alert[] = {
+        0x15, 0x03, 0x01, 0x00, 0x02,   /* alert record, TLS 1.0 framing */
+        0x02, 0x46                      /* fatal, protocol_version */
+    };
+    uint64_t now = now_ms();
+
+    connection->data[0] = CONN_TLS_REJECTED;
+    memcpy(connection->data + 8, &now, sizeof(now));
+
+    connection->recv.len = 0;
+    mg_send(connection, alert, sizeof(alert));
+
+    server->tls_rejected++;
+
+    if (server->tls_warned_ms == 0 ||
+        now - server->tls_warned_ms >= TLS_WARN_INTERVAL_MS) {
+        char peer[64];
+
+        format_mg_addr(&connection->rem, peer, sizeof(peer));
+        server->tls_warned_ms = now;
+        log_warn("http", "%s: TLS handshake on the plain HTTP port, the "
+                         "browser is using https://. Open http://<pi-ip>:%u/ "
+                         "(type http:// explicitly; Firefox HTTPS-Only needs "
+                         "an exception) [%llu rejected]",
+                 peer, (unsigned) server->config.http_port,
+                 (unsigned long long) server->tls_rejected);
+    }
+}
+
+static void tls_guard(struct mg_connection *connection, int event,
+                      void *event_data)
+{
+    Server *server = connection->fn_data;
+
+    if (connection->data[0] == CONN_TLS_REJECTED) {
+        if (event == MG_EV_READ) {
+            connection->recv.len = 0;         /* drain, never parse */
+        } else if (event == MG_EV_POLL && event_data != NULL) {
+            uint64_t since = 0;
+
+            memcpy(&since, connection->data + 8, sizeof(since));
+
+            if (connection->send.len == 0 && connection->data[1] == 0) {
+                /* Alert flushed: FIN our side, keep reading theirs. */
+                shutdown((int) (size_t) connection->fd, SHUT_WR);
+                connection->data[1] = 1;
+            }
+
+            if (now_ms() - since >= TLS_LINGER_MS) {
+                connection->is_closing = 1;
+            }
+        }
+        return;
+    }
+
+    if (connection->data[0] == CONN_UNDECIDED && event == MG_EV_READ &&
+        connection->recv.len > 0) {
+        const uint8_t *head = connection->recv.buf;
+
+        if (head[0] == 0x16 &&
+            (connection->recv.len < 2 || head[1] == 0x03)) {
+            tls_reject(server, connection);
+            return;
+        }
+
+        connection->data[0] = CONN_HTTP;
+    }
+
+    if (server->http_protocol != NULL) {
+        server->http_protocol(connection, event, event_data);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -765,7 +1114,12 @@ static int json_get_string(const char *body, const char *field,
     return -1;
 }
 
-static int json_get_long(const char *body, const char *field, long *out)
+/*
+ * 64-bit on purpose: session ids are random uint32_t values and "long"
+ * is 32 bits on armhf Raspberry Pi OS, where ids above 2^31 used to
+ * saturate and "no such session" came back for half of all viewers.
+ */
+static int json_get_long(const char *body, const char *field, long long *out)
 {
     char pattern[64];
 
@@ -793,9 +1147,12 @@ static int json_get_long(const char *body, const char *field, long *out)
     pos++;
 
     char *end = NULL;
-    long value = strtol(pos, &end, 10);
 
-    if (end == pos) {
+    errno = 0;
+
+    long long value = strtoll(pos, &end, 10);
+
+    if (end == pos || errno == ERANGE) {
         return -1;
     }
 
@@ -915,6 +1272,9 @@ static void handle_offer(Server *server,
         session_config.candidate_count++;
     }
 
+    format_mg_addr(&connection->rem, session_config.signaling_peer,
+                   sizeof(session_config.signaling_peer));
+
     session_config.id = next_session_id(server);
     session_config.udp_port = (uint16_t) (server->config.udp_base_port + slot);
     session_config.offer = offer;
@@ -940,6 +1300,11 @@ static void handle_offer(Server *server,
     server->session_sample_ms[slot] = 0;
     server->session_sample_bytes[slot] = 0;
     server->session_bitrate_kbps[slot] = 0.0;
+    server->client_frames_decoded[slot] = 0;
+    server->client_report_ms[slot] = 0;
+    server->client_width[slot] = 0;
+    server->client_height[slot] = 0;
+    server->client_decoding[slot] = 0;
 
     /* A viewer joining mid-GOP needs a keyframe before it can decode. */
     atomic_store(&server->force_idr, 1);
@@ -966,9 +1331,11 @@ static void handle_offer(Server *server,
 
     reply_json(server, connection, 200, payload);
 
-    log_info("rtc", "%08x: signaling complete (slot %zu, %s, %zu candidates)",
-             rtc_session_id(session), slot, advertise_ip,
-             session_config.candidate_count);
+    log_info("rtc", "%08x: signaling complete for %s (slot %zu, UDP %u, "
+                    "candidate %s + %zu more)",
+             rtc_session_id(session), session_config.signaling_peer, slot,
+             (unsigned) session_config.udp_port, advertise_ip,
+             session_config.candidate_count - 1);
 }
 
 static void handle_close(Server *server,
@@ -986,9 +1353,10 @@ static void handle_close(Server *server,
     memcpy(body, message->body.buf, message->body.len);
     body[message->body.len] = 0;
 
-    long id = 0;
+    long long id = 0;
 
-    if (json_get_long(body, "session_id", &id) != 0 || id <= 0) {
+    if (json_get_long(body, "session_id", &id) != 0 || id <= 0 ||
+        id > UINT32_MAX) {
         reply_error(server, connection, 400,
                     "missing or invalid 'session_id'");
         return;
@@ -1006,23 +1374,163 @@ static void handle_close(Server *server,
     reply_error(server, connection, 404, "no such session");
 }
 
+/*
+ * POST /api/webrtc/client-stats {"session_id":N,"frames_decoded":N,
+ * "frame_width":N,"frame_height":N}
+ *
+ * The page posts what its RTCPeerConnection reports every couple of
+ * seconds. Decoding happens in the browser, so without this the server
+ * can prove packets left and were acknowledged (RTCP RR) but not that a
+ * picture appeared. Purely diagnostic: nothing depends on it.
+ */
+static void handle_client_stats(Server *server,
+                                struct mg_connection *connection,
+                                struct mg_http_message *message)
+{
+    char body[512];
+
+    if (message->body.len == 0 || message->body.len >= sizeof(body)) {
+        reply_error(server, connection, 400,
+                    "client stats body must be 1 to 511 bytes");
+        return;
+    }
+
+    memcpy(body, message->body.buf, message->body.len);
+    body[message->body.len] = 0;
+
+    long long id = 0;
+    long long decoded = 0;
+    long long width = 0;
+    long long height = 0;
+
+    if (json_get_long(body, "session_id", &id) != 0 || id <= 0 ||
+        id > UINT32_MAX ||
+        json_get_long(body, "frames_decoded", &decoded) != 0 || decoded < 0) {
+        reply_error(server, connection, 400,
+                    "need 'session_id' and 'frames_decoded'");
+        return;
+    }
+
+    if (json_get_long(body, "frame_width", &width) != 0 || width < 0 ||
+        width > 16384) {
+        width = 0;
+    }
+
+    if (json_get_long(body, "frame_height", &height) != 0 || height < 0 ||
+        height > 16384) {
+        height = 0;
+    }
+
+    for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+        RtcSession *session = server->sessions[i];
+
+        if (session == NULL || rtc_session_id(session) != (uint32_t) id) {
+            continue;
+        }
+
+        server->client_decoding[i] =
+            (uint64_t) decoded > server->client_frames_decoded[i];
+
+        if (server->client_frames_decoded[i] == 0 && decoded > 0) {
+            log_info("rtc", "%08x: browser is decoding video (%lldx%lld)",
+                     rtc_session_id(session), width, height);
+        }
+
+        server->client_frames_decoded[i] = (uint64_t) decoded;
+        server->client_width[i] = (unsigned) width;
+        server->client_height[i] = (unsigned) height;
+        server->client_report_ms[i] = now_ms();
+
+        reply_json(server, connection, 200, "{\"ok\":true}");
+        return;
+    }
+
+    reply_error(server, connection, 404, "no such session");
+}
+
+/*
+ * Per-layer view over all live sessions. Each counter answers one
+ * question in order, so a viewer with a black picture can be placed on
+ * the first layer that is not flowing:
+ *
+ *   signaling  offer answered (the session exists)
+ *   ice        an authenticated STUN check arrived from the browser
+ *   dtls       the handshake completed and SRTP keys exist
+ *   rtp        access units were packetized and sent recently
+ *   rtcp       the browser acknowledges them with receiver reports
+ *   decode     the page reports a growing framesDecoded count
+ */
+typedef struct {
+    int sessions;
+    int ice;
+    int dtls;
+    int rtp;
+    int rtcp;
+    int decode;
+    int waiting_keyframe;
+} LayerSummary;
+
+static void layer_summary(const Server *server, uint64_t now,
+                          LayerSummary *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
+        const RtcSession *session = server->sessions[i];
+
+        if (session == NULL || rtc_session_state(session) == RTC_CLOSED) {
+            continue;
+        }
+
+        RtcSessionStats stats;
+
+        memset(&stats, 0, sizeof(stats));
+        rtc_session_get_stats(session, &stats);
+
+        out->sessions++;
+        out->ice += stats.stun_ok > 0;
+        out->dtls += rtc_session_state(session) == RTC_STREAMING;
+        out->rtp += stats.last_media_ms != 0 &&
+                    now - stats.last_media_ms < MEDIA_RECENT_MS;
+        out->rtcp += stats.last_rr_ms != 0 &&
+                     now - stats.last_rr_ms < RR_RECENT_MS;
+        out->decode += server->client_decoding[i] &&
+                       now - server->client_report_ms[i] <
+                           CLIENT_REPORT_RECENT_MS;
+        out->waiting_keyframe += stats.waiting_keyframe &&
+                                 rtc_session_state(session) == RTC_STREAMING;
+    }
+}
+
+/*
+ * Top level state. "streaming" means media is actually flowing: an
+ * access unit went out in the last 2 s and the browser acknowledged the
+ * stream with a receiver report, not merely that a session exists.
+ */
 static const char *server_state(const Server *server)
 {
     if (!server->pipeline_running) {
         return "camera-error";
     }
 
-    int active = sessions_active(server);
+    LayerSummary layers;
 
-    if (active == 0) {
+    layer_summary(server, now_ms(), &layers);
+
+    if (layers.sessions == 0) {
         return "idle";
     }
 
-    for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
-        if (server->sessions[i] != NULL &&
-            rtc_session_state(server->sessions[i]) == RTC_STREAMING) {
-            return "streaming";
-        }
+    if (layers.rtp > 0 && layers.rtcp > 0) {
+        return "streaming";
+    }
+
+    if (layers.rtp > 0) {
+        return "sending";           /* no receiver report yet */
+    }
+
+    if (layers.dtls > 0) {
+        return "no-media";          /* connected, nothing to send */
     }
 
     return "connecting";
@@ -1093,11 +1601,20 @@ static void handle_status(Server *server,
              (unsigned long long) ((now_ms() - server->started_ms) / 1000));
     json_string(&writer, server_state(server));
 
-    json_raw(&writer, ",\"http\":{\"port\":%u,\"requests\":%llu,"
-                      "\"errors\":%llu}",
-             server->config.http_port,
+    unsigned http_connections = 0;
+
+    for (struct mg_connection *c = server->mgr.conns; c != NULL; c = c->next) {
+        http_connections += c->is_accepted;
+    }
+
+    json_raw(&writer, ",\"http\":{\"listen\":");
+    json_string(&writer, server->http_bound);
+    json_raw(&writer, ",\"port\":%u,\"connections\":%u,\"requests\":%llu,"
+                      "\"errors\":%llu,\"tls_rejected\":%llu}",
+             server->config.http_port, http_connections,
              (unsigned long long) server->http_requests,
-             (unsigned long long) server->http_errors);
+             (unsigned long long) server->http_errors,
+             (unsigned long long) server->tls_rejected);
 
     if (server->source != NULL) {
         const VideoSource *source = server->source;
@@ -1107,9 +1624,11 @@ static void handle_status(Server *server,
         json_raw(&writer, ",\"name\":");
         json_string(&writer, source->name);
         json_raw(&writer, ",\"width\":%u,\"height\":%u,\"fps\":%u,"
+                          "\"capture_fps\":%.1f,"
                           "\"frames\":%llu,\"capture_errors\":%llu,"
                           "\"status\":\"%s\"}",
                  source->width, source->height, source->fps,
+                 server->capture_fps,
                  (unsigned long long) source_worker_captured(server->source_worker),
                  (unsigned long long) source_worker_errors(server->source_worker),
                  source_worker_failed(server->source_worker) ? "failed" : "ok");
@@ -1123,13 +1642,65 @@ static void handle_status(Server *server,
     json_string(&writer, server->encoder_name[0] ? server->encoder_name : "none");
     json_raw(&writer, ",\"preference\":");
     json_string(&writer, server->config.encoder);
+    const char *encoder_status = "failed";
+
+    if (server->pipeline_running) {
+        if (encoder_worker_failed(server->encoder_worker)) {
+            encoder_status = "failed";
+        } else if (!atomic_load(&server->media_active)) {
+            encoder_status = "idle";        /* no viewer: nothing encoded */
+        } else {
+            encoder_status = server->encode_fps > 0.0 ? "ok" : "stalled";
+        }
+    }
+
+    json_raw(&writer, ",\"kind\":\"%s\"",
+             server->encoder == NULL ? "none"
+             : h264_encoder_kind(server->encoder) == H264_ENCODER_HW
+                 ? "hardware" : "software");
     json_raw(&writer, ",\"bitrate_kbps\":%u,\"keyframe_seconds\":%u,"
-                      "\"frames\":%llu,\"fps\":%.1f,\"status\":\"%s\"}",
+                      "\"frames\":%llu,\"keyframes\":%llu,"
+                      "\"params_prepended\":%llu,\"fps\":%.1f,"
+                      "\"status\":\"%s\"}",
              server->config.bitrate_kbps,
              server->config.keyframe_seconds,
-             (unsigned long long) encoder_worker_frames_encoded(server->encoder_worker),
-             server->encode_fps,
-             server->pipeline_running ? "ok" : "failed");
+             (unsigned long long) encoder_stats.frames_encoded,
+             (unsigned long long) encoder_stats.keyframes,
+             (unsigned long long) encoder_stats.params_prepended,
+             server->encode_fps, encoder_status);
+
+    uint64_t now = now_ms();
+
+    json_raw(&writer, ",\"pipeline\":{\"running\":%s,\"recoveries\":%llu,"
+                      "\"retry_in_sec\":%llu,\"error\":",
+             server->pipeline_running ? "true" : "false",
+             (unsigned long long) server->pipeline_recoveries,
+             (unsigned long long) (server->pipeline_retry_ms > now
+                 ? (server->pipeline_retry_ms - now + 999) / 1000 : 0));
+    json_string(&writer, server->pipeline_error);
+    json_raw(&writer, "}");
+
+    /*
+     * One line per layer, bottom-up, so "where does it stop" can be read
+     * without correlating counters: the first entry that is not "ok"
+     * (or "idle") is the layer to debug.
+     */
+    LayerSummary layers;
+
+    layer_summary(server, now, &layers);
+
+    const char *capture_layer =
+        server->source == NULL ? "failed"
+        : source_worker_failed(server->source_worker) ? "failed"
+        : server->capture_fps > 0.0 ? "ok" : "no-frames";
+
+    json_raw(&writer, ",\"layers\":{\"capture\":\"%s\",\"encoder\":\"%s\","
+                      "\"http\":\"ok\",\"sessions\":%d,\"ice\":%d,"
+                      "\"dtls\":%d,\"rtp\":%d,\"rtcp\":%d,"
+                      "\"browser_decode\":%d,\"waiting_keyframe\":%d}",
+             capture_layer, encoder_status, layers.sessions, layers.ice,
+             layers.dtls, layers.rtp, layers.rtcp, layers.decode,
+             layers.waiting_keyframe);
 
     /*
      * The fingerprint is part of the diagnostics because it is the one
@@ -1199,7 +1770,8 @@ static void handle_status(Server *server,
                       "\"encode_fps\":%.1f,\"frames_seen\":%llu,"
                       "\"frames_encoded\":%llu,\"au_dropped\":%llu,"
                       "\"skipped_idle\":%llu,\"skipped_size\":%llu,"
-                      "\"skipped_mismatch\":%llu,\"encoder_no_output\":%llu}",
+                      "\"skipped_mismatch\":%llu,\"encoder_no_output\":%llu,"
+                      "\"au_discontinuities\":%llu}",
              server->bitrate_kbps, server->capture_fps, server->encode_fps,
              (unsigned long long) encoder_stats.frames_seen,
              (unsigned long long) encoder_stats.frames_encoded,
@@ -1208,7 +1780,8 @@ static void handle_status(Server *server,
              (unsigned long long) encoder_stats.skipped_idle,
              (unsigned long long) encoder_stats.skipped_bad_size,
              (unsigned long long) encoder_stats.skipped_mismatch,
-             (unsigned long long) encoder_stats.no_output);
+             (unsigned long long) encoder_stats.no_output,
+             (unsigned long long) server->au_discontinuities);
 
     json_raw(&writer, ",\"process\":{\"cpu_percent\":%.1f,\"rss_kb\":%llu,"
                       "\"log_lines\":%llu,\"log_errors\":%llu,"
@@ -1282,8 +1855,10 @@ static void handle_stats(Server *server,
     uint64_t stun_rx = 0;
     uint64_t stun_bad = 0;
 
+    uint64_t now = now_ms();
+
     json_raw(&writer, "{\"uptime_sec\":%llu,\"sessions\":[",
-             (unsigned long long) ((now_ms() - server->started_ms) / 1000));
+             (unsigned long long) ((now - server->started_ms) / 1000));
 
     int count = 0;
 
@@ -1304,6 +1879,28 @@ static void handle_stats(Server *server,
         json_string(&writer, rtc_session_state_name(session));
         json_raw(&writer, ",\"peer\":");
         json_string(&writer, stats.peer);
+        json_raw(&writer, ",\"signaling_peer\":");
+        json_string(&writer, stats.signaling_peer);
+        json_raw(&writer, ",\"h264_payload_type\":%u,\"profile_level_id\":",
+                 (unsigned) stats.payload_type);
+        json_string(&writer, stats.profile_level_id);
+        json_raw(&writer,
+                 ",\"frames_sent\":%llu,\"keyframes_sent\":%llu,"
+                 "\"frames_held\":%llu,\"waiting_keyframe\":%s,"
+                 "\"last_media_age_ms\":%lld,\"rr_received\":%u,"
+                 "\"last_rr_age_ms\":%lld,\"browser_frames_decoded\":%llu,"
+                 "\"browser_frame_size\":\"%ux%u\",\"browser_report_age_ms\":%lld",
+                 (unsigned long long) stats.frames_sent,
+                 (unsigned long long) stats.keyframes_sent,
+                 (unsigned long long) stats.frames_held,
+                 stats.waiting_keyframe ? "true" : "false",
+                 stats.last_media_ms ? (long long) (now - stats.last_media_ms) : -1LL,
+                 stats.rr_received,
+                 stats.last_rr_ms ? (long long) (now - stats.last_rr_ms) : -1LL,
+                 (unsigned long long) server->client_frames_decoded[i],
+                 server->client_width[i], server->client_height[i],
+                 server->client_report_ms[i]
+                     ? (long long) (now - server->client_report_ms[i]) : -1LL);
         json_raw(&writer,
                  ",\"udp_port\":%u,\"rtt_ms\":%d,\"fraction_lost\":%u,"
                  "\"jitter\":%u,\"bitrate_kbps\":%.1f,\"packets_sent\":%llu,"
@@ -1349,10 +1946,13 @@ static void handle_stats(Server *server,
              (unsigned long long) source_worker_errors(server->source_worker));
 
     json_raw(&writer,
-             "\"encoder\":{\"frames\":%llu,\"no_output\":%llu,"
+             "\"encoder\":{\"frames\":%llu,\"keyframes\":%llu,"
+             "\"params_prepended\":%llu,\"no_output\":%llu,"
              "\"skipped_idle\":%llu,\"skipped_size\":%llu,"
              "\"skipped_mismatch\":%llu,\"au_dropped\":%llu},",
              (unsigned long long) encoder_stats.frames_encoded,
+             (unsigned long long) encoder_stats.keyframes,
+             (unsigned long long) encoder_stats.params_prepended,
              (unsigned long long) encoder_stats.no_output,
              (unsigned long long) encoder_stats.skipped_idle,
              (unsigned long long) encoder_stats.skipped_bad_size,
@@ -1391,7 +1991,8 @@ static void handle_stats(Server *server,
              "\"events\":{\"http_requests\":%llu,\"http_errors\":%llu,"
              "\"sessions_created\":%llu,\"sessions_closed\":%llu,"
              "\"session_create_failures\":%llu,\"camera_restarts\":%llu,"
-             "\"webrtc_restarts\":%llu,\"config_reloads\":%llu}}",
+             "\"webrtc_restarts\":%llu,\"config_reloads\":%llu,"
+             "\"pipeline_recoveries\":%llu,\"tls_rejected\":%llu}}",
              (unsigned long long) server->http_requests,
              (unsigned long long) server->http_errors,
              (unsigned long long) server->sessions_total,
@@ -1399,7 +2000,9 @@ static void handle_stats(Server *server,
              (unsigned long long) server->session_create_failures,
              (unsigned long long) server->camera_restarts,
              (unsigned long long) server->webrtc_restarts,
-             (unsigned long long) server->config_reloads);
+             (unsigned long long) server->config_reloads,
+             (unsigned long long) server->pipeline_recoveries,
+             (unsigned long long) server->tls_rejected);
 
     if (json_finish(&writer) != 0) {
         log_error("http", "/api/stats payload exceeded %d bytes",
@@ -1523,6 +2126,9 @@ static void handle_camera_restart(Server *server,
 
     media_pipeline_stop(server);
 
+    /* An explicit restart retries the configured encoder preference. */
+    server->encoder_override[0] = 0;
+
     char error[256] = "";
     char payload[512];
     JsonWriter writer;
@@ -1530,6 +2136,11 @@ static void handle_camera_restart(Server *server,
     json_begin(&writer, payload, sizeof(payload));
 
     if (media_pipeline_start(server, error, sizeof(error)) != 0) {
+        snprintf(server->pipeline_error, sizeof(server->pipeline_error),
+                 "%s", error);
+        server->pipeline_failures = 1;
+        pipeline_schedule_retry(server, now_ms());
+
         json_raw(&writer, "{\"restarted\":false,\"error\":");
         json_string(&writer, error);
         json_raw(&writer, "}");
@@ -1542,6 +2153,10 @@ static void handle_camera_restart(Server *server,
         reply_json(server, connection, 503, payload);
         return;
     }
+
+    server->pipeline_error[0] = 0;
+    server->pipeline_failures = 0;
+    server->pipeline_retry_ms = 0;
 
     /* Every viewer needs a keyframe from the rebuilt encoder. */
     atomic_store(&server->force_idr, 1);
@@ -1585,7 +2200,8 @@ static void handle_webrtc_restart(Server *server,
              server->dtls_ready ? "true" : "false",
              closed,
              server->dtls_ready ? "ready" : "failed");
-    json_string(&writer, dtls_srtp_local_fingerprint());
+    json_string(&writer, server->dtls_ready ? dtls_srtp_local_fingerprint()
+                                            : "none");
     json_raw(&writer, "}");
 
     if (json_finish(&writer) != 0) {
@@ -1751,8 +2367,7 @@ static void handle_index(struct mg_connection *connection)
 {
     mg_http_reply(connection, 200,
                   "Content-Type: text/html; charset=utf-8\r\n"
-                  "Cache-Control: no-store\r\n"
-                  "Connection: close\r\n",
+                  "Cache-Control: no-store\r\n",
                   "%s", (const char *) web_index_html);
 }
 
@@ -1815,6 +2430,11 @@ static void http_event_handler(struct mg_connection *connection,
         return;
     }
 
+    if (is_post && uri_is(&message->uri, "/api/webrtc/client-stats")) {
+        handle_client_stats(server, connection, message);
+        return;
+    }
+
     if (is_post && uri_is(&message->uri, "/api/camera/restart")) {
         handle_camera_restart(server, connection);
         return;
@@ -1844,6 +2464,16 @@ static void http_event_handler(struct mg_connection *connection,
 /* ------------------------------------------------------------------ */
 /* Rate sampling                                                       */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Counter delta that survives a pipeline rebuild: the new workers start
+ * again from zero, and an unsigned "new - old" would then report an
+ * absurd frame rate for one window.
+ */
+static uint64_t counter_delta(uint64_t current, uint64_t previous)
+{
+    return current >= previous ? current - previous : current;
+}
 
 static void sample_rates(Server *server, uint64_t now)
 {
@@ -1879,7 +2509,8 @@ static void sample_rates(Server *server, uint64_t now)
         uint64_t window = now - server->session_sample_ms[i];
 
         if (window > 0) {
-            uint64_t delta = stats.bytes_sent - server->session_sample_bytes[i];
+            uint64_t delta = counter_delta(stats.bytes_sent,
+                                           server->session_sample_bytes[i]);
 
             server->session_bitrate_kbps[i] =
                 (double) delta * 8.0 / (double) window;
@@ -1890,17 +2521,17 @@ static void sample_rates(Server *server, uint64_t now)
     }
 
     server->capture_fps =
-        (double) (captured - server->sample_captured) * 1000.0 / (double) elapsed;
+        (double) counter_delta(captured, server->sample_captured) * 1000.0 /
+        (double) elapsed;
     server->encode_fps =
-        (double) (encoded - server->sample_encoded) * 1000.0 / (double) elapsed;
+        (double) counter_delta(encoded, server->sample_encoded) * 1000.0 /
+        (double) elapsed;
 
-    if (server->sample_ms != 0) {
-        uint64_t delta_bytes = bytes_sent >= server->sample_bytes_sent ?
-            bytes_sent - server->sample_bytes_sent : 0;
+    /* Sessions come and go, so the byte total can shrink: no rate then. */
+    uint64_t delta_bytes = bytes_sent >= server->sample_bytes_sent
+                               ? bytes_sent - server->sample_bytes_sent : 0;
 
-        server->bitrate_kbps =
-            (double) delta_bytes * 8.0 / (double) elapsed;
-    }
+    server->bitrate_kbps = (double) delta_bytes * 8.0 / (double) elapsed;
 
     server->sample_ms = now;
     server->sample_captured = captured;
@@ -1912,88 +2543,147 @@ static void sample_rates(Server *server, uint64_t now)
 /* Main loop                                                           */
 /* ------------------------------------------------------------------ */
 
-static void poll_sessions(Server *server)
+static void drain_session_socket(RtcSession *session)
 {
-    struct pollfd fds[MAX_RTC_SESSIONS];
-    int fd_count = 0;
-    int timeout = 10;
-    int has_sessions = 0;
+    uint8_t buffer[2048];
+    struct sockaddr_storage source;
+    int fd = rtc_session_fd(session);
+
+    /*
+     * Bounded drain: a viewer flooding its socket must not starve HTTP
+     * handling or the other sessions.
+     */
+    for (int n = 0; n < MAX_DATAGRAMS_PER_POLL; n++) {
+        socklen_t source_len = sizeof(source);
+
+        ssize_t received = recvfrom(fd, buffer, sizeof(buffer), 0,
+                                    (struct sockaddr *) &source, &source_len);
+
+        if (received <= 0) {
+            break;
+        }
+
+        rtc_session_on_udp(session, buffer, (size_t) received, &source);
+
+        if (rtc_session_state(session) == RTC_CLOSED) {
+            break;
+        }
+    }
+}
+
+/*
+ * One poll() for everything the main thread serves: HTTP sockets (the
+ * listener and every accepted connection), the session UDP sockets, the
+ * mDNS socket and the AU ring's eventfd. The thread sleeps until one of
+ * them is ready or a timer is due, so an idle server costs no CPU, HTTP
+ * is answered immediately even while media flows, and an encoded frame
+ * is sent the moment it leaves the encoder instead of on the next tick.
+ *
+ * Mongoose is then polled with a zero timeout: it re-checks readiness
+ * itself (epoll), so this loop only decides when to wake up.
+ */
+static void server_poll(Server *server)
+{
+    struct pollfd fds[MAX_POLL_FDS];
+    RtcSession *owners[MAX_POLL_FDS];
+    nfds_t count = 0;
+    int timeout = IDLE_WAKE_MS;
+    int http_busy = 0;
+    size_t http_fds = 0;
+
+    for (struct mg_connection *c = server->mgr.conns; c != NULL; c = c->next) {
+        int fd = (int) (size_t) c->fd;
+
+        /* Closing, or draining with nothing left to send: mongoose frees
+         * it on its next poll, so do not sleep before that. */
+        if (c->is_closing || (c->is_draining && c->send.len == 0)) {
+            http_busy = 1;
+            continue;
+        }
+
+        if (fd < 0 || http_fds >= MAX_HTTP_POLL_FDS) {
+            http_busy = 1;          /* cannot watch it: keep polling */
+            continue;
+        }
+
+        fds[count].fd = fd;
+        fds[count].events = POLLIN;
+        fds[count].revents = 0;
+
+        if (!c->is_listening && (c->send.len > 0 || c->is_connecting)) {
+            fds[count].events |= POLLOUT;
+        }
+
+        owners[count] = NULL;
+        count++;
+        http_fds++;
+    }
 
     for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
         RtcSession *session = server->sessions[i];
 
-        if (session == NULL ||
-            rtc_session_state(session) == RTC_CLOSED) {
+        if (session == NULL || rtc_session_state(session) == RTC_CLOSED) {
             continue;
         }
 
-        has_sessions = 1;
-
-        int fd = rtc_session_fd(session);
-
-        if (fd >= 0 && fd_count < MAX_RTC_SESSIONS) {
-            fds[fd_count].fd = fd;
-            fds[fd_count].events = POLLIN;
-            fds[fd_count].revents = 0;
-            fd_count++;
+        if (timeout > SESSION_WAKE_MS) {
+            timeout = SESSION_WAKE_MS;  /* SR, keepalive and idle timers */
         }
 
         int dtls_timeout = rtc_session_dtls_timeout_ms(session);
 
         if (dtls_timeout >= 0 && dtls_timeout < timeout) {
-            timeout = dtls_timeout > 0 ? dtls_timeout : 0;
+            timeout = dtls_timeout;
+        }
+
+        int fd = rtc_session_fd(session);
+
+        if (fd >= 0) {
+            fds[count].fd = fd;
+            fds[count].events = POLLIN;
+            fds[count].revents = 0;
+            owners[count] = session;
+            count++;
         }
     }
 
-    if (!has_sessions) {
-        /* Idle: slower wakeups, but still responsive to HTTP. */
-        timeout = 100;
+    int mdns_socket = server->mdns != NULL ? mdns_fd(server->mdns) : -1;
+
+    if (mdns_socket >= 0) {
+        fds[count].fd = mdns_socket;
+        fds[count].events = POLLIN;
+        fds[count].revents = 0;
+        owners[count] = NULL;
+        count++;
     }
 
-    if (fd_count > 0) {
-        int ready = poll(fds, (nfds_t) fd_count, timeout);
+    int ring_fd = server->ring != NULL ? au_ring_fd(server->ring) : -1;
 
-        if (ready < 0 && errno != EINTR) {
-            log_warn("net", "poll failed: errno=%d (%s)", errno,
-                     strerror(errno));
-            return;
-        }
-    } else {
-        poll(NULL, 0, timeout);
+    if (ring_fd >= 0) {
+        fds[count].fd = ring_fd;
+        fds[count].events = POLLIN;
+        fds[count].revents = 0;
+        owners[count] = NULL;
+        count++;
+    } else if (server->ring != NULL && atomic_load(&server->media_active) &&
+               timeout > 5) {
+        timeout = 5;                /* no eventfd: poll the ring instead */
     }
 
-    for (int i = 0; i < fd_count; i++) {
-        if (!(fds[i].revents & POLLIN)) {
-            continue;
-        }
+    if (http_busy) {
+        timeout = 0;
+    }
 
-        for (size_t s = 0; s < MAX_RTC_SESSIONS; s++) {
-            RtcSession *session = server->sessions[s];
+    int ready = poll(fds, count, timeout);
 
-            if (session == NULL || rtc_session_fd(session) != fds[i].fd) {
-                continue;
-            }
+    if (ready < 0 && errno != EINTR) {
+        log_warn("net", "poll failed: %s", strerror(errno));
+        return;
+    }
 
-            uint8_t buffer[2048];
-            struct sockaddr_storage source;
-
-            /*
-             * Bounded drain: a viewer flooding its socket must not
-             * starve HTTP handling or the other sessions.
-             */
-            for (int n = 0; n < MAX_DATAGRAMS_PER_POLL; n++) {
-                socklen_t source_len = sizeof(source);
-
-                ssize_t received = recvfrom(fds[i].fd, buffer, sizeof(buffer),
-                                            0, (struct sockaddr *) &source,
-                                            &source_len);
-
-                if (received <= 0) {
-                    break;
-                }
-
-                rtc_session_on_udp(session, buffer, (size_t) received, &source);
-            }
+    for (nfds_t i = 0; ready > 0 && i < count; i++) {
+        if (owners[i] != NULL && (fds[i].revents & (POLLIN | POLLERR))) {
+            drain_session_socket(owners[i]);
         }
     }
 }
@@ -2009,6 +2699,17 @@ static void fan_out_access_units(Server *server)
     AuMeta meta;
 
     while (au_ring_pop(server->ring, au_buffer, sizeof(au_buffer), &meta)) {
+        /*
+         * An access unit was lost between encoder and sender (ring
+         * overrun). Every later P frame references the missing one, so
+         * the decoders need a fresh IDR; the sessions keep sending what
+         * they have meanwhile and the browser conceals until it arrives.
+         */
+        if (meta.discontinuity) {
+            server->au_discontinuities++;
+            atomic_store(&server->force_idr, 1);
+        }
+
         for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
             RtcSession *session = server->sessions[i];
 
@@ -2044,6 +2745,123 @@ static void reap_sessions(Server *server)
     atomic_store(&server->media_active, server->pipeline_running && active > 0);
 }
 
+/*
+ * Create the HTTP listener. Called before anything else is started so a
+ * busy port stops the process before the camera is opened (a second
+ * instance would otherwise fight the first one for the sensor).
+ */
+static int http_start(Server *server)
+{
+    char error[256] = "";
+
+    if (http_probe_bind(server->config.listen, server->config.http_port,
+                        error, sizeof(error)) != 0) {
+        log_error("http", "cannot listen on %s:%u: %s", server->config.listen,
+                  (unsigned) server->config.http_port, error);
+        return -1;
+    }
+
+    char url[128];
+
+    snprintf(url, sizeof(url), "http://%s:%u", server->config.listen,
+             server->config.http_port);
+
+    server->listener = mg_http_listen(&server->mgr, url, http_event_handler,
+                                      server);
+
+    if (server->listener == NULL) {
+        log_error("http", "cannot listen on %s (invalid listen address?)",
+                  url);
+        return -1;
+    }
+
+    /*
+     * Put the TLS filter in front of mongoose's HTTP parser. Accepted
+     * connections inherit the listener's protocol handler.
+     */
+    server->http_protocol = server->listener->pfn;
+    server->listener->pfn = tls_guard;
+
+    struct sockaddr_storage bound;
+    socklen_t bound_len = sizeof(bound);
+    int fd = (int) (size_t) server->listener->fd;
+
+    snprintf(server->http_bound, sizeof(server->http_bound), "%s:%u",
+             server->config.listen, (unsigned) server->config.http_port);
+
+    if (getsockname(fd, (struct sockaddr *) &bound, &bound_len) == 0 &&
+        bound.ss_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *) &bound;
+        char ip[INET_ADDRSTRLEN];
+
+        inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+        snprintf(server->http_bound, sizeof(server->http_bound), "%s:%u", ip,
+                 (unsigned) ntohs(in->sin_port));
+    }
+
+    log_info("http", "listening on %s (TCP, plain HTTP: use http://, not "
+                     "https://)", server->http_bound);
+
+    return 0;
+}
+
+static void log_access_urls(const Server *server)
+{
+    InterfaceInfo interfaces[MAX_INTERFACES];
+    size_t interface_count = collect_interfaces(interfaces, MAX_INTERFACES);
+    int wildcard = strcmp(server->config.listen, "0.0.0.0") == 0;
+
+    if (!wildcard) {
+        log_info("app", "  open http://%s:%u/", server->config.listen,
+                 server->config.http_port);
+        return;
+    }
+
+    log_info("app", "  open http://127.0.0.1:%u/   (this machine)",
+             server->config.http_port);
+
+    for (size_t i = 0; i < interface_count; i++) {
+        log_info("app", "  open http://%s:%u/   (%s)", interfaces[i].ip,
+                 server->config.http_port, interfaces[i].name);
+    }
+
+    if (interface_count == 0) {
+        log_warn("app", "no non-loopback IPv4 interface is up: other "
+                        "machines cannot reach this server yet");
+    }
+}
+
+static void mdns_start(Server *server)
+{
+    MdnsConfig mdns_config;
+
+    memset(&mdns_config, 0, sizeof(mdns_config));
+    snprintf(mdns_config.host, sizeof(mdns_config.host), "%s",
+             server->config.mdns_name);
+    snprintf(mdns_config.model, sizeof(mdns_config.model), "camstream %s",
+             APP_VERSION);
+    mdns_config.port = server->config.mdns_port;
+    mdns_config.http_port = server->config.http_port;
+
+    char mdns_error[192] = "";
+
+    server->mdns = mdns_responder_create(&mdns_config, mdns_error,
+                                         sizeof(mdns_error));
+
+    if (server->mdns != NULL) {
+        log_info("app", "  open http://%s.local:%u/   (mDNS)",
+                 server->config.mdns_name, server->config.http_port);
+    } else {
+        /*
+         * Not fatal: the web UI, signaling and the media path do not
+         * depend on name resolution. The operator still has the
+         * addresses printed above.
+         */
+        log_warn("mdns", "responder unavailable: %s; use an address from "
+                         "the list above", mdns_error);
+    }
+}
+
 int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
 {
     Server *server = calloc(1, sizeof(*server));
@@ -2061,9 +2879,25 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
     atomic_init(&server->force_idr, 0);
     atomic_init(&server->media_active, 0);
 
+    /* No hexdumps of foreign traffic, whatever mongoose's log level. */
+    mg_log_set_fn(mongoose_log_discard, NULL);
+    mg_mgr_init(&server->mgr);
+
+    if (http_start(server) != 0) {
+        mg_mgr_free(&server->mgr);
+        free(server);
+        return 1;
+    }
+
     server->dtls_ready = dtls_srtp_global_init() == 0;
 
-    if (!server->dtls_ready) {
+    if (server->dtls_ready) {
+        log_info("webrtc", "DTLS ready (ECDSA P-256, SRTP "
+                           "AES128_CM_SHA1_80), ICE-lite, media on UDP %u-%u "
+                           "(one port per viewer)",
+                 server->config.udp_base_port,
+                 server->config.udp_base_port + MAX_RTC_SESSIONS - 1);
+    } else {
         log_error("webrtc", "DTLS initialisation failed; the HTTP interface "
                             "stays up, WebRTC signaling will return 503 until "
                             "POST /api/webrtc/restart succeeds");
@@ -2072,106 +2906,44 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
     /*
      * The media pipeline starts regardless of WebRTC state: the camera,
      * encoder and diagnostics must stay visible even when WebRTC is
-     * broken, and the encoder only runs while a viewer is connected.
+     * broken, and the encoder only runs while a viewer is connected. A
+     * failure is not fatal either: HTTP stays up to report it, and the
+     * supervisor retries with a backoff.
      */
     char error[256] = "";
 
     if (media_pipeline_start(server, error, sizeof(error)) != 0) {
+        snprintf(server->pipeline_error, sizeof(server->pipeline_error), "%s",
+                 error);
+        server->pipeline_failures = 1;
         log_error("media", "continuing without media: %s", error);
+        pipeline_schedule_retry(server, now_ms());
     }
-
-    mg_mgr_init(&server->mgr);
-
-    char url[128];
-
-    snprintf(url, sizeof(url), "http://%s:%u", server->config.listen,
-             server->config.http_port);
-
-    server->listener = mg_http_listen(&server->mgr, url, http_event_handler,
-                                      server);
-
-    if (server->listener == NULL) {
-        log_error("http", "cannot listen on %s", url);
-        media_pipeline_stop(server);
-        mg_mgr_free(&server->mgr);
-        dtls_srtp_global_shutdown();
-        free(server);
-        return 1;
-    }
-
-    InterfaceInfo interfaces[MAX_INTERFACES];
-    size_t interface_count = collect_interfaces(interfaces, MAX_INTERFACES);
 
     log_info("app", "camstream %s ready", APP_VERSION);
-    log_info("app", "web UI and signaling on http://%s:%u/",
-             server->config.listen, server->config.http_port);
+    log_access_urls(server);
 
-    if (interface_count == 0) {
-        log_info("app", "no non-loopback interface found; use "
-                        "http://localhost:%u/", server->config.http_port);
+    if (server->config.mdns) {
+        mdns_start(server);
     }
 
-    for (size_t i = 0; i < interface_count; i++) {
-        log_info("app", "  open http://%s:%u/   (%s)", interfaces[i].ip,
-                 server->config.http_port, interfaces[i].name);
-    }
-
-    log_info("app", "media: UDP %u-%u, one port per viewer",
-             server->config.udp_base_port,
-             server->config.udp_base_port + MAX_RTC_SESSIONS - 1);
-    log_info("app", "firewall: allow TCP %u and UDP %u-%u",
+    log_info("app", "firewall: allow TCP %u and UDP %u-%u from the LAN",
              server->config.http_port, server->config.udp_base_port,
              server->config.udp_base_port + MAX_RTC_SESSIONS - 1);
 
-    if (server->config.mdns) {
-        MdnsConfig mdns_config;
-
-        memset(&mdns_config, 0, sizeof(mdns_config));
-        snprintf(mdns_config.host, sizeof(mdns_config.host), "%s",
-                 server->config.mdns_name);
-        snprintf(mdns_config.model, sizeof(mdns_config.model), "camstream %s",
-                 APP_VERSION);
-        mdns_config.port = server->config.mdns_port;
-        mdns_config.http_port = server->config.http_port;
-
-        char mdns_error[192] = "";
-
-        server->mdns = mdns_responder_create(&mdns_config, mdns_error,
-                                             sizeof(mdns_error));
-
-        if (server->mdns != NULL) {
-            log_info("app", "mDNS: http://%s.local:%u/ (no address needed on "
-                            "the same LAN)",
-                     server->config.mdns_name, server->config.http_port);
-        } else {
-            /*
-             * Not fatal: the web UI, signaling and the media path do not
-             * depend on name resolution. The operator still has the
-             * addresses printed above.
-             */
-            log_warn("mdns", "responder unavailable: %s; use an address from "
-                             "the list above", mdns_error);
-        }
-    }
-
     while (!*stop_flag) {
-        poll_sessions(server);
+        server_poll(server);
 
         /*
-         * HTTP last: a session created here already sees the datagram
-         * poll below on the next iteration, and the clock is re-read
-         * afterwards so a fresh session is not fed a stale timestamp
-         * (which used to trip the idle timeout immediately).
+         * HTTP after the UDP sockets: a session created here already
+         * sees the datagram poll on the next iteration, and the clock is
+         * re-read afterwards so a fresh session is not fed a stale
+         * timestamp (which used to trip the idle timeout immediately).
          */
         mg_mgr_poll(&server->mgr, 0);
 
         uint64_t now = now_ms();
 
-        /*
-         * mDNS is served from this loop as well: the responder needs a
-         * wakeup for probes, announcements and pending replies, and the
-         * loop already runs at least every 100 ms while idle.
-         */
         if (server->mdns != NULL) {
             mdns_readable(server->mdns, now);
             mdns_service(server->mdns, now);
@@ -2188,6 +2960,7 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
         }
 
         reap_sessions(server);
+        media_supervise(server, now);
         sample_rates(server, now);
     }
 
@@ -2208,6 +2981,8 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
     }
 
     free(server);
+
+    log_info("app", "stopped cleanly");
 
     return 0;
 }

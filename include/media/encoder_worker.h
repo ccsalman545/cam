@@ -2,8 +2,9 @@
  * encoder_worker.h
  *
  * Encode thread: consumes raw frames from the hub, converts
- * them to I420 and pushes H.264 access units into the ring
- * that the network thread drains.
+ * them to I420 when needed (packed I420 is encoded in place)
+ * and pushes H.264 access units into the ring that the network
+ * thread drains.
  *
  * The worker is CPU adaptive: when no WebRTC session is
  * active it drops frames immediately and skips conversion and
@@ -65,10 +66,19 @@ typedef struct {
     uint64_t skipped_mismatch;  /* dropped: width/height not as expected */
     uint64_t skipped_bad_size;  /* dropped: empty frame (size 0) */
     uint64_t no_output;         /* encode call returned nothing */
+    uint64_t keyframes;         /* of frames_encoded, IDR */
+    uint64_t params_prepended;  /* IDRs completed with cached SPS/PPS */
 } EncoderWorkerStats;
 
 void encoder_worker_get_stats(const EncoderWorker *worker,
                               EncoderWorkerStats *out);
+
+/*
+ * 1 once the encoder failed for good (fatal error, or no output for
+ * 10 s while frames were supplied). The worker thread has then exited;
+ * the owner rebuilds the pipeline.
+ */
+int encoder_worker_failed(const EncoderWorker *worker);
 
 void encoder_worker_destroy(EncoderWorker *worker);
 

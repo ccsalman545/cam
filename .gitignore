@@ -16,3 +16,4 @@ camera_sender
 *~
 .DS_Store
 build-asan/
+web_server

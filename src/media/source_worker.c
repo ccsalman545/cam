@@ -82,17 +82,23 @@ static void *source_worker_thread(void *arg)
             atomic_fetch_add(&worker->errors, 1);
             consecutive_errors++;
 
-            if (consecutive_errors == 1) {
-                log_error("capture", "%s: capture failed (fatal error from "
-                                     "the source; see the driver message "
+            if (worker->source->ended) {
+                atomic_store(&worker->failed, 1);
+                log_error("capture", "%s: source ended (see the message "
                                      "above)", worker->source->name);
+                break;
+            }
+
+            if (consecutive_errors == 1) {
+                log_warn("capture", "%s: capture error, retrying (see the "
+                                    "driver message above)",
+                         worker->source->name);
             }
 
             if (consecutive_errors >= SOURCE_FATAL_ERRORS) {
                 atomic_store(&worker->failed, 1);
                 log_error("capture", "%s: %u consecutive capture errors, "
-                                     "worker stopped. Restart the camera with "
-                                     "POST /api/camera/restart",
+                                     "worker stopped",
                           worker->source->name, consecutive_errors);
                 break;
             }

@@ -20,7 +20,6 @@ struct RtpH264 {
     uint64_t base_pts_us;
     int have_base;
 
-    uint32_t last_timestamp;
 
     uint32_t packets;
     uint32_t octets;        /* RTP payload bytes, for the sender report */
@@ -123,6 +122,15 @@ static int next_nal(const uint8_t *data,
         end = length;
     }
 
+    /*
+     * A NAL unit never ends in a zero byte (rbsp_trailing_bits), so any
+     * zeros before the next start code are trailing_zero_8bits padding
+     * or the leading zero of a 4 byte code; they are not sent.
+     */
+    while (end > body && data[end - 1] == 0) {
+        end--;
+    }
+
     *nal_offset = body;
     *nal_length = end > body ? end - body : 0;
 
@@ -153,7 +161,6 @@ int rtp_h264_packetize(RtpH264 *p,
     uint64_t delta_us = pts_us >= p->base_pts_us ? pts_us - p->base_pts_us : 0;
     uint32_t rtp_ts = (uint32_t) ((delta_us * 90000ULL) / 1000000ULL);
 
-    p->last_timestamp = rtp_ts;
 
     uint8_t packet[RTP_MAX_PACKET];
     const size_t payload_budget = RTP_MAX_PACKET - RTP_HEADER_SIZE;
@@ -268,7 +275,15 @@ uint32_t rtp_h264_ssrc(const RtpH264 *packetizer)
     return packetizer != NULL ? packetizer->ssrc : 0;
 }
 
-uint32_t rtp_h264_last_timestamp(const RtpH264 *packetizer)
+uint32_t rtp_h264_timestamp_at(const RtpH264 *packetizer, uint64_t clock_us)
 {
-    return packetizer != NULL ? packetizer->last_timestamp : 0;
+    if (packetizer == NULL || !packetizer->have_base) {
+        return 0;
+    }
+
+    /* Same mapping as rtp_h264_packetize(), evaluated at another instant. */
+    uint64_t delta_us = clock_us >= packetizer->base_pts_us
+                            ? clock_us - packetizer->base_pts_us : 0;
+
+    return (uint32_t) ((delta_us * 90000ULL) / 1000000ULL);
 }
