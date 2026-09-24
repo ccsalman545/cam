@@ -79,6 +79,7 @@ void h264_au_scan(const uint8_t *data, size_t length, H264AuInfo *info)
             info->has_pps = 1;
         } else if (type >= H264_NAL_SLICE && type <= H264_NAL_IDR) {
             info->has_slice = 1;
+            info->slice_count++;
             if (type == H264_NAL_IDR) {
                 info->has_idr = 1;
             }

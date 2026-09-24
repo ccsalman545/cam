@@ -1,14 +1,20 @@
 #
 # camstream
 #
-# Builds the single binary build/camstream and the standalone tests.
+# Builds build/camstream (native WebRTC stack) and, on request,
+# build/camstream-libpeer (same camera pipeline, libpeer as the WebRTC
+# stack), plus the standalone tests.
 #
 # Targets
-#   make                 build/camstream
-#   make test            build and run the unit tests
-#   make install         install camstream, the sample config and the unit file
-#   make clean           remove build/
-#   make help            this list
+#   make                   build/camstream
+#   make test              build and run the unit tests
+#   make install           install camstream, the sample config and the unit file
+#   make camstream-libpeer build/camstream-libpeer (needs the libpeer submodule
+#                          and cmake; no OpenSSL or libsrtp2 required)
+#   make test-libpeer      build and run the libpeer tests
+#   make install-libpeer   install camstream-libpeer and its unit file
+#   make clean             remove build/
+#   make help              this list
 #
 # Dependency locations
 #   DEPS_PREFIX=/opt/cam   prefix holding OpenSSL, libsrtp2 and libx264
@@ -96,8 +102,13 @@ endif
 # something. `make clean` and `make help` must work on a machine that has
 # no OpenSSL at all, so the checks are skipped for those two. Switching to
 # a build goal then reports the same messages as before.
+#
+# camstream-libpeer brings its own DTLS and SRTP (mbedtls and libsrtp from
+# the libpeer submodule), so its goals do not need OpenSSL or libsrtp2.
 SAFE_GOALS := clean help
-BUILD_GOALS := $(filter-out $(SAFE_GOALS),$(or $(MAKECMDGOALS),all))
+LIBPEER_GOALS := camstream-libpeer libpeer test-libpeer install-libpeer
+BUILD_GOALS := $(filter-out $(SAFE_GOALS) $(LIBPEER_GOALS),\
+                 $(or $(MAKECMDGOALS),all))
 
 ifneq ($(BUILD_GOALS),)
 ifeq ($(OPENSSL_INCLUDE),)
@@ -147,7 +158,9 @@ APP_INCLUDE_DIRS := include include/app include/media include/net include/webrtc
 APP_INCLUDES     := $(addprefix -I,$(APP_INCLUDE_DIRS)) \
                     -isystem third_party/mongoose $(DEP_CFLAGS)
 
-SOURCES := $(wildcard src/*.c src/*/*.c) third_party/mongoose/mongoose.c
+# src/lpstream belongs to camstream-libpeer only (see below).
+SOURCES := $(filter-out src/lpstream/%,$(wildcard src/*.c src/*/*.c)) \
+           third_party/mongoose/mongoose.c
 OBJECTS := $(patsubst %.c,$(BUILD)/obj/%.o,$(SOURCES))
 
 COMMON_CFLAGS := $(CSTD) $(WARN) $(OPT) $(CFLAGS) $(APP_INCLUDES) \
@@ -173,7 +186,8 @@ EMBED_TOOL := $(BUILD)/embed_assets
 
 # Rules ---------------------------------------------------------------------
 
-.PHONY: all test install clean help
+.PHONY: all test install clean help camstream-libpeer libpeer test-libpeer \
+        install-libpeer
 
 all: $(BINARY)
 
@@ -210,6 +224,104 @@ $(EMBED_TOOL): tools/embed_assets.c
 $(WEB_ASSETS): $(WEB_PAGE) $(EMBED_TOOL)
 	@mkdir -p $(dir $@)
 	$(EMBED_TOOL) $@ CAMSTREAM_WEB_ASSETS_H web_index_html $(WEB_PAGE)
+
+# camstream-libpeer -----------------------------------------------------------
+#
+# libpeer (github.com/sepfy/libpeer, pinned as the git submodule
+# third_party/libpeer) is built by its own CMake project, which also builds
+# its bundled mbedtls, libsrtp, usrsctp and cJSON as static libraries into
+# $(LIBPEER_BUILD)/dist. Only the `peer` target is built, not the examples.
+#
+# libpeer compile-time settings (src/config.h defaults otherwise):
+#   CONFIG_DTLS_USE_ECDSA=1         P-256 certificate: generated in
+#                                   milliseconds per viewer on a Pi, where
+#                                   the default RSA key takes much longer
+#   CONFIG_STUN_KEEPALIVE_INTERVAL  consent checks every 2 s; a viewer that
+#   CONFIG_STUN_KEEPALIVE_TIMEOUT   stops answering for 10 s is closed (the
+#                                   default 0 never notices a closed tab)
+#   LOG_LEVEL=LEVEL_WARN            libpeer prints straight to stdout, with
+#                                   source paths; keep only its warnings
+#
+# Its mbedtls version generates sources at build time and needs cmake and
+# the Python modules jsonschema and jinja2 (Pi OS: sudo apt install cmake
+# python3-jsonschema python3-jinja2). LIBPEER_CMAKE_ARGS passes extra CMake
+# options, for example -DCMAKE_TOOLCHAIN_FILE=... when cross compiling.
+# CMAKE_POLICY_VERSION_MINIMUM lets CMake 4 configure the bundled projects
+# that still declare CMake 2.x compatibility; CMake 3 ignores it.
+
+CMAKE ?= cmake
+LIBPEER_SRC   := third_party/libpeer
+LIBPEER_BUILD := $(BUILD)/libpeer
+LIBPEER_DIST  := $(LIBPEER_BUILD)/dist/lib
+LIBPEER_LIB   := $(LIBPEER_BUILD)/src/libpeer.a
+LIBPEER_DEFINES := -DCONFIG_DTLS_USE_ECDSA=1 \
+                   -DCONFIG_STUN_KEEPALIVE_INTERVAL=2000 \
+                   -DCONFIG_STUN_KEEPALIVE_TIMEOUT=10000 \
+                   -DLOG_LEVEL=LEVEL_WARN
+LIBPEER_CMAKE_ARGS ?=
+LIBPEER_STAMP := $(LIBPEER_BUILD)/.configured
+# Link order: users before the libraries they use.
+LIBPEER_LIBS := $(LIBPEER_LIB) $(LIBPEER_DIST)/libsrtp2.a \
+                $(LIBPEER_DIST)/libusrsctp.a $(LIBPEER_DIST)/libmbedtls.a \
+                $(LIBPEER_DIST)/libmbedx509.a $(LIBPEER_DIST)/libmbedcrypto.a \
+                $(LIBPEER_DIST)/libtfpsacrypto.a $(LIBPEER_DIST)/libcjson.a
+
+LP_BINARY := $(BUILD)/camstream-libpeer
+LP_WEB_PAGE := web/libpeer.html
+LP_WEB_ASSETS := $(BUILD)/generated/lp_web_assets.h
+# The camera pipeline, config, log, mDNS and HTTP code are shared with
+# camstream; the native WebRTC stack (src/webrtc) and its server are not.
+LP_SHARED_SOURCES := src/app/app_config.c src/app/log.c src/net/mdns.c \
+                     $(wildcard src/media/*.c) third_party/mongoose/mongoose.c
+LP_SOURCES := $(wildcard src/lpstream/*.c)
+LP_OBJECTS := $(patsubst %.c,$(BUILD)/obj/%.o,$(LP_SHARED_SOURCES) $(LP_SOURCES))
+LP_CFLAGS := $(COMMON_CFLAGS) -Iinclude/lpstream -isystem $(LIBPEER_SRC)/include
+LP_LDFLAGS := $(if $(filter 1,$(HAVE_X264)),-L$(X264_LIBDIR) \
+                $(if $(filter-out $(SYSTEM_LIBDIRS),$(X264_LIBDIR)),\
+                  -Wl$(comma)-rpath$(comma)$(X264_LIBDIR)))
+LP_LIBS := $(LIBPEER_LIBS) $(if $(filter 1,$(HAVE_X264)),-lx264) -lpthread -lm
+
+camstream-libpeer: $(LP_BINARY)
+
+$(LP_BINARY): $(LP_OBJECTS) $(LIBPEER_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(OPT) $(LP_OBJECTS) -o $@ $(LDFLAGS) $(LP_LDFLAGS) $(LP_LIBS)
+	@echo "built $(LP_BINARY) (libpeer $$(git -C $(LIBPEER_SRC) rev-parse --short HEAD 2>/dev/null), libx264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
+
+$(BUILD)/obj/src/lpstream/%.o: src/lpstream/%.c $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(LP_CFLAGS) -c $< -o $@
+
+$(BUILD)/obj/src/lpstream/lp_server.o: $(LP_WEB_ASSETS)
+
+$(LP_WEB_ASSETS): $(LP_WEB_PAGE) $(EMBED_TOOL)
+	@mkdir -p $(dir $@)
+	$(EMBED_TOOL) $@ CAMSTREAM_LP_WEB_ASSETS_H web_libpeer_html $(LP_WEB_PAGE)
+
+# Configure once per setting; `cmake --build` itself is incremental and runs
+# every time so an updated submodule is rebuilt.
+$(LIBPEER_STAMP): Makefile
+	@test -f $(LIBPEER_SRC)/CMakeLists.txt -a \
+	        -f $(LIBPEER_SRC)/third_party/mbedtls/CMakeLists.txt || { \
+	    echo "libpeer submodule missing: run" \
+	         "'git submodule update --init --recursive'"; exit 1; }
+	@command -v $(CMAKE) >/dev/null || { \
+	    echo "cmake not found (Pi OS: sudo apt install cmake" \
+	         "python3-jsonschema python3-jinja2)"; exit 1; }
+	CC="$(CC)" CMAKE_POLICY_VERSION_MINIMUM=3.5 $(CMAKE) -S $(LIBPEER_SRC) \
+	    -B $(LIBPEER_BUILD) -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+	    -DCMAKE_C_FLAGS="$(LIBPEER_DEFINES)" $(LIBPEER_CMAKE_ARGS)
+	@touch $@
+
+# '+' hands make's jobserver to the generated Makefiles, so `make -j4` shares
+# its four slots; a serial `make` still builds libpeer on every core.
+libpeer: $(LIBPEER_STAMP)
+	+CC="$(CC)" CMAKE_POLICY_VERSION_MINIMUM=3.5 $(CMAKE) --build $(LIBPEER_BUILD) \
+	    --target peer $(if $(findstring -j,$(MAKEFLAGS)),,-j $$(nproc 2>/dev/null || echo 2)) \
+	    -- --no-print-directory
+
+$(LIBPEER_LIB): libpeer
+	@test -f $@
 
 # Tests ---------------------------------------------------------------------
 #
@@ -289,9 +401,17 @@ $(TEST_BUILD)/test_lan_stream: tests/test_lan_stream.c $(BINARY) $(FLAG_STAMP)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) $(DEP_CFLAGS) \
 	      tests/test_lan_stream.c -o $@ $(DEP_LDFLAGS) -lsrtp2 -lssl -lcrypto -lpthread
 
+# Pure parsing code of camstream-libpeer: no libpeer needed to test it.
+$(TEST_BUILD)/test_lp_sdp: tests/test_lp_sdp.c src/lpstream/lp_sdp.c \
+        include/lpstream/lp_sdp.h $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude/lpstream \
+	      tests/test_lp_sdp.c src/lpstream/lp_sdp.c -o $@
+
 TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
                  $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_mdns \
                  $(TEST_BUILD)/test_rtc_session $(TEST_BUILD)/test_sdp_rtcp \
+                 $(TEST_BUILD)/test_lp_sdp \
                  $(TEST_BUILD)/test_server_api $(TEST_BUILD)/test_lan_stream
 
 # argv[1] is the server binary for the black box tests; argv[2] is the
@@ -303,6 +423,43 @@ test: $(TEST_BINARIES) $(BINARY)
 	    $$test_binary $(BINARY) config/camstream.conf || exit 1; \
 	done
 	@echo "all tests passed"
+
+# End to end: libpeer as the browser against a running camstream-libpeer
+# (HTTP signaling, ICE, DTLS, SRTP, H.264 depacketization).
+#
+# The receiving side is libpeer compiled a second time with a larger
+# CONFIG_MTU (tests/libpeer_rx_config.h). Stock libpeer receives into a CONFIG_MTU (1300) byte buffer
+# while its sender emits CONFIG_MTU byte RTP packets plus a 10 byte SRTP
+# tag, so a libpeer receiver truncates every full-size packet (and then
+# depacketizes the undecryptable bytes anyway). Browsers are unaffected;
+# only this test client needs the room. The sender under test, in
+# camstream-libpeer, is the unmodified build above.
+LIBPEER_RX_SOURCES := $(wildcard $(LIBPEER_SRC)/src/*.c)
+LIBPEER_RX_OBJECTS := $(patsubst $(LIBPEER_SRC)/src/%.c,$(TEST_BUILD)/libpeer_rx/%.o,\
+                        $(LIBPEER_RX_SOURCES))
+
+$(TEST_BUILD)/libpeer_rx/%.o: $(LIBPEER_SRC)/src/%.c tests/libpeer_rx_config.h \
+        $(LIBPEER_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(OPT) -w -include tests/libpeer_rx_config.h -DDISABLE_PEER_SIGNALING \
+	      -DCONFIG_DTLS_USE_ECDSA=1 -DLOG_LEVEL=LEVEL_WARN \
+	      -I$(LIBPEER_SRC)/src -I$(LIBPEER_BUILD)/dist/include \
+	      -I$(LIBPEER_BUILD)/dist/include/cjson -c $< -o $@
+
+$(TEST_BUILD)/test_libpeer_stream: tests/test_libpeer_stream.c \
+        $(LIBPEER_RX_OBJECTS) $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -isystem $(LIBPEER_SRC)/include \
+	      -DDISABLE_PEER_SIGNALING tests/test_libpeer_stream.c \
+	      $(LIBPEER_RX_OBJECTS) -o $@ $(filter-out $(LIBPEER_LIB),$(LIBPEER_LIBS)) \
+	      -lpthread -lm
+
+test-libpeer: $(TEST_BUILD)/test_lp_sdp $(TEST_BUILD)/test_libpeer_stream \
+        $(LP_BINARY)
+	@echo "== $(TEST_BUILD)/test_lp_sdp"; $(TEST_BUILD)/test_lp_sdp
+	@echo "== $(TEST_BUILD)/test_libpeer_stream"; \
+	    $(TEST_BUILD)/test_libpeer_stream $(LP_BINARY)
+	@echo "libpeer tests passed"
 
 # Install -------------------------------------------------------------------
 
@@ -323,6 +480,18 @@ install: $(BINARY)
 	@echo "installed binary matches the build if these two checksums are equal:"
 	@sha256sum $(BINARY) $(DESTDIR)$(BINDIR)/camstream
 
+install-libpeer: $(LP_BINARY)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(LP_BINARY) $(DESTDIR)$(BINDIR)/camstream-libpeer
+	install -d $(DESTDIR)$(SYSCONFDIR)
+	@if [ ! -e $(DESTDIR)$(SYSCONFDIR)/camstream.conf ]; then \
+	    install -m 0644 config/camstream.conf $(DESTDIR)$(SYSCONFDIR)/camstream.conf; \
+	fi
+	install -d $(DESTDIR)$(UNITDIR)
+	install -m 0644 packaging/camstream-libpeer.service \
+	        $(DESTDIR)$(UNITDIR)/camstream-libpeer.service
+	@sha256sum $(LP_BINARY) $(DESTDIR)$(BINDIR)/camstream-libpeer
+
 clean:
 	rm -rf $(BUILD)
 
@@ -331,6 +500,9 @@ help:
 	@echo "  make             build build/camstream"
 	@echo "  make test        build and run the unit tests"
 	@echo "  make install     install camstream and its support files"
+	@echo "  make camstream-libpeer  build build/camstream-libpeer (libpeer WebRTC)"
+	@echo "  make test-libpeer  build and run the libpeer tests"
+	@echo "  make install-libpeer  install camstream-libpeer and its unit file"
 	@echo "  make clean       remove build/"
 	@echo ""
 	@echo "variables:"
@@ -340,6 +512,8 @@ help:
 	@echo "  PREFIX=/usr/local  install prefix"
 	@echo "  DESTDIR=/tmp/root  staging directory for packaging"
 	@echo "  OPT='-O0 -g'       override optimisation flags"
+	@echo "  CMAKE=cmake        CMake used for libpeer"
+	@echo "  LIBPEER_CMAKE_ARGS extra CMake options for libpeer (toolchain file)"
 	@echo ""
 # Detection is printed whether or not a dependency was found, because the
 # usual reason to run `make help` on a fresh machine is a missing one.

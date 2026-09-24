@@ -47,7 +47,7 @@ void m2m_backend_close(void *backend);
 #if HAVE_X264
 void *x264_backend_open(uint32_t width, uint32_t height,
                         uint32_t fps, uint32_t bitrate_kbps,
-                        uint32_t gop_seconds,
+                        uint32_t gop_seconds, int single_slice,
                         char *name_out, size_t name_out_size);
 int x264_backend_encode(void *backend,
                         const uint8_t *y, const uint8_t *u, const uint8_t *v,
@@ -113,6 +113,23 @@ H264Encoder *h264_encoder_open(const char *preference,
                                char *name_out,
                                size_t name_out_size)
 {
+    return h264_encoder_open_flags(preference, width, height, fps,
+                                   bitrate_kbps, gop_seconds, 0, name_out,
+                                   name_out_size);
+}
+
+H264Encoder *h264_encoder_open_flags(const char *preference,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t fps,
+                                     uint32_t bitrate_kbps,
+                                     uint32_t gop_seconds,
+                                     unsigned flags,
+                                     char *name_out,
+                                     size_t name_out_size)
+{
+    (void) flags;   /* only libx264 has options; unused without it */
+
     if (preference == NULL) {
         preference = "auto";
     }
@@ -215,6 +232,8 @@ H264Encoder *h264_encoder_open(const char *preference,
     if (want_sw) {
         void *backend = x264_backend_open(width, height, fps,
                                           bitrate_kbps, gop_seconds,
+                                          (flags & H264_ENCODER_SINGLE_SLICE)
+                                              != 0,
                                           selected, sizeof(selected));
 
         if (backend != NULL) {

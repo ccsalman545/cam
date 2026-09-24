@@ -27,6 +27,7 @@ typedef struct {
     int has_pps;
     int has_idr;
     int has_slice;      /* any VCL NAL unit (types 1..5) */
+    int slice_count;    /* VCL NAL units, i.e. slices of the picture */
 } H264AuInfo;
 
 /* Summarize the NAL unit types of an Annex-B buffer. */

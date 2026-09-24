@@ -9,8 +9,7 @@ build step, nothing to install on the viewer side beyond a browser.
 The problem it solves: a browser cannot consume a raw V4L2 camera. Some piece
 of software has to capture, encode, negotiate a peer connection, and keep the
 connection alive when the viewer closes a tab or walks out of Wi-Fi range.
-`camstream` is that piece. The project is about 16,000 lines of C across 46
-files, plus the vendored HTTP server.
+`camstream` is that piece. The project is about 18,000 lines of C across 50 files (plus libpeer), plus the vendored HTTP server.
 
 ## Contents
 
@@ -33,15 +32,18 @@ files, plus the vendored HTTP server.
 - [Security model](#security-model)
 - [Project structure](#project-structure)
 - [Testing](#testing)
+- [WebRTC via libpeer (camstream-libpeer)](#webrtc-via-libpeer-camstream-libpeer)
 - [Deployment](#deployment)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
 
 ## Architecture
 
-Two paths share one binary and one process.
+Two binaries share the same camera pipeline. `build/camstream` uses the
+in-house WebRTC stack; `build/camstream-libpeer` uses
+[sepfy/libpeer](https://github.com/sepfy/libpeer) (pinned as a submodule).
 
-The media path runs in its own threads and never touches the network:
+In both, the media path runs in its own threads and never touches the network:
 
     camera (V4L2, CSI via rpicam-vid, stdin, or a synthetic pattern)
       -> frame pool (fixed count, refcounted, no allocation in the loop)
@@ -77,12 +79,12 @@ removes every lock between packetization, retransmission, and the RTCP state
 that decides what to retransmit. The encoder is the only heavy consumer, and
 it only runs while at least one viewer holds a session.
 
-Removed along the way, with the audit that justified it: a second WebRTC
-backend built on sepfy/libpeer (unused, different code paths for the same
-protocols), a Janus RTP transport (requires an external gateway, which this
-project explicitly does not need), and a vision/mosaic experiment (no role in
-streaming, pulled in its own dependencies). See `git log` for the removal
-commits; the interfaces they used are gone, not the functionality.
+Removed along the way: a Janus RTP transport (requires an external
+gateway, which this project explicitly does not need) and a vision/mosaic
+experiment (no role in streaming, pulled in its own dependencies). See
+`git log` for the removal commits; the interfaces they used are gone, not the
+functionality. The libpeer stack now lives in its own binary
+`camstream-libpeer` so the two implementations can be compared side by side.
 
 ## Data flow
 
@@ -340,12 +342,17 @@ Runtime and build dependencies:
 
 | Dependency | Needed for | Debian/Ubuntu package |
 | --- | --- | --- |
-| OpenSSL 1.1.1 or 3.x | DTLS, SHA-256 certificate, randomness | `libssl-dev` |
-| libsrtp2 | SRTP keying and protection | `libsrtp2-dev` |
-| libx264 (optional) | Software encoder | `libx264-dev` |
+| OpenSSL 1.1.1 or 3.x | DTLS for `camstream` | `libssl-dev` |
+| libsrtp2 | SRTP for `camstream` | `libsrtp2-dev` |
+| libx264 (optional) | Software encoder (both binaries) | `libx264-dev` |
+| cmake, python3-jsonschema, python3-jinja2 | Build libpeer (mbedtls) | `cmake`, `python3-jsonschema`, `python3-jinja2` |
 | pthreads, libm | Threads and math | libc |
 | Linux kernel headers | V4L2 ioctl definitions | `linux-libc-dev` |
 | `rpicam-vid` (optional) | CSI camera | `rpicam-apps` |
+
+`camstream-libpeer` does not need OpenSSL or libsrtp2: libpeer vendors
+mbedtls and libsrtp2 inside its submodule, so `make camstream-libpeer` works
+even when those system packages are missing.
 
 On a Raspberry Pi OS or Debian machine:
 
@@ -388,10 +395,17 @@ Targets:
 | Target | Effect |
 | --- | --- |
 | `make` | Build `build/camstream` |
-| `make test` | Build and run all test binaries |
-| `make install` | Install binary, sample config and systemd unit |
+| `make camstream-libpeer` | Build `build/camstream-libpeer` (needs the libpeer submodule and cmake) |
+| `make test` | Build and run the native stack tests |
+| `make test-libpeer` | Build and run the libpeer tests (SDP sanitizer + full ICE/DTLS/SRTP/H.264 flow) |
+| `make install` | Install `camstream`, sample config and systemd unit |
+| `make install-libpeer` | Install `camstream-libpeer` and its systemd unit |
 | `make clean` | Remove `build/` |
 | `make help` | List targets |
+
+`camstream-libpeer` reuses the same capture and encoder code as `camstream`
+(V4L2, `rpicam-vid` pipe with 64-byte stride handling, libx264 superfast
+zerolatency and V4L2 M2M) and only replaces the WebRTC stack with libpeer.
 
 `make install` honours `PREFIX` (default `/usr/local`), `SYSCONFDIR`
 (default `/etc`), `UNITDIR` (default `/lib/systemd/system`) and `DESTDIR` for
@@ -427,8 +441,32 @@ stderr behind the logger.
 ./build/camstream --config /etc/camstream.conf
 ```
 
-Stop the service first if it is installed (`sudo systemctl stop camstream`),
-otherwise the second instance reports that TCP 8080 is already in use.
+The libpeer variant takes the same options (the UDP range is unused:
+libpeer binds an ephemeral port per viewer):
+
+```sh
+./build/camstream-libpeer --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
+./build/camstream-libpeer --test -W 640 -H 480 -F 30
+```
+
+It is built with:
+
+```sh
+git submodule update --init --recursive   # first time only, fetches libpeer and its deps
+sudo apt install -y cmake python3-jsonschema python3-jinja2   # Pi OS: mbedtls code generation
+make camstream-libpeer -j4
+```
+
+Cross compiling for a Pi 4 (aarch64) from an x86_64 host works with Zig as the
+C toolchain (`pip install ziglang` gives `zig cc`):
+
+```sh
+make camstream-libpeer CMAKE=cmake LIBPEER_CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=cmake/zig-aarch64.cmake" CC="zig cc -target aarch64-linux-gnu"
+```
+
+Stop the service first if it is installed (`sudo systemctl stop camstream`
+and `sudo systemctl stop camstream-libpeer`), otherwise the second instance
+reports that TCP 8080 is already in use.
 
 Then open `http://camstream.local:8080/` (or `http://<pi-address>:8080/`) in a
 browser on the same LAN. Type the `http://` explicitly: the server speaks
@@ -823,10 +861,13 @@ just stolen video, it is strangers driving the restart endpoints.
 ## Project structure
 
 ```
-Makefile                  single binary, tests, install
+Makefile                  two binaries (native + libpeer), tests, install
 config/camstream.conf     commented sample configuration
-packaging/camstream.service  systemd unit
-web/index.html            the whole web interface, embedded at build time
+packaging/camstream.service          systemd unit for camstream
+packaging/camstream-libpeer.service  systemd unit for camstream-libpeer
+web/index.html            native stack web interface, embedded at build time
+web/libpeer.html          libpeer stack web interface, embedded at build time
+third_party/libpeer/      pure C WebRTC (sepfy/libpeer, pinned, with mbedtls/libsrtp/usrsctp/cJSON)
 tools/embed_assets.c      build-time page embedder
 third_party/mongoose/     HTTP server (vendored, MIT)
 src/
@@ -858,8 +899,13 @@ src/
     rtcp.c                sender reports, RR/NACK/PLI/FIR parsing
     sdp.c                 offer parsing, answer generation
     webrtc_session.c      per-viewer session: state, timers, retransmit
+  lpstream/
+    camstream_libpeer_main.c  entry point for the libpeer binary
+    lp_server.c           HTTP signaling, pipeline ownership, media fan-out thread
+    lp_session.c          one viewer: libpeer PeerConnection + thread, IDR-gated start
+    lp_sdp.c              browser answer sanitizer protecting libpeer's fixed buffers
 include/                  one header per module, no implementation leaks
-tests/                    see below
+tests/                    see below (including libpeer tests)
 ```
 
 ## Testing
@@ -980,7 +1026,17 @@ first boot with no further setup; see
 [Automatic LAN connection](#automatic-lan-connection).
 
 To update, rebuild and `sudo make install`, then `sudo systemctl restart
-camstream`.
+camstream`. For the libpeer variant:
+
+```sh
+make camstream-libpeer
+sudo make install-libpeer
+sudo systemctl daemon-reload
+sudo systemctl restart camstream-libpeer
+```
+
+`install-libpeer` installs `camstream-libpeer` and
+`camstream-libpeer.service`; it reuses `/etc/camstream.conf` when present.
 
 ## Troubleshooting
 
@@ -1034,8 +1090,14 @@ without `--verbose`, because the ring keeps all levels.
 - Video only. No audio, no `getUserMedia` on the page.
 - H.264 only, constrained baseline (`42e01f`), because that is what both
   encoder backends produce and what every browser decodes.
-- Eight concurrent viewers, one UDP port each, and each viewer gets the same
-  encoded stream. There is no per-viewer scaling or simulcast.
+- Eight concurrent viewers for the native stack, four for libpeer (one thread
+  per viewer), each viewer gets the same encoded stream. There is no
+  per-viewer scaling or simulcast.
+- libpeer build quirk: upstream `src/config.h` defines `CONFIG_MTU` without
+  `#ifndef`, so `-DCONFIG_MTU` cannot override it. The test binary works
+  around it with a forced include (`tests/libpeer_rx_config.h`) that undefines
+  and redefines the value to 1500, giving room for the 10-byte SRTP tag on
+  full-size packets. Browsers are unaffected; only a libpeer receiver needs it.
 - Changing resolution, FPS, source, device, encoder, or ports requires a
   restart; `/api/config/reload` only re-applies the bitrate.
 - No recording, no snapshot endpoint, no RTSP or HLS.

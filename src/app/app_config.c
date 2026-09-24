@@ -665,8 +665,12 @@ void app_config_print_summary(const AppConfig *config)
              config->encoder, config->bitrate_kbps, config->keyframe_seconds);
     log_info("app", "http       : http://%s:%u/ (web UI and signaling)",
              config->listen, config->http_port);
-    log_info("app", "udp media  : one port per viewer from %u",
-             config->udp_base_port);
+    if (config->udp_base_port != 0) {
+        log_info("app", "udp media  : one port per viewer from %u",
+                 config->udp_base_port);
+    } else {
+        log_info("app", "udp media  : one ephemeral port per viewer");
+    }
     log_info("app", "mdns       : %s",
              config->mdns ? config->mdns_name : "off");
 

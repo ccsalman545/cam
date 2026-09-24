@@ -1,0 +1,3 @@
+[submodule "third_party/libpeer"]
+	path = third_party/libpeer
+	url = https://github.com/sepfy/libpeer

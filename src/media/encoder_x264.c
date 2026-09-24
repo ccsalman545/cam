@@ -85,6 +85,7 @@ static struct X264Backend *x264_open(uint32_t width,
                               uint32_t fps,
                               uint32_t bitrate_kbps,
                               uint32_t gop_seconds,
+                              int single_slice,
                               char *name_out,
                               size_t name_out_size)
 {
@@ -126,10 +127,12 @@ static struct X264Backend *x264_open(uint32_t width,
 
     /*
      * zerolatency already selected sliced threads and disabled the
-     * lookahead; only the count is set here.
+     * lookahead; only the count is set here. Sliced threads mean one
+     * slice per thread, so a caller that needs single-slice pictures
+     * (H264_ENCODER_SINGLE_SLICE) gets one thread.
      */
-    p->i_threads = x264_thread_count();
-    p->b_sliced_threads = 1;
+    p->i_threads = single_slice ? 1 : x264_thread_count();
+    p->b_sliced_threads = single_slice ? 0 : 1;
 
     p->i_log_level = X264_LOG_ERROR;
 
@@ -157,9 +160,10 @@ static struct X264Backend *x264_open(uint32_t width,
     encoder->picture.img.i_plane = 3;
 
     snprintf(encoder->name, sizeof(encoder->name),
-             "libx264 %ux%u %s/%s %d threads @ %u kbps",
+             "libx264 %ux%u %s/%s %d thread%s%s @ %u kbps",
              width, height, X264_PRESET, X264_TUNE, p->i_threads,
-             bitrate_kbps);
+             p->i_threads == 1 ? "" : "s",
+             single_slice ? " (single slice)" : "", bitrate_kbps);
 
     if (name_out != NULL && name_out_size > 0) {
         snprintf(name_out, name_out_size, "%s", encoder->name);
@@ -280,11 +284,11 @@ static void x264_close(struct X264Backend *encoder)
 
 void *x264_backend_open(uint32_t width, uint32_t height,
                         uint32_t fps, uint32_t bitrate_kbps,
-                        uint32_t gop_seconds,
+                        uint32_t gop_seconds, int single_slice,
                         char *name_out, size_t name_out_size)
 {
     return x264_open(width, height, fps, bitrate_kbps,
-                     gop_seconds, name_out, name_out_size);
+                     gop_seconds, single_slice, name_out, name_out_size);
 }
 
 int x264_backend_encode(void *backend,

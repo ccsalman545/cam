@@ -1,0 +1,28 @@
+[Unit]
+Description=camstream-libpeer WebRTC camera server (libpeer stack)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camstream-libpeer --config /etc/camstream.conf
+Restart=on-failure
+RestartSec=2
+# SIGTERM goes to camstream-libpeer only; it stops its rpicam-vid child itself
+# (pipe closed first, then SIGTERM). Whatever is left after the timeout
+# is killed, so a restart never finds the camera or port 8080 still held.
+KillMode=mixed
+TimeoutStopSec=10
+# The camera (libcamera: /dev/media*, /dev/video*, /dev/dma_heap) and the
+# encoder are reached through /dev nodes, so the process only needs video
+# group membership, not root.
+# Uncomment the two lines below after creating the account:
+#   sudo useradd --system --no-create-home --groups video camstream
+#User=camstream
+#Group=camstream
+SupplementaryGroups=video
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

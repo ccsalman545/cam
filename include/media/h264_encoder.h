@@ -71,6 +71,30 @@ int h264_encoder_encode(H264Encoder *encoder,
                         int *out_is_idr,
                         uint64_t *out_pts_us);
 
+/*
+ * Options for h264_encoder_open_flags().
+ *
+ * H264_ENCODER_SINGLE_SLICE  every picture is coded as one slice. The
+ *     libpeer RTP packetizer treats each slice NAL unit as a complete
+ *     frame (marker bit and timestamp step per slice), so a multi-slice
+ *     picture would reach the browser as several broken frames. libx264
+ *     then runs one encode thread instead of sliced threads (frame
+ *     threads are not an option: each adds a frame of latency). The
+ *     V4L2 M2M encoder always emits one slice per picture.
+ */
+#define H264_ENCODER_SINGLE_SLICE 0x1u
+
+/* As h264_encoder_open(), with H264_ENCODER_* option flags. */
+H264Encoder *h264_encoder_open_flags(const char *preference,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t fps,
+                                     uint32_t bitrate_kbps,
+                                     uint32_t gop_seconds,
+                                     unsigned flags,
+                                     char *name_out,
+                                     size_t name_out_size);
+
 /* Backend kind of an open encoder. */
 H264EncoderKind h264_encoder_kind(const H264Encoder *encoder);
 
