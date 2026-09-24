@@ -627,7 +627,7 @@ Five test binaries, each linked against the real modules:
 | `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling, queued bitrate change applied by the encode thread |
 | `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
 | `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout |
-| `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, certificate rotation, config reload (applied and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |
+| `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |
 
 Test quality rules followed here: a test only passes if the module under test
 produced the observed output, no test asserts on a reimplementation of the

@@ -26,17 +26,23 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define HTTP_PORT_TEST   18991
 #define HTTP_PORT_NO_CAM 18992
+#define HTTP_PORT_MANY   18993
 #define UDP_PORT_TEST    60990
 #define UDP_PORT_NO_CAM  60992
+#define UDP_PORT_MANY    60994
+
+#define MAX_VIEWERS_TEST 8
 
 #define RESPONSE_MAX 65536
 #define START_TIMEOUT_MS 8000
@@ -188,6 +194,44 @@ static void stop_server(pid_t pid, const char *name)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Every client socket gets a short receive timeout. Without it a server
+ * that never answers (a regression worth failing on) would hang the test
+ * instead of reporting a failure.
+ */
+#define CLIENT_TIMEOUT_S 3
+
+static int connect_to(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct timeval timeout;
+
+    timeout.tv_sec = CLIENT_TIMEOUT_S;
+    timeout.tv_usec = 0;
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in address;
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+    if (connect(fd, (struct sockaddr *) &address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+/*
  * Sends one request and returns the status code, with the body in
  * 'body'. Connection: close keeps the client simple and still exercises
  * the server's close path.
@@ -199,23 +243,11 @@ static int http_call(uint16_t port,
                      char *body,
                      size_t body_size)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = connect_to(port);
 
     body[0] = 0;
 
     if (fd < 0) {
-        return -1;
-    }
-
-    struct sockaddr_in address;
-
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-
-    if (connect(fd, (struct sockaddr *) &address, sizeof(address)) != 0) {
-        close(fd);
         return -1;
     }
 
@@ -302,6 +334,39 @@ static int http_call(uint16_t port,
     return status;
 }
 
+/*
+ * Sends bytes verbatim and closes. Used for input that is not a valid
+ * request: the server must survive it and keep answering afterwards.
+ */
+static int http_send_raw(uint16_t port, const char *bytes, size_t length)
+{
+    int fd = connect_to(port);
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    size_t sent = 0;
+
+    while (sent < length) {
+        ssize_t written = send(fd, bytes + sent, length - sent, 0);
+
+        if (written <= 0) {
+            break;
+        }
+
+        sent += (size_t) written;
+    }
+
+    /* Read whatever comes back (an error reply, or nothing) and close. */
+    char scratch[1024];
+
+    recv(fd, scratch, sizeof(scratch), 0);
+    close(fd);
+
+    return 0;
+}
+
 /* Minimal JSON string escaper for the SDP payloads used here. */
 static void json_escape(const char *input, char *out, size_t out_size)
 {
@@ -376,6 +441,18 @@ static int json_field(const char *body, const char *field,
     out[i] = 0;
 
     return 0;
+}
+
+/* Long form of a JSON integer field, for session ids and counters. */
+static long json_long_field(const char *body, const char *field)
+{
+    char text[32];
+
+    if (json_field(body, field, text, sizeof(text)) != 0) {
+        return -1;
+    }
+
+    return strtol(text, NULL, 10);
 }
 
 /* ------------------------------------------------------------------ */
@@ -660,7 +737,238 @@ static void test_management_interface(const char *binary)
         check(status == 200, "server keeps serving after a bad reload");
     }
 
+    /*
+     * Hostile input: none of this is a valid request, so the only
+     * requirement is that the server survives, does not execute
+     * anything, and still answers diagnostics afterwards.
+     */
+    char before[RESPONSE_MAX] = "";
+
+    http_call(HTTP_PORT_TEST, "GET", "/api/status", NULL, before,
+              sizeof(before));
+
+    char sessions_before[32] = "";
+
+    json_field(before, "sessions_total", sessions_before,
+               sizeof(sessions_before));
+
+    http_send_raw(HTTP_PORT_TEST, "GARBAGE\r\n\r\n", 11);
+    http_send_raw(HTTP_PORT_TEST, "GET", 3);
+    http_send_raw(HTTP_PORT_TEST, "\r\n\r\n", 4);
+
+    static char long_uri[4200];
+    size_t long_uri_len = 0;
+
+    memcpy(long_uri, "GET /", 5);
+    long_uri_len = 5;
+
+    while (long_uri_len < sizeof(long_uri) - 16) {
+        long_uri[long_uri_len++] = 'a';
+    }
+
+    memcpy(long_uri + long_uri_len, " HTTP/1.1\r\n\r\n", 14);
+    long_uri_len += 14;
+
+    http_send_raw(HTTP_PORT_TEST, long_uri, long_uri_len);
+
+    static char big_body[20000];
+
+    memset(big_body, 'x', sizeof(big_body));
+
+    {
+        char header[256];
+        int header_len = snprintf(header, sizeof(header),
+                                  "POST /api/webrtc/offer HTTP/1.1\r\n"
+                                  "Host: 127.0.0.1:%u\r\n"
+                                  "Content-Type: application/json\r\n"
+                                  "Content-Length: %zu\r\n"
+                                  "Connection: close\r\n\r\n",
+                                  (unsigned) HTTP_PORT_TEST, sizeof(big_body));
+
+        int fd = connect_to(HTTP_PORT_TEST);
+
+        if (fd >= 0) {
+            status = 0;
+
+            if (send(fd, header, (size_t) header_len, 0) == header_len) {
+                send(fd, big_body, sizeof(big_body), 0);
+            }
+
+            char scratch[2048];
+            ssize_t got = recv(fd, scratch, sizeof(scratch) - 1, 0);
+
+            if (got > 0) {
+                scratch[got] = 0;
+                sscanf(scratch, "HTTP/1.%*d %d", &status);
+            }
+
+            close(fd);
+
+            check(status == 413,
+                  "oversized signaling body is rejected with 413");
+        } else {
+            if (fd >= 0) {
+                close(fd);
+            }
+            check(0, "oversized signaling body is rejected with 413");
+        }
+    }
+
+    status = http_call(HTTP_PORT_TEST, "GET", "/api/status", NULL, body,
+                       sizeof(body));
+
+    check(status == 200 && body_has(body, "\"state\""),
+          "server keeps serving after hostile input");
+
+    /* 64 connections opened and closed: sockets and sessions are freed. */
+    for (int i = 0; i < 64; i++) {
+        http_call(HTTP_PORT_TEST, "GET", "/api/logs?limit=1", NULL, body,
+                  sizeof(body));
+    }
+
+    status = http_call(HTTP_PORT_TEST, "GET", "/api/stats", NULL, body,
+                       sizeof(body));
+
+    check(status == 200, "server survives repeated connections");
+
+    status = http_call(HTTP_PORT_TEST, "GET", "/api/status", NULL, body,
+                       sizeof(body));
+
+    char sessions_after[32] = "";
+
+    json_field(body, "sessions_total", sessions_after,
+               sizeof(sessions_after));
+
+    check(sessions_before[0] != 0 &&
+          strcmp(sessions_before, sessions_after) == 0,
+          "no session was created by the hostile input");
+
     stop_server(pid, "SIGTERM ends the server with status 0");
+}
+
+/*
+ * Concurrent viewers: every session owns a UDP port and a slot, the
+ * ninth viewer is refused, and closing sessions frees both so a new
+ * viewer can connect without restarting the server.
+ */
+static void test_concurrent_viewers(const char *binary)
+{
+    const char *config_path = "/tmp/camstream_api_many.conf";
+    const char *log_path = "/tmp/camstream_api_many.log";
+
+    printf("test_server_api: concurrent viewers\n");
+
+    if (write_test_config(config_path, HTTP_PORT_MANY, UDP_PORT_MANY,
+                          1500) != 0) {
+        check(0, "write config file for the viewer test");
+        return;
+    }
+
+    pid_t pid = spawn_server(binary, config_path, log_path, HTTP_PORT_MANY);
+
+    check(pid > 0, "server starts for the viewer test");
+
+    if (pid <= 0) {
+        return;
+    }
+
+    char offer[8192];
+
+    if (build_offer_body(offer, sizeof(offer)) != 0) {
+        check(0, "build offer body");
+        stop_server(pid, "SIGTERM ends the viewer server");
+        return;
+    }
+
+    char body[RESPONSE_MAX];
+    char session_id[MAX_VIEWERS_TEST + 1][32];
+    int accepted = 0;
+
+    for (int i = 0; i < MAX_VIEWERS_TEST; i++) {
+        int status = http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/offer",
+                               offer, body, sizeof(body));
+
+        if (status != 200 ||
+            json_field(body, "session_id", session_id[i],
+                       sizeof(session_id[i])) != 0) {
+            break;
+        }
+
+        accepted++;
+    }
+
+    check(accepted == MAX_VIEWERS_TEST,
+          "eight concurrent sessions are accepted");
+
+    int status = http_call(HTTP_PORT_MANY, "GET", "/api/status", NULL, body,
+                           sizeof(body));
+
+    check(status == 200 && json_long_field(body, "sessions_active") ==
+          MAX_VIEWERS_TEST,
+          "status counts all eight sessions as active");
+
+    check(body_has(body, "\"session_create_failures\":0"),
+          "no session failed to start");
+
+    status = http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/offer", offer,
+                       body, sizeof(body));
+
+    check(status == 503 && body_has(body, "session limit"),
+          "the ninth viewer is refused with the limit named");
+
+    /* Close two viewers; their slots and UDP ports must come back. */
+    char close_body[64];
+
+    for (int i = 0; i < 2 && accepted > i; i++) {
+        snprintf(close_body, sizeof(close_body), "{\"session_id\":%.*s}",
+                 (int) sizeof(session_id[i]) - 1, session_id[i]);
+
+        status = http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/close",
+                           close_body, body, sizeof(body));
+
+        check(status == 200, i == 0 ? "closing a session succeeds"
+                                    : "closing a second session succeeds");
+    }
+
+    status = http_call(HTTP_PORT_MANY, "GET", "/api/status", NULL, body,
+                       sizeof(body));
+
+    check(status == 200 && json_long_field(body, "sessions_active") ==
+          MAX_VIEWERS_TEST - 2,
+          "closing sessions frees their slots");
+
+    status = http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/offer", offer,
+                       body, sizeof(body));
+
+    check(status == 200,
+          "a freed slot accepts a new viewer without a restart");
+
+    /* Close everything again and wait for the sockets to be released. */
+    for (int i = 2; i < accepted; i++) {
+        snprintf(close_body, sizeof(close_body), "{\"session_id\":%.*s}",
+                 (int) sizeof(session_id[i]) - 1, session_id[i]);
+
+        http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/close", close_body,
+                  body, sizeof(body));
+    }
+
+    http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/restart", NULL, body,
+              sizeof(body));
+
+    status = http_call(HTTP_PORT_MANY, "GET", "/api/status", NULL, body,
+                       sizeof(body));
+
+    check(status == 200 &&
+          json_long_field(body, "sessions_active") == 0,
+          "restart drops every remaining session");
+
+    status = http_call(HTTP_PORT_MANY, "POST", "/api/webrtc/offer", offer,
+                       body, sizeof(body));
+
+    check(status == 200,
+          "signaling works again after dropping every session");
+
+    stop_server(pid, "SIGTERM ends the viewer server cleanly");
 }
 
 static void test_camera_failure_keeps_http_up(const char *binary)
@@ -735,6 +1043,7 @@ int main(int argc, char **argv)
     }
 
     test_management_interface(binary);
+    test_concurrent_viewers(binary);
     test_camera_failure_keeps_http_up(binary);
 
     if (g_failures != 0) {
