@@ -270,7 +270,8 @@ static int pump_session(RtcSession *session, int timeout_ms)
 /* Client certificate from the self signed, ECDSA P-256 pair           */
 /* ------------------------------------------------------------------ */
 
-static SSL_CTX *create_client_ssl_ctx(char *fingerprint, size_t fingerprint_size)
+static SSL_CTX *create_client_ssl_ctx(char *fingerprint, size_t fingerprint_size,
+                                      int offer_use_srtp)
 {
     client_key = EVP_EC_gen("P-256");
 
@@ -338,7 +339,15 @@ static SSL_CTX *create_client_ssl_ctx(char *fingerprint, size_t fingerprint_size
 
     /* WebRTC peers are verified by SDP fingerprint, not by a CA. */
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    SSL_CTX_set_tlsext_use_srtp(ctx, "SRTP_AES128_CM_SHA1_80");
+
+    /*
+     * A real browser always offers this; the second scenario omits it
+     * to prove the server refuses a peer that never agreed on a profile.
+     */
+    if (offer_use_srtp) {
+        SSL_CTX_set_tlsext_use_srtp(ctx, "SRTP_AES128_CM_SHA1_80");
+    }
+
     SSL_CTX_set_options(ctx, SSL_OP_NO_QUERY_MTU);
 
     return ctx;
@@ -362,7 +371,8 @@ static int run_handshake(RtcSession *session, int client_fd, SSL *ssl)
         int error = SSL_get_error(ssl, result);
 
         if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
-            fprintf(stderr, "  SSL_do_handshake failed: %d\n", error);
+            fprintf(stderr, "  SSL_do_handshake failed: %d errno=%d (%s)\n",
+                    error, errno, strerror(errno));
             ERR_print_errors_fp(stderr);
             return -1;
         }
@@ -714,6 +724,164 @@ static uint16_t stun_exchange(RtcSession *session,
     return 0;
 }
 
+/*
+ * A peer that never offers the use_srtp extension reaches the end of the
+ * TLS handshake but must not be sent media: the keys would be derived
+ * from a profile it never agreed to, so the session has to fail where
+ * the cause is visible instead of producing undecryptable packets.
+ *
+ * A browser cannot make this mistake, but a custom client or a broken
+ * gateway can, and it is the one path in the DTLS integration that
+ * produces silently wrong output when unguarded.
+ */
+static void run_peer_without_srtp_scenario(void)
+{
+    /*
+     * create_client_ssl_ctx() publishes the peer certificate and key in
+     * file scope variables that main() frees at the very end. This
+     * scenario runs first and would overwrite those pointers, leaving
+     * the first scenario's certificate unreachable, so release the
+     * previous pair here.
+     */
+    EVP_PKEY_free(client_key);
+    X509_free(client_cert);
+    client_key = NULL;
+    client_cert = NULL;
+
+    char fingerprint[128] = "";
+
+    SSL_CTX *ctx = create_client_ssl_ctx(fingerprint, sizeof(fingerprint), 0);
+
+    expect(ctx != NULL, "peer without use_srtp: client context built");
+
+    if (ctx == NULL) {
+        return;
+    }
+
+    RtcSessionConfig config;
+
+    memset(&config, 0, sizeof(config));
+
+    config.id = 0x22222222;
+    config.udp_port = reserve_free_udp_port();
+    config.candidate_count = 1;
+
+    snprintf(config.candidate_ips[0], sizeof(config.candidate_ips[0]),
+             "127.0.0.1");
+    snprintf(config.offer.ice_ufrag, sizeof(config.offer.ice_ufrag), "%s",
+             CLIENT_UFrag);
+    snprintf(config.offer.ice_pwd, sizeof(config.offer.ice_pwd), "%s",
+             CLIENT_PWD);
+    snprintf(config.offer.fingerprint, sizeof(config.offer.fingerprint), "%s",
+             fingerprint);
+    snprintf(config.offer.setup, sizeof(config.offer.setup), "actpass");
+    snprintf(config.offer.video_mid, sizeof(config.offer.video_mid), "0");
+    config.offer.h264_payload_type = RTP_PAYLOAD_TYPE;
+
+    RtcSession *session = NULL;
+    char answer[4096];
+    size_t answer_length = 0;
+
+    int created = rtc_session_create(&config, &session, answer,
+                                     sizeof(answer), &answer_length);
+
+    expect(created == 0 && session != NULL,
+           "peer without use_srtp: session created");
+
+    if (created != 0 || session == NULL) {
+        SSL_CTX_free(ctx);
+        return;
+    }
+
+    char server_ufrag[80] = "";
+    char server_pwd[128] = "";
+
+    parse_answer_attribute(answer, "ice-ufrag", server_ufrag,
+                           sizeof(server_ufrag));
+    parse_answer_attribute(answer, "ice-pwd", server_pwd, sizeof(server_pwd));
+
+    int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    struct sockaddr_in local;
+
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(client_fd, (struct sockaddr *) &local, sizeof(local));
+
+    int flags = fcntl(client_fd, F_GETFL, 0);
+
+    if (flags >= 0) {
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    struct sockaddr_in session_addr;
+
+    memset(&session_addr, 0, sizeof(session_addr));
+    session_addr.sin_family = AF_INET;
+    session_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    session_addr.sin_port = htons(config.udp_port);
+
+    char username[192];
+
+    snprintf(username, sizeof(username), "%s:%s", server_ufrag, CLIENT_UFrag);
+
+    uint8_t response[512];
+    size_t response_length = 0;
+
+    uint16_t response_type = stun_exchange(session, client_fd, &session_addr,
+                                           username, server_pwd, response,
+                                           sizeof(response),
+                                           &response_length);
+
+    expect(response_type == 0x0101,
+           "peer without use_srtp: ICE check still answered");
+
+    DtlsSrtpGlobalStats before;
+
+    dtls_srtp_global_stats(&before);
+
+    SSL *ssl = SSL_new(ctx);
+    BIO *bio = BIO_new_dgram(client_fd, BIO_NOCLOSE);
+
+    BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_PEER, 0, &session_addr);
+    SSL_set_bio(ssl, bio, bio);
+    SSL_set_connect_state(ssl);
+    SSL_set_mtu(ssl, 1200);
+
+    int handshake = run_handshake(session, client_fd, ssl);
+
+    expect(handshake == 0,
+           "peer without use_srtp: TLS handshake itself completes");
+
+    expect(rtc_session_state(session) != RTC_STREAMING,
+           "peer without use_srtp is never moved to streaming");
+
+    DtlsSrtpGlobalStats after;
+
+    dtls_srtp_global_stats(&after);
+
+    expect(after.handshake_failures == before.handshake_failures + 1,
+           "the refusal is counted as a handshake failure");
+    expect(after.handshakes_completed == before.handshakes_completed,
+           "no SRTP key material was exported for it");
+
+    /* The refused session must still be reaped by the watchdog. */
+    rtc_session_tick(session, now_ms() + 31000);
+    expect(rtc_session_state(session) == RTC_CLOSED,
+           "a refused peer is closed by the DTLS watchdog");
+
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(client_fd);
+    rtc_session_destroy(session);
+
+    EVP_PKEY_free(client_key);
+    X509_free(client_cert);
+    client_key = NULL;
+    client_cert = NULL;
+}
+
 int main(void)
 {
     printf("test_rtc_session: starting\n");
@@ -728,7 +896,7 @@ int main(void)
     char client_fingerprint[128] = "";
 
     SSL_CTX *ssl_ctx = create_client_ssl_ctx(client_fingerprint,
-                                             sizeof(client_fingerprint));
+                                             sizeof(client_fingerprint), 1);
 
     if (ssl_ctx == NULL) {
         printf("  FAIL client SSL_CTX\n");
@@ -1253,6 +1421,8 @@ int main(void)
     if (outbound != NULL) {
         srtp_dealloc(outbound);
     }
+
+    run_peer_without_srtp_scenario();
 
     srtp_shutdown();
     dtls_srtp_global_shutdown();

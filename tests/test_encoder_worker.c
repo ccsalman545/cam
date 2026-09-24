@@ -31,7 +31,13 @@ enum EncodeMode {
     ENCODE_NO_OUTPUT    /* simulate pipeline depth: never emit */
 };
 
-static enum EncodeMode encode_mode = ENCODE_OK;
+/*
+ * Atomic because main switches the mode between phases while the encode
+ * thread may still be inside the stub. The sleeps in the test make the
+ * switch land between frames in practice, but relying on that would
+ * leave a real race in the test itself.
+ */
+static atomic_int encode_mode = ENCODE_OK;
 
 /* Target bitrate the worker asked the stub to apply, 0 = never asked. */
 static atomic_uint stub_bitrate_kbps;
@@ -63,7 +69,7 @@ int h264_encoder_encode(H264Encoder *encoder,
     (void) pts_us;
     (void) force_idr;
 
-    if (encode_mode == ENCODE_NO_OUTPUT) {
+    if (atomic_load(&encode_mode) == ENCODE_NO_OUTPUT) {
         return 0;
     }
 
@@ -120,6 +126,10 @@ int main(void)
         return 1;
     }
 
+    /*
+     * The stub ignores its encoder handle; the address of the mode flag
+     * is only a non-NULL token for the worker.
+     */
     EncoderWorker *worker = encoder_worker_create(hub,
                                                   (H264Encoder *) &encode_mode,
                                                   WIDTH, HEIGHT,
@@ -217,7 +227,7 @@ int main(void)
      * 4. Encoder produces no output (pipeline depth): counted
      *    separately so the status endpoint can name the cause.
      */
-    encode_mode = ENCODE_NO_OUTPUT;
+    atomic_store(&encode_mode, ENCODE_NO_OUTPUT);
     atomic_store(&active, 0);
 
     /* Give the worker a chance to observe the idle state so the
@@ -258,7 +268,7 @@ int main(void)
      *    encode thread, which is the only thread allowed to touch the
      *    encoder handle.
      */
-    encode_mode = ENCODE_OK;
+    atomic_store(&encode_mode, ENCODE_OK);
     atomic_store(&active, 1);
 
     check(encoder_worker_request_bitrate(worker, 1337) == 0,

@@ -217,7 +217,8 @@ $(WEB_ASSETS): $(WEB_PAGE) $(EMBED_TOOL)
 
 TEST_BUILD := $(BUILD)/tests
 
-$(TEST_BUILD)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/ice_lite.h
+$(TEST_BUILD)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/ice_lite.h \
+        $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/webrtc \
 	      $(DEP_CFLAGS) tests/test_stun.c src/webrtc/ice_lite.c -o $@ \
@@ -225,7 +226,7 @@ $(TEST_BUILD)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/
 
 $(TEST_BUILD)/test_encoder_worker: tests/test_encoder_worker.c \
         src/media/encoder_worker.c src/media/frame_hub.c src/media/frame_pool.c \
-        src/media/au_ring.c src/media/yuv_convert.c src/app/log.c
+        src/media/au_ring.c src/media/yuv_convert.c src/app/log.c $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/media \
 	      -Iinclude/app tests/test_encoder_worker.c src/media/encoder_worker.c \
@@ -233,7 +234,7 @@ $(TEST_BUILD)/test_encoder_worker: tests/test_encoder_worker.c \
 	      src/media/yuv_convert.c src/app/log.c -o $@ -lpthread
 
 $(TEST_BUILD)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c \
-        src/media/test_source.c src/app/log.c
+        src/media/test_source.c src/app/log.c $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/media \
 	      -Iinclude/app tests/test_csi_source.c src/media/csi_source.c \
@@ -245,16 +246,21 @@ WEBRTC_TEST_SOURCES := src/webrtc/webrtc_session.c src/webrtc/dtls_srtp.c \
                        src/webrtc/ice_lite.c src/webrtc/rtp_h264.c \
                        src/webrtc/rtcp.c src/webrtc/sdp.c src/app/log.c
 
-$(TEST_BUILD)/test_rtc_session: tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES)
+$(TEST_BUILD)/test_rtc_session: tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES) \
+        $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/app \
 	      -Iinclude/media -Iinclude/webrtc $(DEP_CFLAGS) \
 	      tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES) -o $@ \
 	      $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2 -lpthread -lm
 
+# Every test depends on the flag stamp too: a change of OPT or HAVE_X264
+# must rebuild the tests, otherwise a sanitizer run silently executes a
+# binary instrumented with something else.
+#
 # This one drives the real binary over HTTP, so it takes the server path
 # as its only argument and needs the binary built first.
-$(TEST_BUILD)/test_server_api: tests/test_server_api.c $(BINARY)
+$(TEST_BUILD)/test_server_api: tests/test_server_api.c $(BINARY) $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) tests/test_server_api.c -o $@
 

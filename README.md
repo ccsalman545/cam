@@ -143,7 +143,10 @@ stateDiagram-v2
    flows only after the handshake completes and both sides are authenticated.
 5. SRTP with `SRTP_AES128_CM_SHA1_80`, keys exported from the DTLS handshake
    (`EXTRACTOR-dtls_srtp`). The session moves to `streaming` only after the
-   handshake completes, and the first keyframe is requested at that moment.
+   handshake completes and only when the peer actually negotiated a `use_srtp`
+   profile; a peer that never offered the extension is refused rather than
+   sent media encrypted with keys it does not have. The first keyframe is
+   requested the moment the session reaches `streaming`.
 
 Ports: one UDP port per session from `--udp-port`, up to 8 sessions. The
 server binds each port when the session is created and closes it when the
@@ -562,7 +565,9 @@ connecting. Concretely:
   existing session.
 - Media is encrypted with SRTP. DTLS certificates are self-signed and
   regenerated at every start; there is no CA and no pinning beyond the SDP
-  fingerprint exchange.
+  fingerprint exchange. A peer whose certificate does not match the
+  fingerprint in its offer, or whose handshake negotiated no `use_srtp`
+  profile, never receives media.
 - There is no shell, no file API, no `system()` call, and no dynamic code
   loading. All external input (HTTP requests, SDP, STUN, RTP, RTCP) is parsed
   with explicit length checks and bounded buffers.
@@ -626,7 +631,7 @@ Five test binaries, each linked against the real modules:
 | `test_stun` | STUN message parsing, MESSAGE-INTEGRITY verification, XOR-MAPPED-ADDRESS, fingerprints, RFC 5769 vectors, malformed input |
 | `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling, queued bitrate change applied by the encode thread |
 | `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
-| `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout |
+| `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout, and a peer that never offers `use_srtp` being refused with the failure counted |
 | `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |
 
 Test quality rules followed here: a test only passes if the module under test

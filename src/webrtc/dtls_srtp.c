@@ -26,7 +26,21 @@
 
 #define DTLS_RX_QUEUE 64
 #define DTLS_MTU 1200
-#define SRTP_KEY_MATERIAL_LEN 60     /* 2 x (16 key + 14 salt) */
+
+/*
+ * RFC 5764 keying material: a 16 byte master key and a 14 byte master
+ * salt per direction, 60 bytes in total.
+ */
+#define SRTP_KEY_MATERIAL_LEN 60
+
+/*
+ * The one DTLS-SRTP profile offered: AES128 CM with HMAC-SHA1-80, the
+ * RFC 5764 mandatory to implement profile that browsers require. It is
+ * also the only implemented profile whose key sizes match the libsrtp
+ * AES128 CM policies used below, so the negotiation result is checked
+ * rather than assumed.
+ */
+#define SRTP_PROFILE_NAME "SRTP_AES128_CM_SHA1_80"
 
 static SSL_CTX *g_ctx;
 static X509 *g_cert;
@@ -203,7 +217,7 @@ int dtls_srtp_global_init(void)
      * the universally implemented WebRTC baseline profile and
      * keeps the exported key layout at exactly 60 bytes.
      */
-    if (SSL_CTX_set_tlsext_use_srtp(g_ctx, "SRTP_AES128_CM_SHA1_80") != 0) {
+    if (SSL_CTX_set_tlsext_use_srtp(g_ctx, SRTP_PROFILE_NAME) != 0) {
         dtls_log_openssl("SSL_CTX_set_tlsext_use_srtp");
         return -1;
     }
@@ -439,6 +453,21 @@ static int derive_srtp_keys(DtlsSrtp *session)
     unsigned char material[SRTP_KEY_MATERIAL_LEN];
     uint8_t client_key[30];
     uint8_t server_key[30];
+
+    /*
+     * The keys are only meaningful if the handshake agreed on a
+     * use_srtp profile. Without this check a peer that never offered
+     * the extension would be sent media protected with a key schedule
+     * it does not know, instead of the handshake failing where the
+     * cause is visible.
+     */
+    if (SSL_get_selected_srtp_profile(session->ssl) == NULL) {
+        snprintf(session->failure_reason, sizeof(session->failure_reason),
+                 "peer negotiated no use_srtp profile "
+                 "(offered %s)", SRTP_PROFILE_NAME);
+        log_error("dtls", "%s", session->failure_reason);
+        return -1;
+    }
 
     /*
      * Export order (RFC 5764):
