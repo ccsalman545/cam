@@ -264,9 +264,16 @@ $(TEST_BUILD)/test_server_api: tests/test_server_api.c $(BINARY) $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) tests/test_server_api.c -o $@
 
+# This one acts as the browser: real UDP, STUN, DTLS and SRTP against the
+# running server, so it links OpenSSL and libsrtp2 but no project source.
+$(TEST_BUILD)/test_lan_stream: tests/test_lan_stream.c $(BINARY) $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) $(DEP_CFLAGS) \
+	      tests/test_lan_stream.c -o $@ $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2
+
 TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
                  $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_rtc_session \
-                 $(TEST_BUILD)/test_server_api
+                 $(TEST_BUILD)/test_server_api $(TEST_BUILD)/test_lan_stream
 
 test: $(TEST_BINARIES) $(BINARY)
 	@for test_binary in $(TEST_BINARIES); do \

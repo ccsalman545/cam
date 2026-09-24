@@ -624,7 +624,9 @@ tests/                    see below
 make test
 ```
 
-Five test binaries, each linked against the real modules:
+Six test binaries. Five link the real modules directly; `test_lan_stream`
+links OpenSSL and libsrtp2 only, because it acts as the browser and drives the
+built `camstream` binary over HTTP and UDP:
 
 | Test | Covers |
 | --- | --- |
@@ -633,6 +635,7 @@ Five test binaries, each linked against the real modules:
 | `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
 | `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout, and a peer that never offers `use_srtp` being refused with the failure counted |
 | `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |
+| `test_lan_stream` | The real binary driven the way a browser drives it: the server is started with a test config, ICE check answered with a verified MESSAGE-INTEGRITY, DTLS 1.2 handshake with the certificate matching the answer's fingerprint, SRTP key export and decrypt, access units reassembled from single NAL and FU-A packets, a keyframe for a viewer that joins late, SRTCP Sender Reports, viewer close, a second viewer streaming without a restart, and SIGTERM exiting with status 0 |
 
 Test quality rules followed here: a test only passes if the module under test
 produced the observed output, no test asserts on a reimplementation of the
