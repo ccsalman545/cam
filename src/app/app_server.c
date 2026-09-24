@@ -388,6 +388,13 @@ static VideoSource *create_source(const AppConfig *config)
 }
 
 /*
+ * Defined below media_pipeline_start(), whose failure path calls it to
+ * unwind a partially built pipeline. It only touches members that are
+ * non-NULL, so it is safe at any point of the build.
+ */
+static void media_pipeline_stop(Server *server);
+
+/*
  * Build the pipeline. On failure the caller gets a message that names
  * the subsystem and the setting that failed, and the partially built
  * pipeline is torn down again.

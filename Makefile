@@ -130,7 +130,8 @@ comma := ,
 DEP_LDFLAGS := $(addprefix -L,$(sort $(OPENSSL_LIBDIR) $(SRTP_LIBDIR))) \
                $(addprefix -Wl$(comma)-rpath$(comma),$(sort $(RPATH_DIRS)))
 
-DEP_LIBS := -lssl -lcrypto -lsrtp2 -lpthread
+# libsrtp2 uses libcrypto, so it must precede it (matters for static archives).
+DEP_LIBS := -lsrtp2 -lssl -lcrypto -lpthread
 ifeq ($(HAVE_X264),1)
   DEP_CFLAGS += $(addprefix -I,$(filter-out /usr/include,$(X264_INCLUDE)))
   DEP_LDFLAGS += -L$(X264_LIBDIR)
@@ -260,7 +261,7 @@ $(TEST_BUILD)/test_rtc_session: tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES) 
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/app \
 	      -Iinclude/media -Iinclude/webrtc $(DEP_CFLAGS) \
 	      tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES) -o $@ \
-	      $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2 -lpthread -lm
+	      $(DEP_LDFLAGS) -lsrtp2 -lssl -lcrypto -lpthread -lm
 
 # Every test depends on the flag stamp too: a change of OPT or HAVE_X264
 # must rebuild the tests, otherwise a sanitizer run silently executes a
@@ -277,7 +278,7 @@ $(TEST_BUILD)/test_server_api: tests/test_server_api.c $(BINARY) $(FLAG_STAMP)
 $(TEST_BUILD)/test_lan_stream: tests/test_lan_stream.c $(BINARY) $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) $(DEP_CFLAGS) \
-	      tests/test_lan_stream.c -o $@ $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2
+	      tests/test_lan_stream.c -o $@ $(DEP_LDFLAGS) -lsrtp2 -lssl -lcrypto -lpthread
 
 TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
                  $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_mdns \
