@@ -66,6 +66,10 @@
 #define START_TIMEOUT_MS      8000
 #define STOP_TIMEOUT_MS       8000
 
+#define MDNS_NAME_TEST  "lanstream-test"
+#define MDNS_PORT_TEST  15353
+#define MDNS_QUERY_WAIT_MS 2000
+
 #define STUN_HEADER_SIZE 20
 #define STUN_MAGIC_COOKIE 0x2112A442u
 
@@ -137,10 +141,14 @@ static int write_config(void)
                           "fps = 15\n"
                           "bitrate_kbps = 1200\n"
                           "keyframe_seconds = 1\n"
+                          "mdns = on\n"
+                          "mdns_name = %s\n"
+                          "mdns_port = %d\n"
                           "listen = 127.0.0.1\n"
                           "http_port = %d\n"
                           "udp_port = %d\n"
                           "verbose = 0\n",
+                          MDNS_NAME_TEST, MDNS_PORT_TEST,
                           HTTP_PORT_TEST, UDP_PORT_TEST);
 
     fclose(file);
@@ -233,6 +241,287 @@ static void stop_server(pid_t pid, const char *name)
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
     check(0, name);
+}
+
+/* ------------------------------------------------------------------ */
+/* mDNS                                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Decodes a name from a response. Compression pointers are refused: the
+ * responder publishes a handful of fixed records and never needs them,
+ * so a pointer here would be a bug in the server, not in this decoder.
+ */
+static int mdns_read_name(const uint8_t *packet,
+                          size_t length,
+                          size_t offset,
+                          char *out,
+                          size_t out_size,
+                          size_t *next_offset)
+{
+    size_t position = offset;
+    size_t used = 0;
+
+    for (;;) {
+        if (position >= length) {
+            return -1;
+        }
+
+        uint8_t label = packet[position];
+
+        if (label == 0) {
+            out[used] = 0;
+            *next_offset = position + 1;
+            return 0;
+        }
+
+        if ((label & 0xC0) != 0 || label > 63 ||
+            position + 1 + label > length) {
+            return -1;
+        }
+
+        if (used + (used > 0 ? 1 : 0) + label + 1 > out_size) {
+            return -1;
+        }
+
+        if (used > 0) {
+            out[used++] = '.';
+        }
+
+        memcpy(out + used, packet + position + 1, label);
+        used += label;
+        position += 1 + label;
+    }
+}
+
+static size_t mdns_build_query(uint8_t *out,
+                              uint16_t id,
+                              const char *name,
+                              uint16_t qtype)
+{
+    memset(out, 0, 12);
+    out[0] = (uint8_t) (id >> 8);
+    out[1] = (uint8_t) (id & 0xFF);
+    out[5] = 1;                         /* one question */
+
+    size_t offset = 12;
+    const char *label = name;
+
+    while (*label != 0) {
+        const char *dot = strchr(label, '.');
+        size_t label_length = dot != NULL ? (size_t) (dot - label)
+                                          : strlen(label);
+
+        out[offset++] = (uint8_t) label_length;
+        memcpy(out + offset, label, label_length);
+        offset += label_length;
+
+        if (dot == NULL) {
+            break;
+        }
+
+        label = dot + 1;
+    }
+
+    out[offset++] = 0;
+    out[offset++] = (uint8_t) (qtype >> 8);
+    out[offset++] = (uint8_t) (qtype & 0xFF);
+    out[offset++] = 0;
+    out[offset++] = 1;                  /* class IN */
+
+    return offset;
+}
+
+/*
+ * Sends one query and waits for the answer. A query from an ephemeral
+ * port is a legacy unicast resolver, which is the only way to ask
+ * without joining the multicast group: the answer carries the query ID
+ * and comes straight back to this socket.
+ */
+static int mdns_query(uint16_t id,
+                      const char *name,
+                      uint16_t qtype,
+                      uint8_t *answer,
+                      size_t answer_size,
+                      size_t *answer_length)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct timeval timeout;
+
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in server;
+
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(MDNS_PORT_TEST);
+    inet_pton(AF_INET, "127.0.0.1", &server.sin_addr);
+
+    uint8_t query[256];
+    size_t query_length = mdns_build_query(query, id, name, qtype);
+
+    /*
+     * A responder that is still probing its name does not answer yet
+     * (RFC 6762 section 8.1), so the query is repeated the way a resolver
+     * repeats it instead of assuming the first one lands.
+     */
+    uint64_t deadline = now_ms() + MDNS_QUERY_WAIT_MS;
+    uint64_t next_send = now_ms();
+    ssize_t received = -1;
+
+    while (now_ms() < deadline) {
+        if (now_ms() >= next_send) {
+            if (sendto(fd, query, query_length, 0, (struct sockaddr *) &server,
+                       sizeof(server)) < 0) {
+                break;
+            }
+
+            next_send = now_ms() + 500;
+        }
+
+        received = recv(fd, answer, answer_size, 0);
+
+        if (received > 0) {
+            break;
+        }
+    }
+
+    close(fd);
+
+    if (received < 12) {
+        return -1;
+    }
+
+    *answer_length = (size_t) received;
+
+    return 0;
+}
+
+static void check_mdns(void)
+{
+    uint8_t answer[MAX_PACKET];
+    size_t length = 0;
+    char question[160];
+
+    snprintf(question, sizeof(question), "%s.local", MDNS_NAME_TEST);
+
+    if (mdns_query(0x5A5A, question, 1, answer, sizeof(answer), &length) != 0) {
+        check(0, "mDNS: the server answers a query for its name");
+        return;
+    }
+
+    check(answer[0] == 0x5A && answer[1] == 0x5A,
+          "mDNS: the transaction ID is echoed to the resolver");
+    check((answer[2] & 0x80) != 0, "mDNS: the reply has the response bit set");
+    check((answer[3] & 0x0F) == 0, "mDNS: the reply carries no error code");
+
+    uint16_t records = (uint16_t) ((answer[6] << 8) | answer[7]);
+    size_t offset = 12;
+    int have_address = 0;
+
+    for (uint16_t i = 0; i < records; i++) {
+        char name[160];
+        size_t next = 0;
+
+        if (mdns_read_name(answer, length, offset, name, sizeof(name),
+                           &next) != 0 || next + 10 > length) {
+            break;
+        }
+
+        uint16_t type = (uint16_t) ((answer[next] << 8) | answer[next + 1]);
+        uint16_t rdata_length = (uint16_t) ((answer[next + 8] << 8) |
+                                            answer[next + 9]);
+        size_t rdata = next + 10;
+
+        if (rdata + rdata_length > length) {
+            break;
+        }
+
+        if (type == 1 && strcmp(name, question) == 0 && rdata_length == 4) {
+            char text[INET_ADDRSTRLEN] = "";
+            struct in_addr address;
+
+            memcpy(&address, answer + rdata, 4);
+            inet_ntop(AF_INET, &address, text, sizeof(text));
+
+            have_address = 1;
+            note("mDNS: %s resolves to %s", question, text);
+        }
+
+        offset = rdata + rdata_length;
+    }
+
+    check(have_address, "mDNS: the name resolves to a local address");
+
+    /*
+     * A DNS-SD client resolves the service instance next, which is where
+     * the HTTP port is published.
+     */
+    char service[160];
+
+    snprintf(service, sizeof(service), "%s._http._tcp.local", MDNS_NAME_TEST);
+
+    if (mdns_query(0x5B5B, service, 255, answer, sizeof(answer),
+                   &length) != 0) {
+        check(0, "mDNS: the service instance is answered");
+        return;
+    }
+
+    records = (uint16_t) ((answer[6] << 8) | answer[7]);
+    offset = 12;
+
+    int have_port = 0;
+    int have_model = 0;
+
+    for (uint16_t i = 0; i < records; i++) {
+        char name[160];
+        size_t next = 0;
+
+        if (mdns_read_name(answer, length, offset, name, sizeof(name),
+                           &next) != 0 || next + 10 > length) {
+            break;
+        }
+
+        uint16_t type = (uint16_t) ((answer[next] << 8) | answer[next + 1]);
+        uint16_t rdata_length = (uint16_t) ((answer[next + 8] << 8) |
+                                            answer[next + 9]);
+        size_t rdata = next + 10;
+
+        if (rdata + rdata_length > length) {
+            break;
+        }
+
+        if (type == 33 && rdata_length >= 6) {
+            uint16_t port = (uint16_t) ((answer[rdata + 4] << 8) |
+                                        answer[rdata + 5]);
+
+            have_port = port == HTTP_PORT_TEST;
+        }
+
+        if (type == 16 && rdata_length >= 1) {
+            uint8_t entry = answer[rdata];
+            char text[201];
+
+            if (entry > 0 && (size_t) entry + 1 <= rdata_length &&
+                (size_t) entry < sizeof(text)) {
+                memcpy(text, answer + rdata + 1, entry);
+                text[entry] = 0;
+                have_model = strstr(text, "model=") != NULL;
+            }
+        }
+
+        offset = rdata + rdata_length;
+    }
+
+    check(have_port, "mDNS: the SRV record advertises the HTTP port");
+    check(have_model, "mDNS: the TXT record describes the service");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1288,6 +1577,8 @@ int main(int argc, char **argv)
         stop_server(pid, "SIGTERM ends the server");
         return 1;
     }
+
+    check_mdns();
 
     /*
      * Without an encoder the handshake can still be verified but no

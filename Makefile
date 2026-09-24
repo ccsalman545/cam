@@ -141,7 +141,7 @@ DEP_LIBS += -lm
 
 # Sources -------------------------------------------------------------------
 
-APP_INCLUDE_DIRS := include include/app include/media include/webrtc \
+APP_INCLUDE_DIRS := include include/app include/media include/net include/webrtc \
                     $(BUILD)/generated
 APP_INCLUDES     := $(addprefix -I,$(APP_INCLUDE_DIRS)) \
                     -isystem third_party/mongoose $(DEP_CFLAGS)
@@ -240,6 +240,14 @@ $(TEST_BUILD)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c \
 	      -Iinclude/app tests/test_csi_source.c src/media/csi_source.c \
 	      src/media/test_source.c src/app/log.c -o $@ -lpthread
 
+# The responder is protocol code with no dependency of its own, so the
+# test links it directly with the log module it writes to.
+$(TEST_BUILD)/test_mdns: tests/test_mdns.c src/net/mdns.c src/app/log.c \
+        include/net/mdns.h $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/net \
+	      -Iinclude/app tests/test_mdns.c src/net/mdns.c src/app/log.c -o $@
+
 # The session test needs the whole WebRTC stack: STUN, DTLS, SRTP,
 # RTP packetization, RTCP parsing and SDP answer generation.
 WEBRTC_TEST_SOURCES := src/webrtc/webrtc_session.c src/webrtc/dtls_srtp.c \
@@ -272,13 +280,17 @@ $(TEST_BUILD)/test_lan_stream: tests/test_lan_stream.c $(BINARY) $(FLAG_STAMP)
 	      tests/test_lan_stream.c -o $@ $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2
 
 TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
-                 $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_rtc_session \
+                 $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_mdns \
+                 $(TEST_BUILD)/test_rtc_session \
                  $(TEST_BUILD)/test_server_api $(TEST_BUILD)/test_lan_stream
 
+# argv[1] is the server binary for the black box tests; argv[2] is the
+# configuration file that `make install` ships, which the API test loads to
+# prove a fresh install can start. Tests that need neither ignore them.
 test: $(TEST_BINARIES) $(BINARY)
 	@for test_binary in $(TEST_BINARIES); do \
 	    echo "== $$test_binary"; \
-	    $$test_binary $(BINARY) || exit 1; \
+	    $$test_binary $(BINARY) config/camstream.conf || exit 1; \
 	done
 	@echo "all tests passed"
 

@@ -19,6 +19,7 @@ files, plus the vendored HTTP server.
 - [WebRTC flow](#webrtc-flow)
 - [Camera pipeline](#camera-pipeline)
 - [Networking model](#networking-model)
+- [Automatic LAN connection](#automatic-lan-connection)
 - [Building](#building)
 - [Running](#running)
 - [Configuration](#configuration)
@@ -205,6 +206,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | 8080 | TCP | browser to server | Web page, `/api/*`, WebRTC signaling |
 | 50000 to 50007 | UDP | browser to server | STUN, DTLS, SRTP (one port per session) |
+| 5353 | UDP | both ways | mDNS name and service announcement (multicast 224.0.0.251) |
 
 Outbound traffic from the browser uses an ephemeral UDP port that the
 browser chose; the server learns it from the first valid STUN check and
@@ -217,9 +219,86 @@ qualify. The page is served over plain HTTP, which is fine because the page
 only receives video; `getUserMedia` is not used, so the HTTPS requirement for
 camera capture does not apply.
 
-Finding the Pi's address: `/api/status` lists every non-loopback IPv4 address
-with its interface name, and the startup log prints the same list with the
-URLs to type. `hostname -I` and `ip -4 addr` work too.
+Finding the Pi: the server publishes `camstream.local` over mDNS, so the page
+is at `http://camstream.local:8080/` with no address to look up, from a
+router or over a single cable. The name appears in the startup log, in
+`/api/status` under `mdns.url`, and in the footer of the page itself.
+`/api/status` lists every non-loopback IPv4 address with its interface name
+as the fallback, and the startup log prints those URLs as well; `hostname -I`
+and `ip -4 addr` show them too.
+
+## Automatic LAN connection
+
+Three things make the server reachable without typing an address and
+without touching the page after it loads: the name published over mDNS, the
+page that connects itself, and the unit that starts the server at boot.
+
+Start at boot (see [Deployment](#deployment) for the account and paths):
+
+```sh
+sudo make install
+sudo systemctl daemon-reload
+sudo systemctl enable --now camstream
+systemctl status camstream
+```
+
+The page connects on load. It creates the peer connection, posts the offer
+and starts the video as soon as the first keyframe arrives, which works
+without a click because the video element is muted and there is no audio
+track to play. The Connect button stays for a manual reconnect, and pressing
+Disconnect stops the automatic path until Connect is pressed again. A failed
+attempt is retried five times with a growing delay, then the state stops
+changing and says so.
+
+The name is announced on every non-loopback interface and re-announced when
+an address appears or disappears, so plugging the cable in after boot needs
+no restart. On a normal LAN the router hands out an address and the name
+resolves through it. Between the Pi and one laptop with a single cable there
+is no DHCP server, and both ends fall back to a link-local address in
+169.254.0.0/16, which mDNS carries over the same cable.
+
+Raspberry Pi OS (NetworkManager, Bookworm and later) does the link-local
+fallback on its own, but waits for DHCP first and can withdraw the link-local
+address when DHCP finally reports a failure. Pinning both makes it
+immediate and stable:
+
+```sh
+nmcli con show                              # find the wired profile name
+sudo nmcli con mod "Wired connection 1" ipv4.method auto \
+     ipv4.link-local enabled ipv4.dhcp-timeout infinity
+sudo nmcli con up "Wired connection 1"
+ip -4 addr show dev eth0                    # expect a 169.254.x.x and DHCP address
+```
+
+`ipv4.link-local enabled` needs NetworkManager 1.40 or newer, and
+`ipv4.link-local fallback`, which keeps the link-local address only when DHCP
+fails, needs 1.52. On older images (dhcpcd) the fallback is built in and
+needs no configuration. Windows and macOS clients configured for DHCP assign
+themselves a 169.254.x.x address the same way, so nothing has to be set on
+the laptop side.
+
+Which clients resolve `.local`:
+
+| Client | Resolution |
+| --- | --- |
+| macOS, iOS | Built in |
+| Windows 10 1809 and later, Windows 11 | Built in |
+| Linux with `systemd-resolved` | Enable with `resolvectl mdns eth0 yes` |
+| Linux with avahi | Install `avahi-daemon` and `libnss-mdns` |
+| Android 12 and later | Built in; older versions need the IP address |
+
+If a client cannot resolve the name, the addresses printed at startup and
+listed by `/api/status` work unchanged; the name is a convenience, not a
+dependency.
+
+Two cameras on one LAN must not share a name. The default is `camstream`,
+and the responder probes before it claims the name, takes `camstream-2` and
+up to `camstream-10` when it is taken, and logs a warning each time. Set
+`mdns_name` explicitly when you run more than one:
+
+```sh
+camstream --config /etc/camstream.conf --mdns-name porch
+```
 
 ## Building
 
@@ -356,6 +435,9 @@ keyframe_seconds = 2
 listen = 0.0.0.0
 http_port = 8080
 udp_port = 50000
+mdns = on
+mdns_name = camstream
+mdns_port = 5353
 verbose = 0
 ```
 
@@ -368,7 +450,14 @@ without interrupting the stream:
 - applied live: `bitrate_kbps` (queued to the encode thread, which owns
   the encoder handle and applies it before its next frame)
 - reported under `restart_required`: everything else that changed
-  (`source`, `device`, `width`, `height`, `fps`, `encoder`, ports, `listen`)
+  (`source`, `device`, `width`, `height`, `fps`, `encoder`, ports, `listen`,
+  `mdns`, `mdns_name`, `mdns_port`)
+
+`mdns_name` is the single label published as `<name>.local`; letters, digits
+and `-` only. `mdns_port` is the responder's UDP port and only needs changing
+when something else on the same host must not see these packets, for example
+a test run. Turning the responder off (`mdns = off`, or `--mdns-name ""` for
+one run) removes the name but leaves the HTTP interface untouched.
 
 The response lists exactly which keys were applied and which need a restart.
 A viewer is never dropped by a reload. If the file has an error, the reload
@@ -437,7 +526,14 @@ The page shows the video, the connection state, camera and encoder state
 (codec, resolution, capture and encode FPS, bitrate), transport counters
 (packets, bytes, retransmissions, NACKs, PLIs, send errors, RTT, loss),
 CPU and memory, and the server log with a level filter. Buttons cover
-Connect/Disconnect, camera restart, WebRTC restart and config reload.
+Connect/Disconnect, camera restart, WebRTC restart and config reload. The
+footer repeats the addresses, the UDP media range, the HTTP port and the
+published `mdns.url`.
+
+Opening the page is enough to see video: it connects on load and retries five
+times with a growing delay when the server or the camera is not ready yet.
+Disconnect stops the automatic retries, Connect starts them again. See
+[Automatic LAN connection](#automatic-lan-connection).
 
 It uses `RTCPeerConnection` with `iceServers: []` (no STUN, no TURN),
 `fetch()` for the API, and no third-party library, framework, bundler or
@@ -569,8 +665,15 @@ connecting. Concretely:
   fingerprint in its offer, or whose handshake negotiated no `use_srtp`
   profile, never receives media.
 - There is no shell, no file API, no `system()` call, and no dynamic code
-  loading. All external input (HTTP requests, SDP, STUN, RTP, RTCP) is parsed
-  with explicit length checks and bounded buffers.
+  loading. All external input (HTTP requests, SDP, STUN, RTP, RTCP, mDNS
+  packets) is parsed with explicit length checks and bounded buffers. The
+  mDNS parser walks at most eight questions and sixty-four records per
+  packet, refuses name compression loops, and never follows a pointer
+  outside the packet.
+- mDNS is unauthenticated by design: any host on the LAN can claim the
+  published name, and nothing here detects or repairs that beyond renaming
+  this responder. It publishes the same addresses `/api/status` already
+  lists, so it reveals nothing that a scan of the LAN would not.
 
 If the server must be reachable from an untrusted network, put it behind a
 VPN or an SSH tunnel, or front it with a reverse proxy that terminates TLS
@@ -607,6 +710,8 @@ src/
     encoder_v4l2m2m.c     hardware V4L2 M2M backend
     h264_encoder.c        backend selection by preference
     source_worker.c       capture thread with fatal error accounting
+  net/
+    mdns.c                mDNS responder: name, service discovery, conflicts
   webrtc/
     ice_lite.c            STUN parsing, ICE-lite checks, FINGERPRINT
     dtls_srtp.c           DTLS 1.2, certificate, SRTP key export
@@ -624,18 +729,19 @@ tests/                    see below
 make test
 ```
 
-Six test binaries. Five link the real modules directly; `test_lan_stream`
+Seven test binaries. Six link the real modules directly; `test_lan_stream`
 links OpenSSL and libsrtp2 only, because it acts as the browser and drives the
-built `camstream` binary over HTTP and UDP:
+built `camstream` binary over HTTP, UDP and multicast DNS:
 
 | Test | Covers |
 | --- | --- |
 | `test_stun` | STUN message parsing, MESSAGE-INTEGRITY verification, XOR-MAPPED-ADDRESS, fingerprints, RFC 5769 vectors, malformed input |
 | `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling, queued bitrate change applied by the encode thread |
 | `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
+| `test_mdns` | The responder against packets built by hand: probe and announcement timing, A record address, TTL and cache-flush flags, service discovery PTR, SRV port and TXT strings, legacy unicast replies with an echoed transaction ID and a clamped TTL, known answer suppression, seven malformed packets, name conflict rename with its rate limit, giving up when every suffix is taken, and the goodbye packet |
 | `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout, and a peer that never offers `use_srtp` being refused with the failure counted |
-| `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |
-| `test_lan_stream` | The real binary driven the way a browser drives it: the server is started with a test config, ICE check answered with a verified MESSAGE-INTEGRITY, DTLS 1.2 handshake with the certificate matching the answer's fingerprint, SRTP key export and decrypt, access units reassembled from single NAL and FU-A packets, a keyframe for a viewer that joins late, SRTCP Sender Reports, viewer close, a second viewer streaming without a restart, and SIGTERM exiting with status 0 |
+| `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, and a start from the configuration file `make install` ships, which catches a bad value in that file. Ends with a clean SIGTERM shutdown |
+| `test_lan_stream` | The real binary driven the way a browser drives it: the server is started with a test config, its mDNS name resolved through a real query, ICE check answered with a verified MESSAGE-INTEGRITY, DTLS 1.2 handshake with the certificate matching the answer's fingerprint, SRTP key export and decrypt, access units reassembled from single NAL and FU-A packets, a keyframe for a viewer that joins late, SRTCP Sender Reports, viewer close, a second viewer streaming without a restart, and SIGTERM exiting with status 0 |
 
 Test quality rules followed here: a test only passes if the module under test
 produced the observed output, no test asserts on a reimplementation of the
@@ -645,6 +751,30 @@ test through the API instead of being faked.
 
 Not covered: a real camera, a real hardware encoder, real browsers, and
 long-run stability beyond the process lifetime of a test.
+
+Not covered automatically either: the address that appears *after* the server
+started, which is the case the mDNS responder exists for. It needs an
+interface to change, so it is checked by hand in a network namespace, where
+anything can be plugged in without touching the machine:
+
+```sh
+unshare -rn sh -c '
+  ip link set lo up
+  /path/to/camstream --test --http-port 18996 --mdns-name camstream \
+      --mdns-port 15353 --udp-port 60996 2>&1 | grep -E "mdns|mDNS" &
+  sleep 2
+  ip link add veth0 type veth peer name veth1     # the cable goes in
+  ip link set veth0 up
+  ip addr add 192.0.2.55/24 dev veth0
+  sleep 3
+  kill %1'
+```
+
+Expected: a warning that there is no address yet, then
+`camstream.local is now announced on 1 address(es), first 192.0.2.55`, and any
+mDNS resolver inside that namespace resolving the name to that address. Running
+the query outside the namespace needs the address instead, because the
+namespace has its own loopback.
 
 Memory errors and thread races are checked with the same suite rather than by
 inspection. Both commands were run against this tree and passed with no
@@ -693,7 +823,10 @@ sudo systemctl daemon-reload
 
 Then edit `/etc/camstream.conf` for your camera and geometry, and confirm the
 unit's `ExecStart` path matches where `make install` put the binary when you
-override `PREFIX`.
+override `PREFIX`. The installed configuration already has the mDNS responder
+on, so the page answers at `http://camstream.local:8080/` right after the
+first boot with no further setup; see
+[Automatic LAN connection](#automatic-lan-connection).
 
 To update, rebuild and `sudo make install`, then `sudo systemctl restart
 camstream`.
@@ -708,7 +841,10 @@ camstream`.
 | Page loads, Connect stays on `connecting` | Firewall blocks UDP in the media range; check the browser console and `/api/logs` |
 | `ICE failed` in the page and `stun_rejected` climbing in stats | The offer was regenerated by a stale page; press Connect again, then `POST /api/webrtc/restart` |
 | Black video, counters climbing | Encoder issue: `/api/status` `encoder.status`, `media.skipped_mismatch`, `/api/logs` |
-| Frozen after Wi-Fi drop | The 30 s DTLS watchdog closes the session; the page retries once automatically, otherwise press Connect |
+| Frozen after Wi-Fi drop | The 30 s DTLS watchdog closes the session; the page retries five times automatically, otherwise press Connect |
+| `camstream.local` does not resolve | Client without mDNS (table in [Automatic LAN connection](#automatic-lan-connection)); use the addresses from `/api/status`. On Linux check `resolvectl query camstream.local` |
+| The name resolves to the wrong address, or `mdns: name conflict` in the log | Another host claims the name; the log names the suffix it moved to, or set `mdns_name` |
+| `mdns: responder unavailable: bind to 0.0.0.0:5353 failed` | Another responder owns the port and refuses to share it; the server keeps serving by address |
 | `OpenSSL headers not found` from `make` | Install `libssl-dev` or pass `DEPS_PREFIX` |
 | `libsrtp2 headers not found` from `make` | Install `libsrtp2-dev`; a source build needs `--enable-openssl` |
 | High CPU with no viewer | Expected only in `stdin`/`test` capture; a real camera using the hardware encoder idles near zero |
@@ -739,7 +875,12 @@ without `--verbose`, because the ring keeps all levels.
   restart; `/api/config/reload` only re-applies the bitrate.
 - No recording, no snapshot endpoint, no RTSP or HLS.
 - No authentication on the HTTP interface by design; see
-  [Security model](#security-model).
+  [Security model](#security-model). The mDNS name is unauthenticated too:
+  any host on the LAN can claim it, and a hostile host can therefore take
+  `camstream.local` or answer with its own address. The name is a convenience
+  for a trusted LAN, the addresses in `/api/status` are the ground truth.
+- mDNS publishes IPv4 addresses only, so an IPv6-only network needs the
+  address instead of the name.
 - The retransmission cache covers 512 packets and the access-unit ring 8
   slots; a viewer that stops reading faster than the encoder produces will
   lose quality rather than apply backpressure, which keeps latency bounded

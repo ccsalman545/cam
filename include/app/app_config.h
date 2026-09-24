@@ -33,6 +33,7 @@ typedef struct {
     char device[256];           /* V4L2 device path */
     char rpicam_bin[256];       /* empty means autodetect */
     char listen[64];            /* HTTP bind address */
+    char mdns_name[64];         /* mDNS label: camstream -> camstream.local */
     char encoder[64];           /* auto | hw | hw:/dev/videoN | sw */
     char config_path[256];      /* empty means "no config file" */
 
@@ -44,7 +45,9 @@ typedef struct {
 
     uint16_t http_port;
     uint16_t udp_base_port;     /* first of MAX_SESSIONS consecutive ports */
+    uint16_t mdns_port;         /* mDNS responder port, 5353 unless overridden */
 
+    int mdns;                   /* 1 = answer mDNS queries for mdns_name.local */
     int verbose;                /* 1 = log DEBUG */
 } AppConfig;
 

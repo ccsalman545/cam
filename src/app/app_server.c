@@ -46,6 +46,7 @@
 #include "frame_hub.h"
 #include "h264_encoder.h"
 #include "log.h"
+#include "mdns.h"
 #include "source_worker.h"
 #include "sysinfo.h"
 #include "video_source.h"
@@ -87,6 +88,13 @@ typedef struct {
     atomic_int force_idr;
     atomic_int media_active;        /* encoder actively producing */
     int pipeline_running;
+
+    /*
+     * mDNS responder, NULL when it is off or could not be created. It
+     * only publishes a name; the HTTP listener above is what serves the
+     * page, so a missing responder degrades to "type the address".
+     */
+    MdnsResponder *mdns;
 
     RtcSession *sessions[MAX_RTC_SESSIONS];
     uint64_t sessions_total;
@@ -1143,6 +1151,44 @@ static void handle_status(Server *server,
              (unsigned long long) dtls_stats.handshake_failures,
              server->config.udp_base_port);
 
+    json_raw(&writer, ",\"mdns\":{\"enabled\":%s,\"name\":",
+             server->mdns != NULL ? "true" : "false");
+
+    if (server->mdns != NULL) {
+        MdnsStats mdns_stats;
+
+        mdns_responder_get_stats(server->mdns, &mdns_stats);
+
+        json_string(&writer, mdns_stats.name);
+        json_raw(&writer, ",\"port\":%u,\"url\":",
+                 (unsigned) server->config.mdns_port);
+        char mdns_url[MDNS_NAME_MAX + 16];
+
+        snprintf(mdns_url, sizeof(mdns_url), "http://%s:%u/",
+                 mdns_stats.name, server->config.http_port);
+        json_string(&writer, mdns_url);
+        json_raw(&writer, ",\"addresses\":[");
+        for (size_t i = 0; i < mdns_stats.address_count; i++) {
+            json_raw(&writer, "%s", i ? "," : "");
+            json_string(&writer, mdns_stats.addresses[i]);
+        }
+        json_raw(&writer, "],\"queries\":%llu,\"responses\":%llu,"
+                          "\"announcements\":%llu,\"conflicts\":%llu,"
+                          "\"parse_errors\":%llu,\"socket_errors\":%llu,"
+                          "\"renamed\":%s,\"disabled\":%s}",
+                 (unsigned long long) mdns_stats.queries,
+                 (unsigned long long) mdns_stats.responses,
+                 (unsigned long long) mdns_stats.announcements,
+                 (unsigned long long) mdns_stats.conflicts,
+                 (unsigned long long) mdns_stats.parse_errors,
+                 (unsigned long long) mdns_stats.socket_errors,
+                 mdns_stats.renamed ? "true" : "false",
+                 mdns_stats.disabled ? "true" : "false");
+    } else {
+        json_raw(&writer, "null,\"port\":%u}",
+                 (unsigned) server->config.mdns_port);
+    }
+
     json_raw(&writer, ",\"media\":{\"bitrate_kbps\":%.1f,\"capture_fps\":%.1f,"
                       "\"encode_fps\":%.1f,\"frames_seen\":%llu,"
                       "\"frames_encoded\":%llu,\"au_dropped\":%llu,"
@@ -1617,7 +1663,11 @@ static void apply_runtime_config(Server *server,
         { "listen", strcmp(candidate->listen, server->config.listen) != 0 },
         { "http_port", candidate->http_port != server->config.http_port },
         { "udp_port",
-          candidate->udp_base_port != server->config.udp_base_port }
+          candidate->udp_base_port != server->config.udp_base_port },
+        { "mdns", candidate->mdns != server->config.mdns },
+        { "mdns_name",
+          strcmp(candidate->mdns_name, server->config.mdns_name) != 0 },
+        { "mdns_port", candidate->mdns_port != server->config.mdns_port }
     };
 
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -2062,6 +2112,37 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
              server->config.http_port, server->config.udp_base_port,
              server->config.udp_base_port + MAX_RTC_SESSIONS - 1);
 
+    if (server->config.mdns) {
+        MdnsConfig mdns_config;
+
+        memset(&mdns_config, 0, sizeof(mdns_config));
+        snprintf(mdns_config.host, sizeof(mdns_config.host), "%s",
+                 server->config.mdns_name);
+        snprintf(mdns_config.model, sizeof(mdns_config.model), "camstream %s",
+                 APP_VERSION);
+        mdns_config.port = server->config.mdns_port;
+        mdns_config.http_port = server->config.http_port;
+
+        char mdns_error[192] = "";
+
+        server->mdns = mdns_responder_create(&mdns_config, mdns_error,
+                                             sizeof(mdns_error));
+
+        if (server->mdns != NULL) {
+            log_info("app", "mDNS: http://%s.local:%u/ (no address needed on "
+                            "the same LAN)",
+                     server->config.mdns_name, server->config.http_port);
+        } else {
+            /*
+             * Not fatal: the web UI, signaling and the media path do not
+             * depend on name resolution. The operator still has the
+             * addresses printed above.
+             */
+            log_warn("mdns", "responder unavailable: %s; use an address from "
+                             "the list above", mdns_error);
+        }
+    }
+
     while (!*stop_flag) {
         poll_sessions(server);
 
@@ -2074,6 +2155,16 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
         mg_mgr_poll(&server->mgr, 0);
 
         uint64_t now = now_ms();
+
+        /*
+         * mDNS is served from this loop as well: the responder needs a
+         * wakeup for probes, announcements and pending replies, and the
+         * loop already runs at least every 100 ms while idle.
+         */
+        if (server->mdns != NULL) {
+            mdns_readable(server->mdns, now);
+            mdns_service(server->mdns, now);
+        }
 
         for (size_t i = 0; i < MAX_RTC_SESSIONS; i++) {
             if (server->sessions[i] != NULL) {
@@ -2090,6 +2181,10 @@ int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag)
     }
 
     log_info("app", "shutting down");
+
+    /* Sends the goodbye packets that drop the name from resolver caches. */
+    mdns_responder_destroy(server->mdns);
+    server->mdns = NULL;
 
     sessions_close_all(server);
 

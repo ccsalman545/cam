@@ -99,6 +99,35 @@ static void check(int condition, const char *what)
     }
 }
 
+/*
+ * The counters are updated one at a time as the worker progresses: a frame
+ * is counted as seen when it is taken from the hub and lands in exactly one
+ * of encoded, skipped_idle, skipped_mismatch, skipped_bad_size or
+ * no_output when that frame is done. A snapshot taken in between shows one
+ * frame unaccounted for, so the identity is retried instead of sampled
+ * once. Failure to ever reach it is a real accounting bug.
+ */
+static int wait_for_accounting(EncoderWorker *worker, EncoderWorkerStats *out)
+{
+    for (int attempt = 0; attempt < 200; attempt++) {
+        encoder_worker_get_stats(worker, out);
+
+        uint64_t accounted = out->frames_encoded + out->skipped_idle +
+                             out->skipped_mismatch + out->skipped_bad_size +
+                             out->no_output;
+
+        if (accounted == out->frames_seen) {
+            return 0;
+        }
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+
+        nanosleep(&ts, NULL);
+    }
+
+    return -1;
+}
+
 static void wait_for_frames(EncoderWorker *worker, uint64_t target_seen)
 {
     for (int i = 0; i < 2000; i++) {
@@ -180,12 +209,15 @@ int main(void)
     }
     wait_for_frames(worker, seen_before + 30);
 
-    encoder_worker_get_stats(worker, &stats);
+    check(wait_for_accounting(worker, &stats) == 0,
+          "every frame is accounted for exactly once");
     check(stats.frames_encoded > 0, "active window encodes frames");
-    check(stats.frames_encoded == stats.frames_seen - stats.skipped_idle -
-                                   stats.skipped_mismatch -
-                                   stats.skipped_bad_size,
-          "drop accounting is exact");
+    printf("     active window: seen=%llu encoded=%llu idle=%llu "
+           "no-output=%llu\n",
+           (unsigned long long) stats.frames_seen,
+           (unsigned long long) stats.frames_encoded,
+           (unsigned long long) stats.skipped_idle,
+           (unsigned long long) stats.no_output);
     check(stats.skipped_mismatch == 0, "no mismatch when sizes agree");
 
     /*

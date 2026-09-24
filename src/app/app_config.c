@@ -34,6 +34,15 @@ void app_config_defaults(AppConfig *config)
     config->http_port = 8080;
     config->udp_base_port = 50000;
 
+    /*
+     * The name is what makes the server reachable without looking up an
+     * address, so it is on by default and the operator only has to
+     * change it when two cameras share one LAN.
+     */
+    config->mdns = 1;
+    config->mdns_port = 5353;
+    snprintf(config->mdns_name, sizeof(config->mdns_name), "camstream");
+
     config->verbose = 0;
 }
 
@@ -127,6 +136,27 @@ static int app_config_set_key(AppConfig *config,
         return copy_string(config->encoder, sizeof(config->encoder), value);
     }
 
+    if (strcmp(key, "mdns_name") == 0) {
+        if (value[0] == 0) {
+            /*
+             * --mdns-name "" is the shortest way to turn the responder
+             * off for one run; the config file uses "mdns = off".
+             */
+            config->mdns = 0;
+            return 0;
+        }
+        return copy_string(config->mdns_name, sizeof(config->mdns_name), value);
+    }
+
+    if (strcmp(key, "mdns_port") == 0) {
+        if (parse_unsigned(value, &number) != 0 || number == 0 ||
+            number > 65535) {
+            return -1;
+        }
+        config->mdns_port = (uint16_t) number;
+        return 0;
+    }
+
     if (strcmp(key, "width") == 0) {
         return parse_unsigned(value, &config->width) == 0 ? 0 : -1;
     }
@@ -163,6 +193,20 @@ static int app_config_set_key(AppConfig *config,
         }
         config->udp_base_port = (uint16_t) number;
         return 0;
+    }
+
+    if (strcmp(key, "mdns") == 0) {
+        if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "on") == 0) {
+            config->mdns = 1;
+            return 0;
+        }
+        if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "off") == 0) {
+            config->mdns = 0;
+            return 0;
+        }
+        return -1;
     }
 
     if (strcmp(key, "verbose") == 0) {
@@ -388,6 +432,7 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
             { "l", "listen",           "listen" },
             { "p", "http-port",        "http_port" },
             { "u", "udp-port",         "udp_port" },
+            { "n", "mdns-name",        "mdns_name" },
             { "e", "encoder",          "encoder" },
             { "b", "bitrate",          "bitrate_kbps" },
             { "K", "keyframe",         "keyframe_seconds" },
@@ -499,6 +544,41 @@ int app_config_validate(const AppConfig *config, char *error, size_t error_size)
         return -1;
     }
 
+    if (config->mdns) {
+        size_t length = strlen(config->mdns_name);
+
+        if (length == 0 || length > 63) {
+            snprintf(error, error_size,
+                     "config: mdns_name must be 1 to 63 characters, got %zu",
+                     length);
+            return -1;
+        }
+
+        if (config->mdns_name[0] == '-' ||
+            config->mdns_name[length - 1] == '-') {
+            snprintf(error, error_size,
+                     "config: mdns_name must not start or end with '-', "
+                     "got '%s'", config->mdns_name);
+            return -1;
+        }
+
+        for (size_t i = 0; i < length; i++) {
+            char c = config->mdns_name[i];
+
+            int valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-';
+
+            if (!valid) {
+                /* Letters, digits and '-' only: a dot would publish a
+                 * different name and a space breaks DNS label rules. */
+                snprintf(error, error_size,
+                         "config: mdns_name may only contain letters, digits "
+                         "and '-', got '%s'", config->mdns_name);
+                return -1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -534,6 +614,9 @@ void app_config_print_usage(const char *program)
         "                         signaling (default 8080)\n"
         "  -u, --udp-port N       first UDP media port (default 50000, one\n"
         "                         port per viewer)\n"
+        "  -n, --mdns-name NAME   publish NAME.local over mDNS so a browser\n"
+        "                         needs no IP address (default camstream);\n"
+        "                         an empty NAME turns the responder off\n"
         "\n"
         "General:\n"
         "      --config PATH      read settings from a config file; command\n"
@@ -544,7 +627,7 @@ void app_config_print_usage(const char *program)
         "\n"
         "Config file keys: source, device, rpicam_bin, width, height, fps,\n"
         "encoder, bitrate_kbps, keyframe_seconds, listen, http_port,\n"
-        "udp_port, verbose.\n"
+        "udp_port, mdns, mdns_name, mdns_port, verbose.\n"
         "\n"
         "Examples:\n"
         "  %s --test --encoder sw                 pipeline check, no camera\n"
@@ -580,6 +663,8 @@ void app_config_print_summary(const AppConfig *config)
              config->listen, config->http_port);
     log_info("app", "udp media  : one port per viewer from %u",
              config->udp_base_port);
+    log_info("app", "mdns       : %s",
+             config->mdns ? config->mdns_name : "off");
 
     if (config->config_path[0] != 0) {
         log_info("app", "config file: %s", config->config_path);

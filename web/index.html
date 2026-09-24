@@ -156,6 +156,7 @@
   Interfaces: <span id="interfaces">-</span>.
   Media flows over UDP ports <span id="udp-range">-</span>, signaling and these
   panels over HTTP port <span id="http-port">-</span>.
+  Name for other devices: <span id="mdns-name">-</span>.
   The server must be on the same LAN as this browser: no STUN, no TURN, no relay.
 </footer>
 
@@ -167,8 +168,14 @@ var state = {
   sessionId: null,
   connecting: false,
   retried: false,
-  lastStats: null
+  lastStats: null,
+  /* Auto connect on load, and how many attempts are left. A manual
+     disconnect stops it; a successful stream resets it. */
+  autoConnect: true,
+  autoRetries: 0
 };
+
+var AUTO_RETRY_LIMIT = 5;
 
 var el = function (id) { return document.getElementById(id); };
 
@@ -221,6 +228,7 @@ function connect() {
   state.retried = false;
   setState("connecting", "warn");
   el("connect").disabled = true;
+  el("placeholder").textContent = "connecting...";
 
   var pc = new RTCPeerConnection({ iceServers: [] });
 
@@ -231,8 +239,17 @@ function connect() {
   pc.ontrack = function (event) {
     el("video").srcObject = event.streams[0];
     el("placeholder").style.display = "none";
-    el("video").play().catch(function () {});
+    /*
+     * The video element is muted, which is what browsers require before
+     * they allow a stream to start without a click. If a policy still
+     * refuses, the stream is running and only playback needs a gesture,
+     * so say that instead of showing a stalled picture.
+     */
+    el("video").play().catch(function () {
+      setState("stream ready, press Connect to start playback", "warn");
+    });
     el("disconnect").disabled = false;
+    state.autoRetries = 0;
     setState("streaming", "ok");
   };
 
@@ -262,7 +279,7 @@ function connect() {
     .catch(function (error) {
       state.connecting = false;
       setState("signaling failed: " + error.message, "bad");
-      teardown(0);
+      teardown(1000);
     });
 }
 
@@ -290,11 +307,19 @@ function teardown(delayMs) {
     postJson("/api/webrtc/close", { session_id: sessionId }).catch(function () {});
   }
 
-  /* One automatic retry covers a camera or network blip; afterwards the
-     operator decides when to reconnect. */
+  /*
+   * One automatic retry covers a camera or network blip. After that the
+   * retries are bounded so a server that stays down is not hammered,
+   * and the operator decides when to try again.
+   */
   if (delayMs && !state.retried) {
     state.retried = true;
     window.setTimeout(connect, delayMs);
+  } else if (state.autoConnect && state.autoRetries < AUTO_RETRY_LIMIT) {
+    state.autoRetries++;
+    setState("reconnecting (" + state.autoRetries + "/" + AUTO_RETRY_LIMIT +
+             ")", "warn");
+    window.setTimeout(connect, Math.min(1000 * state.autoRetries, 5000));
   }
 }
 
@@ -341,6 +366,11 @@ function refreshStatus() {
     }).join(", ") || "none";
 
     el("http-port").textContent = status.http.port;
+
+    var mdns = status.mdns || {};
+
+    el("mdns-name").textContent =
+      mdns.enabled && mdns.url ? mdns.url : "off";
     el("udp-range").textContent = status.webrtc.udp_base_port + " to " +
       (status.webrtc.udp_base_port + status.webrtc.sessions_max - 1);
 
@@ -404,13 +434,24 @@ function reportError(error) {
 
 /* --- controls ------------------------------------------------------ */
 
-el("connect").addEventListener("click", connect);
-el("disconnect").addEventListener("click", function () { teardown(0); });
+el("connect").addEventListener("click", function () {
+  state.autoConnect = true;
+  state.autoRetries = 0;
+  connect();
+});
+
+el("disconnect").addEventListener("click", function () {
+  state.autoConnect = false;
+  teardown(0);
+});
 el("log-level").addEventListener("change", refreshLogs);
 
 el("restart-camera").addEventListener("click", function () {
   postJson("/api/camera/restart").then(function (data) {
     setState("camera restarted: " + data.encoder, "ok");
+    if (state.autoConnect && !state.pc) {
+      connect();
+    }
   }).catch(reportError);
 });
 
@@ -433,6 +474,18 @@ el("reload-config").addEventListener("click", function () {
 });
 
 window.addEventListener("pagehide", function () { teardown(0); });
+
+/*
+ * A page that is opened is a page that wants video: connecting on load
+ * is what makes "plug in the cable, open the address" a single step.
+ * The connect is skipped for a page loaded from the file system, where
+ * /api/ callbacks would fail anyway.
+ */
+if (location.protocol === "http:" || location.protocol === "https:") {
+  connect();
+} else {
+  setState("open this page from the server address");
+}
 
 refreshStatus();
 refreshStats();

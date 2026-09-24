@@ -38,9 +38,12 @@
 #define HTTP_PORT_TEST   18991
 #define HTTP_PORT_NO_CAM 18992
 #define HTTP_PORT_MANY   18993
+#define HTTP_PORT_SHIPPED 18994
+#define MDNS_PORT_SHIPPED 15356
 #define UDP_PORT_TEST    60990
 #define UDP_PORT_NO_CAM  60992
 #define UDP_PORT_MANY    60994
+#define UDP_PORT_SHIPPED 60996
 
 #define MAX_VIEWERS_TEST 8
 
@@ -88,6 +91,42 @@ static int write_file(const char *path, const char *text)
     fclose(file);
 
     return ok ? 0 : -1;
+}
+
+static int append_file(const char *path, const char *text)
+{
+    FILE *file = fopen(path, "ab");
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    size_t length = strlen(text);
+    int ok = fwrite(text, 1, length, file) == length;
+
+    fclose(file);
+
+    return ok ? 0 : -1;
+}
+
+static int read_file(const char *path,
+                     char *out,
+                     size_t out_size,
+                     size_t *out_length)
+{
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    size_t length = fread(out, 1, out_size - 1, file);
+
+    fclose(file);
+    out[length] = 0;
+    *out_length = length;
+
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,6 +550,7 @@ static int write_test_config(const char *path, uint16_t http_port,
              "listen = 127.0.0.1\n"
              "http_port = %u\n"
              "udp_port = %u\n"
+             "mdns = off\n"
              "verbose = 0\n",
              bitrate_kbps, (unsigned) http_port, (unsigned) udp_port);
 
@@ -533,7 +573,8 @@ static int write_broken_camera_config(const char *path, uint16_t http_port,
              "bitrate_kbps = 1000\n"
              "listen = 127.0.0.1\n"
              "http_port = %u\n"
-             "udp_port = %u\n",
+             "udp_port = %u\n"
+             "mdns = off\n",
              (unsigned) http_port, (unsigned) udp_port);
 
     return write_file(path, text);
@@ -1028,9 +1069,94 @@ static void test_camera_failure_keeps_http_up(const char *binary)
     stop_server(pid, "SIGTERM ends the failed-camera server cleanly");
 }
 
+/*
+ * The configuration file that `make install` puts in /etc is part of the
+ * shipped product, so it has to load. It is read here unmodified except
+ * for the values that would collide with a test run (ports, capture
+ * source, mDNS), and then the server is started with it: a typo in that
+ * file would have made a fresh install fail to start.
+ */
+static void test_shipped_config(const char *binary, const char *source_path)
+{
+    const char *copy_path = "/tmp/camstream_api_shipped.conf";
+    const char *log_path = "/tmp/camstream_api_shipped.log";
+
+    printf("test_server_api: shipped configuration file\n");
+
+    FILE *source = fopen(source_path, "rb");
+
+    if (source == NULL) {
+        check(0, "the shipped config file is readable");
+        return;
+    }
+
+    char contents[8192];
+    size_t length = fread(contents, 1, sizeof(contents) - 1, source);
+
+    fclose(source);
+    contents[length] = 0;
+
+    check(length > 0, "the shipped config file is not empty");
+
+    char overrides[512];
+
+    snprintf(overrides, sizeof(overrides),
+             "\n# appended by tests/test_server_api.c\n"
+             "source = test\n"
+             "mdns = on\n"
+             "mdns_port = %u\n"
+             "http_port = %u\n"
+             "udp_port = %u\n",
+             (unsigned) MDNS_PORT_SHIPPED, (unsigned) HTTP_PORT_SHIPPED,
+             (unsigned) UDP_PORT_SHIPPED);
+
+    if (write_file(copy_path, contents) != 0 ||
+        append_file(copy_path, overrides) != 0) {
+        check(0, "the shipped config can be copied for the test");
+        return;
+    }
+
+    pid_t pid = spawn_server(binary, copy_path, log_path, HTTP_PORT_SHIPPED);
+
+    check(pid > 0, "the server starts with the shipped config file");
+
+    if (pid <= 0) {
+        return;
+    }
+
+    char body[RESPONSE_MAX];
+    int status = http_call(HTTP_PORT_SHIPPED, "GET", "/api/status", NULL, body,
+                           sizeof(body));
+
+    check(status == 200 && body_has(body, "\"state\""),
+          "the shipped config file yields a serving server");
+
+    /*
+     * The responder configured in the shipped file must show up in the
+     * status payload, which is where the page reads the name it prints.
+     */
+    check(body_has(body, "\"mdns\":{\"enabled\":true") &&
+          body_has(body, "\"url\":\"http://camstream.local:"),
+          "the shipped config enables mDNS and reports the name");
+
+    char log[8192];
+    size_t log_length = 0;
+
+    if (read_file(log_path, log, sizeof(log), &log_length) == 0) {
+        check(strstr(log, "empty key or value") == NULL &&
+              strstr(log, "unknown key") == NULL,
+              "no configuration error in the log");
+    } else {
+        check(0, "the server log of the shipped config run is readable");
+    }
+
+    stop_server(pid, "the shipped config run shuts down cleanly");
+}
+
 int main(int argc, char **argv)
 {
     const char *binary = argc > 1 ? argv[1] : "build/camstream";
+    const char *shipped_config = argc > 2 ? argv[2] : "config/camstream.conf";
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -1045,6 +1171,7 @@ int main(int argc, char **argv)
     test_management_interface(binary);
     test_concurrent_viewers(binary);
     test_camera_failure_keeps_http_up(binary);
+    test_shipped_config(binary, shipped_config);
 
     if (g_failures != 0) {
         printf("test_server_api: %d check(s) failed\n", g_failures);
