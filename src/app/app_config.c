@@ -433,6 +433,8 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
             { "p", "http-port",        "http_port" },
             { "u", "udp-port",         "udp_port" },
             { "n", "mdns-name",        "mdns_name" },
+            { NULL, "mdns",            "mdns" },
+            { NULL, "mdns-port",       "mdns_port" },
             { "e", "encoder",          "encoder" },
             { "b", "bitrate",          "bitrate_kbps" },
             { "K", "keyframe",         "keyframe_seconds" },
@@ -617,6 +619,8 @@ void app_config_print_usage(const char *program)
         "  -n, --mdns-name NAME   publish NAME.local over mDNS so a browser\n"
         "                         needs no IP address (default camstream);\n"
         "                         an empty NAME turns the responder off\n"
+        "      --mdns on|off      answer mDNS queries (default on)\n"
+        "      --mdns-port N      responder UDP port (default 5353)\n"
         "\n"
         "General:\n"
         "      --config PATH      read settings from a config file; command\n"

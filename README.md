@@ -390,8 +390,9 @@ stderr behind the logger.
 ./build/camstream --config /etc/camstream.conf
 ```
 
-Then open `http://<pi-address>:8080/` in a browser on the same LAN and press
-Connect. All options:
+Then open `http://camstream.local:8080/` (or `http://<pi-address>:8080/`) in a
+browser on the same LAN. The page connects itself; see
+[Automatic LAN connection](#automatic-lan-connection). All options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -409,6 +410,9 @@ Connect. All options:
 | `-l, --listen ADDR` | `0.0.0.0` | HTTP bind address |
 | `-p, --http-port N` | 8080 | HTTP port |
 | `-u, --udp-port N` | 50000 | First UDP media port |
+| `-n, --mdns-name NAME` | `camstream` | Published as `NAME.local`; empty value turns the responder off |
+| `--mdns on\|off` | on | Answer mDNS queries |
+| `--mdns-port N` | 5353 | Responder UDP port |
 | `--config PATH` | none | Config file |
 | `-v, --verbose` | off | DEBUG to stderr as well as `/api/logs` |
 | `-h, --help` | | Usage |
