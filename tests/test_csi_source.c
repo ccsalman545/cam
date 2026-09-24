@@ -7,10 +7,8 @@
 #include "video_source.h"
 
 #include <assert.h>
-#include <fcntl.h>
 #include <linux/videodev2.h>
 #include <poll.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

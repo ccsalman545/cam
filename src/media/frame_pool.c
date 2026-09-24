@@ -8,7 +8,6 @@
 #include "frame_pool.h"
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 

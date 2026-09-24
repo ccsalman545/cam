@@ -7,8 +7,6 @@
  * hand control to the server until SIGINT or SIGTERM.
  */
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "app/app_config.h"
