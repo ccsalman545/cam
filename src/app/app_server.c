@@ -376,9 +376,14 @@ static VideoSource *create_source(const AppConfig *config)
         return stdin_source_create(config->width, config->height, config->fps);
 
     case SOURCE_V4L2:
-    default:
-        return v4l2_source_create(config->device, config->width,
-                                  config->height, config->fps);
+    default: {
+        VideoSource *vsrc = v4l2_source_create(config->device, config->width,
+                                               config->height, config->fps);
+        if (vsrc == NULL) {
+            log_warn("capture", "V4L2 source failed on %s. If using a Raspberry Pi CSI camera (e.g. IMX219), switch to '-s csi' or 'source = csi'", config->device);
+        }
+        return vsrc;
+    }
     }
 }
 
@@ -470,6 +475,7 @@ static int media_pipeline_start(Server *server, char *error, size_t error_size)
 
 fail:
     log_error("media", "pipeline start failed: %s", error);
+    media_pipeline_stop(server);
     return -1;
 }
 
@@ -1745,7 +1751,8 @@ static void handle_index(struct mg_connection *connection)
 {
     mg_http_reply(connection, 200,
                   "Content-Type: text/html; charset=utf-8\r\n"
-                  "Cache-Control: no-store\r\n",
+                  "Cache-Control: no-store\r\n"
+                  "Connection: close\r\n",
                   "%s", (const char *) web_index_html);
 }
 
@@ -1763,11 +1770,15 @@ static void http_event_handler(struct mg_connection *connection,
         return;
     }
 
-    if (event != MG_EV_HTTP_MSG) {
+    if (event != MG_EV_HTTP_MSG || event_data == NULL) {
         return;
     }
 
     struct mg_http_message *message = event_data;
+    if (message->method.buf == NULL) {
+        return;
+    }
+
     server->http_requests++;
 
     int is_get = mg_strcmp(message->method, mg_str("GET")) == 0;

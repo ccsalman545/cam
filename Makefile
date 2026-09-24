@@ -61,7 +61,7 @@ else
 endif
 
 MULTIARCH  := $(shell $(CC) -print-multiarch 2>/dev/null)
-SYSTEM_INCLUDE := /usr/local/include /usr/include
+SYSTEM_INCLUDE := /usr/local/include /usr/include /usr/local/include/node
 SYSTEM_LIBDIRS := /usr/local/lib /usr/lib/$(MULTIARCH) /usr/lib64 /usr/lib
 
 # find_header(DIRS, RELATIVE_PATH) -> first directory containing the header

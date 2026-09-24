@@ -94,7 +94,14 @@ static int v4l2_start(VideoSource *source)
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (xioctl(impl->fd, VIDIOC_STREAMON, &type) == -1) {
-        log_error("capture", "v4l2 VIDIOC_STREAMON: errno=%d (%s)", errno, strerror(errno));
+        if (errno == EINVAL) {
+            log_error("capture", "v4l2 VIDIOC_STREAMON failed with EINVAL (errno 22) on %s. "
+                      "If this is a Raspberry Pi CSI camera (e.g., IMX219), raw V4L2 pad formats "
+                      "do not match sensor resolution (3280x2464). Use '-s csi' to stream via rpicam-vid.",
+                      device);
+        } else {
+            log_error("capture", "v4l2 VIDIOC_STREAMON: errno=%d (%s)", errno, strerror(errno));
+        }
         return -1;
     }
 
