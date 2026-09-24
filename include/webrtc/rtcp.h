@@ -21,8 +21,12 @@ typedef struct {
     size_t nack_seqs;               /* sequence numbers to retransmit */
     uint16_t nack_seq[RTCP_MAX_NACK_SEQS];
 
-    /* First receiver report block, when present. */
+    /*
+     * Report block (from an RR or SR) about media_ssrc, or the first
+     * block when none names it.
+     */
     int has_rr;
+    uint32_t rr_ssrc;               /* stream the block reports on */
     uint8_t rr_fraction_lost;       /* times 256 */
     uint32_t rr_highest_seq;
     uint32_t rr_jitter;             /* RTP clock units */
@@ -47,15 +51,18 @@ size_t rtcp_build_sender_report(uint8_t *out,
 /*
  * Parse a compound RTCP packet (SRTCP already removed). Fields not
  * present stay zero. Unknown packet types are skipped, not rejected.
+ * media_ssrc selects the report block about our stream.
  */
 void rtcp_parse(const uint8_t *buffer,
                 size_t length,
+                uint32_t media_ssrc,
                 RtcpFeedback *feedback);
 
 /*
  * Round trip time from the last sender report, per RFC 3550 A.3:
  * (now - LSR - DLSR) in milliseconds. now is the middle 32 bits of the
- * NTP time. Returns -1 when the peer has not reported on an SR yet.
+ * NTP time. Returns -1 when the peer has not reported on an SR yet or
+ * the report is inconsistent with our clock.
  */
 int rtcp_rtt_ms(uint32_t now_ntp_msw,
                 uint32_t rr_last_sr,

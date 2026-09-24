@@ -60,26 +60,34 @@ int h264_encoder_encode(H264Encoder *encoder,
                         const uint8_t *plane_v,
                         uint64_t pts_us, int force_idr,
                         uint8_t *out, size_t out_capacity,
-                        size_t *out_size, int *out_is_idr)
+                        size_t *out_size, int *out_is_idr,
+                        uint64_t *out_pts_us)
 {
     (void) encoder;
     (void) plane_y;
     (void) plane_u;
     (void) plane_v;
-    (void) pts_us;
     (void) force_idr;
 
     if (atomic_load(&encode_mode) == ENCODE_NO_OUTPUT) {
         return 0;
     }
 
-    if (out_capacity < 4) {
+    /* A minimal keyframe: SPS, PPS and one IDR slice NAL unit. */
+    static const uint8_t idr_au[] = {
+        0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f,
+        0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+        0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21
+    };
+
+    if (out_capacity < sizeof(idr_au)) {
         return -1;
     }
 
-    memcpy(out, "\0\0\0\x01", 4);
-    *out_size = 4;
+    memcpy(out, idr_au, sizeof(idr_au));
+    *out_size = sizeof(idr_au);
     *out_is_idr = 1;
+    *out_pts_us = pts_us;
     return 1;
 }
 

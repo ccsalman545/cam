@@ -18,10 +18,13 @@
 #include <unistd.h>
 
 #include "au_ring.h"
+#include "h264_bitstream.h"
 #include "yuv_convert.h"
 
 #define ENCODE_SCRATCH_MAX (4096 * 4096 * 3 / 2)
 #define AU_SCRATCH_CAPACITY (512 * 1024)
+/* Room for a cached SPS + PPS in front of an access unit. */
+#define AU_FIXUP_CAPACITY (AU_SCRATCH_CAPACITY + 2 * H264_PARAM_MAX)
 
 struct EncoderWorker {
     FrameHub *hub;
@@ -36,6 +39,8 @@ struct EncoderWorker {
 
     uint8_t *i420;              /* planar scratch: y, then u, then v */
     uint8_t *au_buffer;         /* access unit output */
+    uint8_t *au_fixup;          /* access unit with SPS/PPS prepended */
+    H264ParamCache params;      /* last SPS/PPS the encoder produced */
 
     pthread_t thread;
     atomic_int running;
@@ -55,6 +60,9 @@ struct EncoderWorker {
     atomic_uint_fast64_t skipped_mismatch;
     atomic_uint_fast64_t skipped_bad_size;
     atomic_uint_fast64_t no_output;
+    atomic_uint_fast64_t keyframes;
+    atomic_uint_fast64_t params_prepended;
+    atomic_int failed;          /* encoder unusable; worker stopped */
 
     /*
      * Live reconfiguration mailbox. The HTTP thread only stores a
@@ -85,6 +93,68 @@ static uint64_t counter_get(const atomic_uint_fast64_t *counter)
  */
 #define STALL_WATCHDOG_FRAMES 90
 
+/*
+ * Active time without a single access unit after which the encoder is
+ * declared failed. A hung hardware encoder never returns an error, it
+ * only stops producing; the server then rebuilds the pipeline (and
+ * falls back to libx264 when the preference is "auto").
+ */
+#define STALL_FATAL_MS 10000
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
+}
+
+/*
+ * Post-process one encoder output before it reaches the network:
+ *   - a header-only buffer (SPS/PPS, no picture) is cached, not sent;
+ *   - an IDR without SPS/PPS gets the cached ones prepended, so every
+ *     keyframe a viewer can start from is self-contained;
+ *   - the keyframe flag is taken from the NAL types, which is the
+ *     authoritative source whatever the backend reported.
+ * Returns 1 with the access unit in *au / *au_size, 0 when there is
+ * nothing to send.
+ */
+static int finish_access_unit(EncoderWorker *worker, size_t size,
+                              const uint8_t **au, size_t *au_size,
+                              int *is_idr)
+{
+    H264AuInfo info;
+
+    h264_au_scan(worker->au_buffer, size, &info);
+
+    if (info.has_sps || info.has_pps) {
+        h264_param_cache_update(&worker->params, worker->au_buffer, size);
+    }
+
+    if (!info.has_slice) {
+        return 0;
+    }
+
+    *au = worker->au_buffer;
+    *au_size = size;
+    *is_idr = info.has_idr;
+
+    if (info.has_idr && !(info.has_sps && info.has_pps)) {
+        size_t fixed = h264_prepend_params(&worker->params, worker->au_buffer,
+                                           size, worker->au_fixup,
+                                           AU_FIXUP_CAPACITY);
+
+        if (fixed > 0) {
+            *au = worker->au_fixup;
+            *au_size = fixed;
+            counter_add(&worker->params_prepended);
+        }
+    }
+
+    return 1;
+}
+
 static void *encoder_thread(void *arg)
 {
     EncoderWorker *worker = arg;
@@ -95,18 +165,15 @@ static void *encoder_thread(void *arg)
     int stall_warned = 0;
     int mismatch_logged = 0;
     int bad_size_logged = 0;
+    int ring_full_logged = 0;
     uint64_t last_encode_at_seen = 0;
+    uint64_t last_output_ms = 0;
 
     while (worker->running) {
-        Frame *frame = frame_hub_take(worker->consumer);
+        /* Sleeps until the source publishes; wakes to notice a stop. */
+        Frame *frame = frame_hub_take_wait(worker->consumer, 100);
 
         if (frame == NULL) {
-            /*
-             * Nothing new: brief sleep keeps this well below
-             * one percent CPU.
-             */
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
-            nanosleep(&ts, NULL);
             continue;
         }
 
@@ -149,6 +216,7 @@ static void *encoder_thread(void *arg)
              */
             stall_warned = 0;
             last_encode_at_seen = frames_in;
+            last_output_ms = monotonic_ms();
         }
         was_active = active;
 
@@ -196,55 +264,82 @@ static void *encoder_thread(void *arg)
             continue;
         }
 
-        if (frame->size == 0) {
+        size_t luma = (size_t) worker->width * worker->height;
+        uint32_t min_stride = frame->format == V4L2_PIX_FMT_YUYV
+                                  ? worker->width * 2 : worker->width;
+
+        if (frame->size == 0 ||
+            frame->size < (size_t) (frame->stride ? frame->stride : min_stride) *
+                              worker->height) {
             if (!bad_size_logged) {
                 bad_size_logged = 1;
-                log_info("encode", "encode worker: empty frame (size 0), "
-                        "frames are dropped");
+                log_info("encode", "encode worker: frame of %zu bytes is too "
+                        "small for %ux%u, frames are dropped", frame->size,
+                        worker->width, worker->height);
             }
             counter_add(&worker->skipped_bad_size);
             frame_unref(frame_hub_pool(worker->hub), frame);
             continue;
         }
 
-        /*
-         * Convert to planar I420 in the scratch buffer.
-         */
-        uint8_t *plane_y = worker->i420;
-        uint8_t *plane_u = worker->i420 +
-                           (size_t) worker->width * worker->height;
-        uint8_t *plane_v = plane_u +
-                           (size_t) worker->width * worker->height / 4;
+        const uint8_t *plane_y = worker->i420;
+        const uint8_t *plane_u = worker->i420 + luma;
+        const uint8_t *plane_v = plane_u + luma / 4;
 
         if (frame->format == V4L2_PIX_FMT_YUYV) {
             yuyv_to_i420(frame->data,
                          frame->stride ? frame->stride : frame->width * 2,
-                         plane_y, plane_u, plane_v,
+                         worker->i420, worker->i420 + luma,
+                         worker->i420 + luma + luma / 4,
                          worker->width, worker->height);
         } else {
             /*
-             * Planar YU12 source. Luma stride from the driver,
-             * chroma assumed at half stride right after luma.
+             * Planar YU12: luma stride from the source, chroma at half
+             * stride right after luma, as V4L2 and rpicam-vid lay it out.
              */
-            uint32_t y_stride = frame->stride ? frame->stride : frame->width;
-            const uint8_t *src_y = frame->data;
-            const uint8_t *src_u = frame->data +
-                                   (size_t) y_stride * frame->height;
-            const uint8_t *src_v = src_u +
-                                   (size_t) (y_stride / 2) * (frame->height / 2);
+            uint32_t y_stride = frame->stride ? frame->stride : worker->width;
+            size_t chroma_plane = (size_t) (y_stride / 2) * (worker->height / 2);
+            size_t needed = (size_t) y_stride * worker->height + 2 * chroma_plane;
 
-            i420_copy(src_y, y_stride, src_u, src_v,
-                      plane_y, plane_u, plane_v,
-                      worker->width, worker->height);
+            if (frame->size < needed) {
+                if (!bad_size_logged) {
+                    bad_size_logged = 1;
+                    log_info("encode", "encode worker: I420 frame of %zu bytes "
+                            "is smaller than %zu, frames are dropped",
+                            frame->size, needed);
+                }
+                counter_add(&worker->skipped_bad_size);
+                frame_unref(frame_hub_pool(worker->hub), frame);
+                continue;
+            }
+
+            const uint8_t *src_u = frame->data + (size_t) y_stride * worker->height;
+            const uint8_t *src_v = src_u + chroma_plane;
+
+            if (y_stride == worker->width) {
+                /*
+                 * Tightly packed (the CSI and stdin sources): the
+                 * encoder reads the pooled frame directly, saving a
+                 * full frame copy. The reference is held until the
+                 * encode call returns.
+                 */
+                plane_y = frame->data;
+                plane_u = src_u;
+                plane_v = src_v;
+            } else {
+                i420_copy(frame->data, y_stride, src_u, src_v,
+                          worker->i420, worker->i420 + luma,
+                          worker->i420 + luma + luma / 4,
+                          worker->width, worker->height);
+            }
         }
 
-        /* The frame may be recycled immediately after unref; retain all
-         * metadata needed by the encoded access unit before releasing it. */
         uint64_t pts_us = frame->timestamp_us;
         int force_idr = atomic_exchange(worker->force_idr, 0);
 
         size_t au_size = 0;
-        int is_idr = 0;
+        int backend_idr = 0;
+        uint64_t au_pts_us = pts_us;
 
         int result = h264_encoder_encode(worker->encoder,
                                          plane_y, plane_u, plane_v,
@@ -253,47 +348,80 @@ static void *encoder_thread(void *arg)
                                          worker->au_buffer,
                                          AU_SCRATCH_CAPACITY,
                                          &au_size,
-                                         &is_idr);
+                                         &backend_idr,
+                                         &au_pts_us);
 
+        /* Planes may point into the frame: release it only now. */
         frame_unref(frame_hub_pool(worker->hub), frame);
 
         if (result < 0) {
-            log_error("encode", "encode worker: encoder error, stopping");
+            log_error("encode", "encode worker: fatal encoder error, encoder "
+                                "marked failed");
+            atomic_store(&worker->failed, 1);
             break;
         }
 
-        if (result == 0) {
+        const uint8_t *au = NULL;
+        size_t send_size = 0;
+        int is_idr = 0;
+
+        if (result == 0 ||
+            !finish_access_unit(worker, au_size, &au, &send_size, &is_idr)) {
             /*
-             * Hardware pipeline depth: no output this round.
+             * Hardware pipeline depth, a dropped frame, or a buffer
+             * that only carried SPS/PPS.
              */
             counter_add(&worker->no_output);
+
+            if (force_idr) {
+                /* Not satisfied yet: keep asking. */
+                atomic_store(worker->force_idr, 1);
+            }
+
+            if (last_output_ms != 0 &&
+                monotonic_ms() - last_output_ms > STALL_FATAL_MS) {
+                log_error("encode", "encode worker: no access unit for %d s "
+                                    "while frames were supplied; encoder "
+                                    "marked failed", STALL_FATAL_MS / 1000);
+                atomic_store(&worker->failed, 1);
+                break;
+            }
             continue;
         }
 
         counter_add(&worker->frames_encoded);
         last_encode_at_seen = frames_in;
+        last_output_ms = monotonic_ms();
         stall_warned = 0;
 
         if (is_idr) {
+            counter_add(&worker->keyframes);
             /*
              * Satisfy pending keyframe requests that arrived
              * while this IDR was produced.
              */
             atomic_store(worker->force_idr, 0);
+        } else if (force_idr) {
+            /* A hardware encoder may deliver the IDR a frame later. */
+            atomic_store(worker->force_idr, 1);
         }
 
-        if (au_ring_push(worker->ring,
-                         worker->au_buffer,
-                         au_size,
-                         pts_us,
-                         is_idr) != 0) {
-            log_info("encode", "encode worker: access unit too large");
+        if (au_ring_push(worker->ring, au, send_size, au_pts_us, is_idr) != 0) {
+            if (!ring_full_logged) {
+                ring_full_logged = 1;
+                log_warn("encode", "encode worker: %zu byte access unit does "
+                                   "not fit the ring slot; dropped, keyframe "
+                                   "requested", send_size);
+            }
+            atomic_store(worker->force_idr, 1);
         }
     }
 
-    log_info("encode", "encode worker: stopped (%llu frames in, %llu encoded)",
+    log_info("encode", "encode worker: stopped (%llu frames in, %llu encoded, "
+                       "%llu keyframes)",
            (unsigned long long) counter_get(&worker->frames_in),
-           (unsigned long long) counter_get(&worker->frames_encoded));
+           (unsigned long long) counter_get(&worker->frames_encoded),
+           (unsigned long long) counter_get(&worker->keyframes));
 
     return NULL;
 }
@@ -326,13 +454,16 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
 
     uint8_t *i420 = malloc(i420_size);
     uint8_t *au_buffer = malloc(AU_SCRATCH_CAPACITY);
+    uint8_t *au_fixup = malloc(AU_FIXUP_CAPACITY);
 
-    if (worker->consumer == NULL || i420 == NULL || au_buffer == NULL) {
+    if (worker->consumer == NULL || i420 == NULL || au_buffer == NULL ||
+        au_fixup == NULL) {
         if (worker->consumer != NULL) {
             frame_hub_unsubscribe(hub, worker->consumer);
         }
         free(i420);
         free(au_buffer);
+        free(au_fixup);
         free(worker);
         return NULL;
     }
@@ -346,6 +477,7 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
     worker->height = height;
     worker->i420 = i420;
     worker->au_buffer = au_buffer;
+    worker->au_fixup = au_fixup;
     worker->running = 1;
 
     return worker;
@@ -433,6 +565,13 @@ void encoder_worker_get_stats(const EncoderWorker *worker,
     out->skipped_mismatch = counter_get(&worker->skipped_mismatch);
     out->skipped_bad_size = counter_get(&worker->skipped_bad_size);
     out->no_output = counter_get(&worker->no_output);
+    out->keyframes = counter_get(&worker->keyframes);
+    out->params_prepended = counter_get(&worker->params_prepended);
+}
+
+int encoder_worker_failed(const EncoderWorker *worker)
+{
+    return worker != NULL && atomic_load(&((EncoderWorker *) worker)->failed);
 }
 
 void encoder_worker_destroy(EncoderWorker *worker)
@@ -446,5 +585,6 @@ void encoder_worker_destroy(EncoderWorker *worker)
     frame_hub_unsubscribe(worker->hub, worker->consumer);
     free(worker->i420);
     free(worker->au_buffer);
+    free(worker->au_fixup);
     free(worker);
 }

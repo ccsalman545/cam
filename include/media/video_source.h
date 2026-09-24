@@ -3,6 +3,8 @@
  *
  * Common interface for every raw video producer:
  *   - V4L2 capture device (USB webcam, v4l2loopback sink)
+ *   - Raspberry Pi CSI camera through rpicam-vid (csi_source.c)
+ *   - Raw YUV420 on standard input
  *   - Built in synthetic test pattern generator
  *
  * Contract:
@@ -28,6 +30,13 @@ struct VideoSource {
     uint32_t stride;
     uint32_t format;        /* V4L2 fourcc: YUYV or YU12 */
     size_t frame_size;
+
+    /*
+     * Set by a source that can never deliver again (pipe EOF, child
+     * process exited, stalled). capture() then returns -1 and the worker
+     * gives up at once instead of retrying a transient error.
+     */
+    volatile int ended;
 
     int  (*start)(VideoSource *source);
     /*

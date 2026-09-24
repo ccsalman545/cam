@@ -20,6 +20,7 @@
 
 #define RTCP_HEADER_SIZE 8
 #define RTCP_REPORT_BLOCK_SIZE 24
+#define RTCP_SENDER_INFO_SIZE 20
 
 static uint16_t read_be16(const uint8_t *p)
 {
@@ -85,14 +86,30 @@ int rtcp_rtt_ms(uint32_t now_ntp_msw,
         return -1;
     }
 
-    /* RFC 3550 A.3, arithmetic in the 1/65536 second unit. */
-    uint32_t elapsed = now_ntp_msw - rr_last_sr - rr_delay_since_sr;
+    /*
+     * RFC 3550 A.3: RTT = A - LSR - DLSR, all three in the compact NTP
+     * unit (middle 32 bits, 1/65536 s). The subtraction is modulo 2^32
+     * by design (the compact format wraps every 18.2 hours), so the
+     * result is read as a signed distance.
+     *
+     * A small negative value is the rounding of the three 1/65536 s
+     * quantities on a sub-millisecond LAN path: the true RTT is 0.
+     * Anything further negative means LSR/DLSR do not belong to this
+     * clock (a corrupt or foreign report), which is reported as
+     * "unknown" rather than turned into a number.
+     */
+    int32_t elapsed = (int32_t) (now_ntp_msw - rr_last_sr - rr_delay_since_sr);
 
-    return (int) ((uint64_t) elapsed * 1000ULL / 65536ULL);
+    if (elapsed < 0) {
+        return elapsed > -(65536 / 100) ? 0 : -1;   /* within 10 ms */
+    }
+
+    return (int) (((int64_t) elapsed * 1000 + 32768) / 65536);
 }
 
 void rtcp_parse(const uint8_t *buffer,
                 size_t length,
+                uint32_t media_ssrc,
                 RtcpFeedback *feedback)
 {
     memset(feedback, 0, sizeof(*feedback));
@@ -120,21 +137,38 @@ void rtcp_parse(const uint8_t *buffer,
 
         switch (packet_type) {
         case RTCP_PT_SR:
-            /* Sender reports from the peer carry no video feedback. */
-            break;
-
         case RTCP_PT_RR: {
-            /* First report block only: we send one stream. */
-            if (count_or_fmt >= 1 &&
-                body_len >= RTCP_HEADER_SIZE + RTCP_REPORT_BLOCK_SIZE) {
-                const uint8_t *block = body + RTCP_HEADER_SIZE;
+            /*
+             * RFC 3550 6.4: report blocks follow the 8 byte header of an
+             * RR, and the 8 byte header plus 20 byte sender info of an
+             * SR. Block layout: SSRC(0) fraction(4) cumulative lost(5..7)
+             * extended highest seq(8) jitter(12) LSR(16) DLSR(20).
+             */
+            size_t first = RTCP_HEADER_SIZE +
+                           (packet_type == RTCP_PT_SR ? RTCP_SENDER_INFO_SIZE : 0);
+
+            for (size_t i = 0; i < count_or_fmt; i++) {
+                size_t at = first + i * RTCP_REPORT_BLOCK_SIZE;
+
+                if (at + RTCP_REPORT_BLOCK_SIZE > body_len) {
+                    break;
+                }
+
+                const uint8_t *block = body + at;
+                uint32_t block_ssrc = read_be32(block);
+
+                /* Keep the block about our stream when the caller names it. */
+                if (feedback->has_rr && feedback->rr_ssrc == media_ssrc) {
+                    break;
+                }
 
                 feedback->has_rr = 1;
+                feedback->rr_ssrc = block_ssrc;
                 feedback->rr_fraction_lost = block[4];
                 feedback->rr_highest_seq = read_be32(block + 8);
-                feedback->rr_jitter = read_be32(block + 16);
-                feedback->rr_last_sr = read_be32(block + 20);
-                feedback->rr_delay_since_sr = read_be32(block + 24);
+                feedback->rr_jitter = read_be32(block + 12);
+                feedback->rr_last_sr = read_be32(block + 16);
+                feedback->rr_delay_since_sr = read_be32(block + 20);
             }
             break;
         }

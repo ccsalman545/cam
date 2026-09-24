@@ -8,7 +8,8 @@
  *     On Raspberry Pi this is the bcm2835-codec H.264 encoder
  *     (usually /dev/video11), which offloads all encoding work
  *     to the GPU or hardware block.
- *   - H264_ENCODER_SW: libx264 in zerolatency tune.
+ *   - H264_ENCODER_SW: libx264, superfast preset, zerolatency tune,
+ *     sliced threads.
  *
  * The factory preference string selects behavior:
  *   "auto"            try hardware first, fall back to software
@@ -48,13 +49,15 @@ H264Encoder *h264_encoder_open(const char *preference,
 
 /*
  * Encode one I420 frame. Plane strides are assumed equal to
- * width for luma and width/2 for chroma (the caller normalizes
- * through yuv_convert).
+ * width for luma and width/2 for chroma.
  *
  * Returns:
- *   1  access unit written to out, size in *out_size
- *   0  no output ready yet (hardware pipeline depth)
- *  -1  fatal encoder error
+ *   1  access unit written to out, size in *out_size, its capture
+ *      timestamp in *out_pts_us (a hardware encoder may return the
+ *      picture of an earlier call; the timestamp is that picture's)
+ *   0  no output this call (hardware pipeline depth, or a frame the
+ *      backend had to drop; it then forces the next one to be an IDR)
+ *  -1  fatal encoder error: the handle is unusable
  */
 int h264_encoder_encode(H264Encoder *encoder,
                         const uint8_t *plane_y,
@@ -65,7 +68,11 @@ int h264_encoder_encode(H264Encoder *encoder,
                         uint8_t *out,
                         size_t out_capacity,
                         size_t *out_size,
-                        int *out_is_idr);
+                        int *out_is_idr,
+                        uint64_t *out_pts_us);
+
+/* Backend kind of an open encoder. */
+H264EncoderKind h264_encoder_kind(const H264Encoder *encoder);
 
 /*
  * Change the target bitrate of a running encoder. Returns 0 when the

@@ -1611,7 +1611,7 @@ MdnsResponder *mdns_responder_create(const MdnsConfig *config,
     }
 
     if (responder->config.port != 0) {
-        responder->fd = socket(AF_INET, SOCK_DGRAM, 0);
+        responder->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
         if (responder->fd < 0) {
             snprintf(error, error_size, "socket failed: errno=%d (%s)", errno,

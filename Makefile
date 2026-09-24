@@ -227,12 +227,14 @@ $(TEST_BUILD)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/
 
 $(TEST_BUILD)/test_encoder_worker: tests/test_encoder_worker.c \
         src/media/encoder_worker.c src/media/frame_hub.c src/media/frame_pool.c \
-        src/media/au_ring.c src/media/yuv_convert.c src/app/log.c $(FLAG_STAMP)
+        src/media/au_ring.c src/media/yuv_convert.c src/media/h264_bitstream.c \
+        src/app/log.c $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/media \
 	      -Iinclude/app tests/test_encoder_worker.c src/media/encoder_worker.c \
 	      src/media/frame_hub.c src/media/frame_pool.c src/media/au_ring.c \
-	      src/media/yuv_convert.c src/app/log.c -o $@ -lpthread
+	      src/media/yuv_convert.c src/media/h264_bitstream.c src/app/log.c \
+	      -o $@ -lpthread
 
 $(TEST_BUILD)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c \
         src/media/test_source.c src/app/log.c $(FLAG_STAMP)
@@ -248,6 +250,13 @@ $(TEST_BUILD)/test_mdns: tests/test_mdns.c src/net/mdns.c src/app/log.c \
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/net \
 	      -Iinclude/app tests/test_mdns.c src/net/mdns.c src/app/log.c -o $@
+
+$(TEST_BUILD)/test_sdp_rtcp: tests/test_sdp_rtcp.c src/webrtc/sdp.c src/webrtc/rtcp.c \
+        src/app/log.c include/webrtc/sdp.h include/webrtc/rtcp.h $(FLAG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/app \
+	      -Iinclude/webrtc tests/test_sdp_rtcp.c src/webrtc/sdp.c \
+	      src/webrtc/rtcp.c src/app/log.c -o $@ -lpthread
 
 # The session test needs the whole WebRTC stack: STUN, DTLS, SRTP,
 # RTP packetization, RTCP parsing and SDP answer generation.
@@ -282,7 +291,7 @@ $(TEST_BUILD)/test_lan_stream: tests/test_lan_stream.c $(BINARY) $(FLAG_STAMP)
 
 TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
                  $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_mdns \
-                 $(TEST_BUILD)/test_rtc_session \
+                 $(TEST_BUILD)/test_rtc_session $(TEST_BUILD)/test_sdp_rtcp \
                  $(TEST_BUILD)/test_server_api $(TEST_BUILD)/test_lan_stream
 
 # argv[1] is the server binary for the black box tests; argv[2] is the
@@ -301,10 +310,18 @@ install: $(BINARY)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BINARY) $(DESTDIR)$(BINDIR)/camstream
 	install -d $(DESTDIR)$(SYSCONFDIR)
-	install -m 0644 config/camstream.conf $(DESTDIR)$(SYSCONFDIR)/camstream.conf
+	@# Never overwrite an operator's configuration: new defaults go next to it.
+	@if [ -e $(DESTDIR)$(SYSCONFDIR)/camstream.conf ]; then \
+	    install -m 0644 config/camstream.conf $(DESTDIR)$(SYSCONFDIR)/camstream.conf.new; \
+	    echo "kept $(DESTDIR)$(SYSCONFDIR)/camstream.conf; shipped defaults are in camstream.conf.new"; \
+	else \
+	    install -m 0644 config/camstream.conf $(DESTDIR)$(SYSCONFDIR)/camstream.conf; \
+	fi
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 0644 packaging/camstream.service \
 	        $(DESTDIR)$(UNITDIR)/camstream.service
+	@echo "installed binary matches the build if these two checksums are equal:"
+	@sha256sum $(BINARY) $(DESTDIR)$(BINDIR)/camstream
 
 clean:
 	rm -rf $(BUILD)

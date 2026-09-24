@@ -66,6 +66,8 @@ void i420_copy(const uint8_t *src_y, uint32_t src_y_stride,
 {
     const uint32_t chroma_w = width / 2;
     const uint32_t chroma_h = height / 2;
+    /* Chroma rows are half the luma stride, padding included. */
+    const uint32_t src_c_stride = src_y_stride / 2;
 
     for (uint32_t row = 0; row < height; row++) {
         memcpy(dst_y + (size_t) row * width,
@@ -74,10 +76,10 @@ void i420_copy(const uint8_t *src_y, uint32_t src_y_stride,
     }
     for (uint32_t crow = 0; crow < chroma_h; crow++) {
         memcpy(dst_u + (size_t) crow * chroma_w,
-               src_u + (size_t) crow * chroma_w,
+               src_u + (size_t) crow * src_c_stride,
                chroma_w);
         memcpy(dst_v + (size_t) crow * chroma_w,
-               src_v + (size_t) crow * chroma_w,
+               src_v + (size_t) crow * src_c_stride,
                chroma_w);
     }
 }

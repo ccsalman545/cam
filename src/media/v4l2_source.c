@@ -261,7 +261,7 @@ VideoSource *v4l2_source_create(const char *device,
     impl->fd = -1;
     snprintf(impl->name, sizeof(impl->name), "v4l2 %s", device);
 
-    impl->fd = open(device, O_RDWR | O_NONBLOCK);
+    impl->fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 
     if (impl->fd == -1) {
         log_error("capture", "v4l2: cannot open %s: %s", device, strerror(errno));

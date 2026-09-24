@@ -3,16 +3,21 @@
  *
  * See frame_hub.h for the design rationale.
  */
+#define _POSIX_C_SOURCE 200809L
+
 #include "frame_hub.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 struct FrameHubConsumer {
     FrameHub *hub;
     Frame *slot;
     pthread_mutex_t lock;
+    pthread_cond_t ready;           /* signalled when slot is filled */
     int active;
     struct FrameHubConsumer *next;
     struct FrameHubConsumer *prev;
@@ -57,6 +62,14 @@ FrameHubConsumer *frame_hub_subscribe(FrameHub *hub)
     consumer->active = 1;
     pthread_mutex_init(&consumer->lock, NULL);
 
+    /* Timed waits run on the monotonic clock: immune to clock steps. */
+    pthread_condattr_t attr;
+
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&consumer->ready, &attr);
+    pthread_condattr_destroy(&attr);
+
     pthread_mutex_lock(&hub->lock);
 
     consumer->next = hub->consumers;
@@ -100,6 +113,7 @@ void frame_hub_unsubscribe(FrameHub *hub, FrameHubConsumer *consumer)
         consumer->slot = NULL;
     }
 
+    pthread_cond_destroy(&consumer->ready);
     pthread_mutex_destroy(&consumer->lock);
     free(consumer);
 }
@@ -158,6 +172,7 @@ int frame_hub_publish(FrameHub *hub,
 
         c->slot = frame;
 
+        pthread_cond_signal(&c->ready);
         pthread_mutex_unlock(&c->lock);
     }
 
@@ -179,6 +194,39 @@ Frame *frame_hub_take(FrameHubConsumer *consumer)
     }
 
     pthread_mutex_lock(&consumer->lock);
+
+    Frame *frame = consumer->slot;
+    consumer->slot = NULL;
+
+    pthread_mutex_unlock(&consumer->lock);
+
+    return frame;
+}
+
+Frame *frame_hub_take_wait(FrameHubConsumer *consumer, int timeout_ms)
+{
+    if (consumer == NULL) {
+        return NULL;
+    }
+
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long) (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&consumer->lock);
+
+    while (consumer->slot == NULL) {
+        if (pthread_cond_timedwait(&consumer->ready, &consumer->lock,
+                                   &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
 
     Frame *frame = consumer->slot;
     consumer->slot = NULL;

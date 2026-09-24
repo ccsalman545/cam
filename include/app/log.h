@@ -27,7 +27,7 @@ typedef enum {
 } LogLevel;
 
 #define LOG_RING_CAPACITY 256
-#define LOG_MESSAGE_MAX 192
+#define LOG_MESSAGE_MAX 256
 #define LOG_TAG_MAX 12
 
 /*

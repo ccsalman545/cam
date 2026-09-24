@@ -9,7 +9,7 @@ build step, nothing to install on the viewer side beyond a browser.
 The problem it solves: a browser cannot consume a raw V4L2 camera. Some piece
 of software has to capture, encode, negotiate a peer connection, and keep the
 connection alive when the viewer closes a tab or walks out of Wi-Fi range.
-`camstream` is that piece. The project is about 12,000 lines of C across 41
+`camstream` is that piece. The project is about 16,000 lines of C across 46
 files, plus the vendored HTTP server.
 
 ## Contents
@@ -25,6 +25,7 @@ files, plus the vendored HTTP server.
 - [Configuration](#configuration)
 - [Camera setup](#camera-setup)
 - [Firewall](#firewall)
+- [LAN access: step-by-step check](#lan-access-step-by-step-check)
 - [Web interface](#web-interface)
 - [Diagnostics API](#diagnostics-api)
 - [Recovery](#recovery)
@@ -160,24 +161,57 @@ Capture sources, selected with `--source`:
 | Source | How it works | Typical use |
 | --- | --- | --- |
 | `v4l2` | Opens the device, negotiates YUYV then YU12, uses 4 mmap buffers | USB camera, `/dev/video0` |
-| `csi` | Spawns `rpicam-vid` (or `libcamera-vid`) and reads raw YUV420 from its pipe | Raspberry Pi CSI camera |
+| `csi` | Spawns `rpicam-vid` (or `libcamera-vid`) and reads raw YUV420 from its pipe | Raspberry Pi CSI camera (IMX219, IMX477, IMX708, ...) |
 | `stdin` | Reads raw YUV420 frames from standard input | Feeding test footage, `ffmpeg -i clip.mp4 -f rawvideo -pix_fmt yuv420p -` |
 | `test` | Synthetic pattern at the requested size and rate | Bench testing, no hardware |
 
 The CSI source is a pipe reader, not a libcamera client: the Pi camera stack
 is a moving target and `rpicam-vid` is the interface that survives Pi OS
-upgrades. The source thread only blocks on `poll` with a timeout; EOF, a
-dead child process, or a truncated frame is reported as a fatal source error
-and reflected in `/api/status` and `/api/logs`.
+upgrades. The chain is
+
+```
+IMX219 -> libcamera ISP -> rpicam-vid --codec yuv420 --flush -o - -> pipe
+       -> camstream -> H.264 -> RTP -> SRTP -> WebRTC -> browser
+```
+
+`rpicam-vid` pads every luma row to a multiple of 64 bytes (chroma to 32);
+the source reports that stride and the encoder removes the padding, so any
+even width works, but 640, 1280 and 1920 avoid the extra copy. The child is
+started with `posix_spawn`, inherits no camstream socket (everything is
+close-on-exec), gets a 1 MB pipe, and runs with `LIBCAMERA_LOG_LEVELS=*:WARN`
+unless `--verbose` is given. EOF, a dead child, a truncated frame or 5 s
+without data (15 s for the first frame) ends the source; the pipeline is then
+rebuilt automatically (see [Recovery](#recovery)).
+
+Why not `--source v4l2 --device /dev/video0` for a CSI camera: on current Pi
+OS the sensor's `/dev/video0` is the raw Unicam/CFE capture node. It only
+produces Bayer data, and only after libcamera has configured the media
+graph, so opening it directly fails (`VIDIOC_STREAMON` errno 22, or a
+3280x2464 pad format mismatch on the IMX219). That is expected; use
+`--source csi`.
 
 Encoders, selected with `--encoder`:
 
 | Mode | Backend | Notes |
 | --- | --- | --- |
-| `auto` | Hardware first, then libx264 | Default |
-| `hw` | V4L2 memory-to-memory, first M2M device found | Pi 4/5, CMA memory, H.264 hardware block |
+| `auto` | Hardware first, then libx264 | Default. Also switches to libx264 if the hardware encoder fails while running |
+| `hw` | V4L2 memory-to-memory, `/dev/video11` first, then any M2M H.264 encoder | Pi Zero 2/3/4 (bcm2835-codec). The Pi 5 has no H.264 encoder block |
 | `hw:/dev/video11` | Same, explicit device | When the numbering is unusual |
 | `sw` | libx264 | Needs `libx264-dev` at build time |
+
+libx264 runs with preset `superfast`, tune `zerolatency` (no lookahead, no
+B-frames, no frame delay), sliced threads (one per core, at most 4: slices
+add no latency, unlike frame threads), constrained baseline, CBR-like VBV
+(max rate = target, buffer = half a second), a fixed GOP of
+`keyframe_seconds` with SPS/PPS repeated on every IDR. `/api/status` shows
+`capture_fps`, `encode_fps` and `cpu_percent` to confirm the rate on the
+device.
+
+The hardware backend sets the capture (H.264) format with the real picture
+size. The previous version left it at 0x0, which the bcm2835 encoder accepts
+at `S_FMT` time and rejects when the port is enabled, surfacing as
+`VIDIOC_STREAMON` errno 11 (EAGAIN); that is fixed, and a genuine
+`EAGAIN`/`EBUSY` is retried three times before `auto` falls back to libx264.
 
 The encoder runs only while a viewer is connected. With no viewer the source
 keeps running (so `/api/status` still reports capture frames and errors) and
@@ -383,15 +417,28 @@ stderr behind the logger.
 # A USB camera
 ./build/camstream --source v4l2 --device /dev/video0 --width 1280 --height 720
 
-# Raspberry Pi CSI camera with the hardware encoder
-./build/camstream --source csi --encoder hw --width 1280 --height 720 --fps 30
+# Raspberry Pi CSI camera (IMX219 etc.), hardware encoder when available
+./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
+
+# The same with libx264 (always available, required on a Pi 5)
+./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder sw --listen 0.0.0.0 --http-port 8080
 
 # From a config file, which also enables POST /api/config/reload
 ./build/camstream --config /etc/camstream.conf
 ```
 
+Stop the service first if it is installed (`sudo systemctl stop camstream`),
+otherwise the second instance reports that TCP 8080 is already in use.
+
 Then open `http://camstream.local:8080/` (or `http://<pi-address>:8080/`) in a
-browser on the same LAN. The page connects itself; see
+browser on the same LAN. Type the `http://` explicitly: the server speaks
+plain HTTP only, and a browser that upgrades the address to `https://`
+(Firefox HTTPS-Only mode, Chrome's "Always use secure connections", a
+bookmarked https URL) gets `PR_END_OF_FILE_ERROR` / "secure connection
+failed". The server answers such a TLS handshake with a TLS alert and logs
+`TLS handshake on the plain HTTP port, the browser is using https://`.
+WebRTC itself works from a plain-HTTP page on a LAN address because the page
+only receives video (no camera or microphone permission is requested). The page connects itself; see
 [Automatic LAN connection](#automatic-lan-connection). All options:
 
 | Option | Default | Meaning |
@@ -485,9 +532,13 @@ Raspberry Pi camera:
 
 ```sh
 sudo apt install -y rpicam-apps
-rpicam-vid --list-cameras       # confirms the sensor is detected
-./build/camstream --source csi
+rpicam-hello --list-cameras     # confirms the sensor is detected (imx219 ...)
+rpicam-vid -t 2000 -n --width 1280 --height 720 --codec yuv420 -o /dev/null
+./build/camstream --source csi --width 1280 --height 720 --fps 30
 ```
+
+Do not point `--source v4l2` at the CSI sensor's `/dev/video0`; see
+[Camera pipeline](#camera-pipeline).
 
 The CSI sensor is single-owner: `camstream` logs a warning naming the process
 holding it if another program (a `libcamera` preview, another server) has the
@@ -511,6 +562,14 @@ sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 50000:50007 proto udp
 ```
 
+With `firewalld` (Fedora-style images, some Pi setups):
+
+```sh
+sudo firewall-cmd --list-all
+sudo firewall-cmd --permanent --add-port=8080/tcp --add-port=50000-50007/udp
+sudo firewall-cmd --reload
+```
+
 With `iptables` or `nftables` the same two rules, restricted to the LAN
 interface, are enough. Do not port-forward these to the internet: the
 management endpoints have no authentication, by design, because the threat
@@ -520,13 +579,74 @@ If the browser connects to the page but the video stays black, a blocked UDP
 range is the first thing to check. `POST /api/webrtc/restart` frees the UDP
 ports if another process is holding one.
 
+## LAN access: step-by-step check
+
+Go down this list in order and stop at the first step that fails; each one
+depends on the ones above it. Run steps 1 to 6 on the Pi.
+
+```sh
+# 1. build and start (service stopped, so the port is free)
+make clean && make
+sudo systemctl stop camstream
+./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
+#    the log must show:  http: listening on 0.0.0.0:8080
+#                        media: pipeline running: capture csi (rpicam-vid) 1280x720 @ 30 fps -> ...
+
+# 2. port 8080 is listening on all interfaces, UDP media ports are free
+sudo ss -ltnp 'sport = :8080'          # LISTEN 0.0.0.0:8080 users:(("camstream",...))
+sudo ss -lunp | grep -E ':500[0-9]{2}' # one line per connected viewer
+
+# 3. addresses and link state
+ip -4 addr show
+nmcli device status
+
+# 4. HTTP from the Pi itself, loopback and LAN address (use your eth0 address)
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/
+curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.0.28:8080/
+curl -sS http://127.0.0.1:8080/api/status | python3 -m json.tool | head -60
+
+# 5. firewall
+sudo firewall-cmd --list-all 2>/dev/null || sudo ufw status verbose 2>/dev/null || sudo nft list ruleset | head -50
+
+# 6. from another PC on the LAN
+curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.0.28:8080/
+```
+
+Then in a browser on the other PC open `http://192.168.0.28:8080/` (typed
+with `http://`). The "Pipeline layers" panel on the page, and `layers` in
+`/api/status`, show where the stream stops:
+
+| Layer | Meaning when not flowing | Where to look |
+| --- | --- | --- |
+| `capture` | no frames from the camera | log `capture:` lines, `rpicam-hello --list-cameras` |
+| `encoder` | `idle` without a viewer is normal; `stalled`/`failed` is not | log `encode:` lines, `encoder.kind` |
+| `http` | the page itself would not load | steps 2 to 6 above |
+| `ice` | no authenticated STUN check: UDP 50000-50007 blocked, or the browser tried an unreachable candidate | firewall, `stun_rejected` in `/api/stats` |
+| `dtls` | handshake did not complete | log `dtls:` lines, `handshake_failures` |
+| `rtp` | connected but no media sent in the last 2 s (encoder, or waiting for a keyframe) | `frames_sent`, `frames_held`, `waiting_keyframe` in `/api/stats` |
+| `rtcp` | media sent but no receiver report from the browser | packets are lost on the way; `peer` address in `/api/stats` |
+| `browser_decode` | the page reports no growing `framesDecoded` | `chrome://webrtc-internals`, `about:webrtc` |
+
+`state` in `/api/status` is only `streaming` when access units went out in
+the last 2 s and the browser acknowledged them with RTCP receiver reports;
+`sending` means media leaves but nothing is acknowledged, `no-media` means
+connected but nothing to send.
+
+`peer` in `/api/stats` is the source address of the browser's authenticated
+STUN checks, i.e. the real remote viewer; `signaling_peer` is the address
+that posted the offer. A peer equal to one of the Pi's own addresses means
+the viewer ran on the Pi itself (for example a desktop browser on
+`http://127.0.0.1:8080/`), and the log says so.
+
 ## Web interface
 
 `web/index.html` is plain HTML, CSS and a few hundred lines of JavaScript. It
 is embedded into the binary at build time, so there is no web root to deploy
 and no way for the page to drift from the binary that serves it.
 
-The page shows the video, the connection state, camera and encoder state
+The page shows the video, the connection state (it says `streaming` only
+once the video element plays decoded frames), a "Pipeline layers" panel,
+camera and encoder state
 (codec, resolution, capture and encode FPS, bitrate), transport counters
 (packets, bytes, retransmissions, NACKs, PLIs, send errors, RTT, loss),
 CPU and memory, and the server log with a level filter. Buttons cover
@@ -554,6 +674,7 @@ build step. The same job can be done by hand from a browser console with
 | GET | `/api/logs` | Recent log ring, `?limit=1..256&level=debug|warn|info|error` |
 | POST | `/api/webrtc/offer` | WebRTC signaling, body `{"sdp":"..."}` |
 | POST | `/api/webrtc/close` | Close one session, body `{"session_id":N}` |
+| POST | `/api/webrtc/client-stats` | The page reports `frames_decoded` (diagnostic only) |
 | POST | `/api/camera/restart` | Rebuild the capture and encode pipeline |
 | POST | `/api/webrtc/restart` | Drop all sessions, new DTLS certificate |
 | POST | `/api/config/reload` | Re-read the config file |
@@ -562,9 +683,13 @@ Unknown paths return `404` with a JSON error, unsupported methods `405`,
 malformed signaling input `400` with the parser's reason. Every error reply
 is JSON with an `error` field.
 
-`/api/status` reports: overall `state` (`idle`, `connecting`, `streaming`,
-`camera-error`), `http`, `source` (kind, name, geometry, frames, errors),
-`encoder` (name, preference, bitrate, frames, status), `webrtc` (DTLS state
+`/api/status` reports: overall `state` (`idle`, `connecting`, `no-media`,
+`sending`, `streaming`, `camera-error`), `http` (bound address, open
+connections, TLS attempts rejected), `source` (kind, name, geometry,
+capture FPS, frames, errors), `encoder` (name, kind, preference, bitrate,
+frames, keyframes, status `idle|ok|stalled|failed`), `pipeline` (running,
+last error, next automatic retry), `layers` (see
+[LAN access](#lan-access-step-by-step-check)), `webrtc` (DTLS state
 and fingerprint, session counts, handshake counters), `media` (capture and
 encode FPS, bitrate, dropped access units, idle and mismatched frames skip
 counters), `process` (CPU percent, RSS in KiB, log counters), the `interfaces`
@@ -573,7 +698,10 @@ holds an error message.
 
 `/api/stats` adds RTP totals (packets, bytes, bitrate, retransmissions,
 NACKs, PLIs, RTCP sent, send errors) and one object per session with state,
-peer address, RTT, loss, jitter, per-session counters for datagrams received,
+ICE peer and signaling peer addresses, negotiated H.264 payload type and
+profile-level-id, frames and keyframes sent, frames held while waiting for a
+keyframe, age of the last media and of the last receiver report, frames the
+browser reports as decoded, RTT, loss, jitter, per-session counters for datagrams received,
 STUN checks accepted and rejected, retransmissions, and socket errors.
 
 Examples:
@@ -597,7 +725,8 @@ state-changing operations.
 | Symptom | Action |
 | --- | --- |
 | Video frozen, page still live | The browser socket is still open; press Connect again, or wait for the DTLS watchdog (30 s) and the page's automatic single retry |
-| Camera unplugged or `rpicam-vid` died | `POST /api/camera/restart`, or the restart button |
+| Camera unplugged or `rpicam-vid` died | Automatic: the pipeline is rebuilt after 5 s, then 10, 20, ... up to 60 s between attempts. `POST /api/camera/restart` retries at once |
+| Hardware encoder fails while running | Automatic: rebuilt at once; with `encoder = auto` it continues on libx264 |
 | Handshake failures after a browser cache reset | `POST /api/webrtc/restart` rotates the certificate and drops stale sessions |
 | Bitrate or verbose flag changed on disk | `POST /api/config/reload` |
 | Server feels wedged | `GET /api/logs?level=error` then `GET /api/status`; a hang would be visible as a stale `uptime_sec` and `requests` counter |
@@ -639,12 +768,18 @@ Measure it, do not assume it:
    `video.requestVideoFrameCallback` in the console timestamps displayed
    frames.
 
-Server cost, measured on the x86-64 container used to develop this version
-(2 cores, libx264, synthetic 640x480 test source at 30 fps, one session):
-`process.cpu_percent` 16.5, `process.rss_kb` 20212, `encode_fps` 30.0. A Pi
-4 or 5 with the hardware encoder is in a different regime; use
-`/api/status` and `top` on the actual device rather than trusting either
-number.
+RTT (`rtt_ms`) is computed per RFC 3550 section 6.4.1 from the receiver
+report block about our SSRC: `RTT = A - LSR - DLSR` in 1/65536 s units,
+converted to milliseconds. The previous version read LSR/DLSR at the wrong
+offsets of the report block, which produced values like 59770778 ms; it now
+reports -1 until a valid report arrives rather than a made-up number.
+
+Server cost has to be measured on the device: `/api/status` gives
+`capture_fps`, `encode_fps` and `process.cpu_percent`, and `top -H -p $(pidof
+camstream)` shows the capture, encode and main threads separately. The
+earlier libx264 setup (`veryfast`, one thread) reached only about 13 encode
+FPS at 1280x720 on a Pi; `superfast` with sliced threads is the fix, with
+the latency properties of `zerolatency` unchanged.
 
 Knobs that matter, in order: use the hardware encoder (`--encoder hw`);
 lower `--fps`; lower `--width`/`--height`; raise `--keyframe` to save
@@ -803,15 +938,27 @@ is why `OPT` is repeated there.
 
 `make install` (as root) copies three files: the binary to
 `/usr/local/bin/camstream`, the commented sample config to
-`/etc/camstream.conf`, and the unit to
-`/lib/systemd/system/camstream.service`.
+`/etc/camstream.conf` (an existing file is kept; the new defaults are then
+written to `/etc/camstream.conf.new`), and the unit to
+`/lib/systemd/system/camstream.service`. It prints the SHA-256 of the built
+and the installed binary, which must be equal.
 
 ```sh
+make clean && make
 sudo make install
 sudo systemctl daemon-reload
-sudo systemctl enable --now camstream
-journalctl -u camstream -f
+sudo systemctl enable camstream
+sudo systemctl restart camstream
+systemctl status camstream --no-pager
+journalctl -u camstream -n 50 --no-pager
+# the running process uses the file that was just installed:
+sha256sum build/camstream /usr/local/bin/camstream
+sudo ls -l /proc/$(pidof camstream)/exe
 ```
+
+The shipped config uses `source = csi` at 1280x720@30. An older
+`/etc/camstream.conf` may still say `source = v4l2`; compare it with
+`/etc/camstream.conf.new`.
 
 The installed unit starts `camstream` with `/etc/camstream.conf`, restarts it
 on failure, and lets it join the `video` group. It ships without `User=` so
@@ -841,7 +988,13 @@ camstream`.
 | --- | --- |
 | `v4l2: cannot open /dev/video0` | Device path, permissions, `video` group membership |
 | `VIDIOC_STREAMON failed: errno=16 (Device or resource busy)` | Another process holds the camera; `fuser -v /dev/video0` |
-| `csi: conflicting camera process detected` | Log names the PID; stop it |
+| `csi: camera busy: PID ... holds it` | Log names the PID; stop it |
+| Browser: `PR_END_OF_FILE_ERROR`, "secure connection failed", "connection was reset" | The browser used `https://`. Type `http://<pi>:8080/`; the log shows `TLS handshake on the plain HTTP port` |
+| `http: cannot listen on 0.0.0.0:8080: TCP port 8080 is already in use` | The service (or another instance) runs: `sudo ss -ltnp 'sport = :8080'`, `sudo systemctl stop camstream` |
+| `curl http://127.0.0.1:8080/` works, the LAN address does not | `listen` is not `0.0.0.0`, or a firewall: [LAN access](#lan-access-step-by-step-check) |
+| `VIDIOC_STREAMON` errno 22 on `/dev/video0` with a CSI camera | Expected: use `--source csi` |
+| `m2m ... VIDIOC_STREAMON ... errno=11` | Hardware encoder refused the stream; `auto` falls back to libx264, `--encoder sw` skips the probe |
+| `peer` in stats is the Pi's own address | The viewer runs on the Pi; open the page from the other PC |
 | Page loads, Connect stays on `connecting` | Firewall blocks UDP in the media range; check the browser console and `/api/logs` |
 | `ICE failed` in the page and `stun_rejected` climbing in stats | The offer was regenerated by a stale page; press Connect again, then `POST /api/webrtc/restart` |
 | Black video, counters climbing | Encoder issue: `/api/status` `encoder.status`, `media.skipped_mismatch`, `/api/logs` |
@@ -868,6 +1021,14 @@ without `--verbose`, because the ring keeps all levels.
 
 ## Known limitations
 
+- Plain HTTP only. There is no HTTPS listener; a browser forced to
+  `https://` cannot load the page (the server rejects the TLS handshake with
+  an alert and logs it).
+- The Pi 5 has no hardware H.264 encoder; `auto` uses libx264 there.
+- The V4L2 M2M fixes (capture format size, stream-on order, one-by-one
+  controls) follow the bcm2835-codec driver source and pass the build and
+  the test suite, but they have not been run on Pi hardware in this
+  revision.
 - LAN only. No STUN, TURN, or internet traversal; ICE-lite with host
   candidates assumes the browser can reach the server's addresses.
 - Video only. No audio, no `getUserMedia` on the page.

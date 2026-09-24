@@ -22,15 +22,51 @@
 
 #define SDP_MAX_CANDIDATES 8
 
+#define SDP_MAX_MLINES 8
+#define SDP_MAX_H264 16
+
+/* One m= section of the offer, in offer order. */
+typedef struct {
+    char kind[16];              /* audio, video, application, ... */
+    char proto[32];             /* UDP/TLS/RTP/SAVPF, UDP/DTLS/SCTP, ... */
+    char fmt[32];               /* first format token, for a rejection */
+    char mid[24];
+} SdpMediaLine;
+
+/* An H264 payload type of the video section with its fmtp. */
+typedef struct {
+    int payload_type;
+    int packetization_mode;     /* 0 when absent (RFC 6184 default) */
+    char profile_level_id[8];   /* six hex digits, "" when absent */
+} SdpH264Format;
+
 typedef struct {
     char ice_ufrag[80];
     char ice_pwd[128];
     char fingerprint[128];      /* "sha-256 AA:BB:..." */
     char setup[24];             /* actpass, active or passive */
     char video_mid[24];
-    char audio_mid[24];
-    int has_audio;
-    int h264_payload_type;      /* -1 when the offer has no H264 */
+
+    /*
+     * Every m= line in offer order. JSEP requires the answer to repeat
+     * them in the same order, rejecting (port 0) the ones not used.
+     * video_mline is the index of the answered video section, -1 when
+     * mline_count is 0 (an offer built by hand in tests).
+     */
+    SdpMediaLine mlines[SDP_MAX_MLINES];
+    size_t mline_count;
+    int video_mline;
+
+    SdpH264Format h264[SDP_MAX_H264];
+    size_t h264_count;
+
+    /*
+     * Chosen H264 format: packetization-mode=1 (FU-A is required for
+     * frames larger than one packet), constrained baseline preferred,
+     * then baseline. -1 when the offer has no usable H264.
+     */
+    int h264_payload_type;
+    char h264_profile_level_id[8];
 } SdpOffer;
 
 typedef struct {
