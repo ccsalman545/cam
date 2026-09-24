@@ -53,6 +53,14 @@ int stun_is_binding_request(const uint8_t *buf, size_t len,
                             uint8_t tid[12]);
 
 /*
+ * A STUN Binding indication (type 0x0011) is the peer's keepalive: it
+ * carries no transaction to answer and no MESSAGE-INTEGRITY contract,
+ * so it is counted and ignored (RFC 5389 section 12, RFC 8445
+ * section 11 keepalives).
+ */
+int stun_is_binding_indication(const uint8_t *buf, size_t len);
+
+/*
  * Copy the STUN USERNAME attribute into a C string (truncated
  * to out_size - 1). Returns 0 on success, -1 when absent.
  */

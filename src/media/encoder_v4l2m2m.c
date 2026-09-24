@@ -15,6 +15,7 @@
  *   CAPTURE queue  produces Annex-B H.264
  */
 #include "h264_encoder.h"
+#include "log.h"
 #include "yuv_convert.h"
 
 #include <errno.h>
@@ -150,8 +151,35 @@ static int m2m_set_controls(struct M2mBackend *encoder,
      * subsets, so failure of the batch simply means defaults.
      */
     if (xioctl(encoder->fd, VIDIOC_S_EXT_CTRLS, &controls) == -1) {
-        fprintf(stderr, "m2m: optional encoder controls rejected (%s)\n",
-                strerror(errno));
+        log_warn("encode", "m2m: optional encoder controls rejected: "
+                           "errno=%d (%s)", errno, strerror(errno));
+    }
+
+    return 0;
+}
+
+/*
+ * Live bitrate change. Drivers that do not expose a writable bitrate
+ * control simply reject the ioctl and the caller falls back to
+ * reporting a restart as required.
+ */
+static int m2m_set_bitrate(struct M2mBackend *encoder, uint32_t bitrate_kbps)
+{
+    if (encoder == NULL || encoder->fd < 0 || bitrate_kbps == 0) {
+        return -1;
+    }
+
+    struct v4l2_control control;
+
+    memset(&control, 0, sizeof(control));
+    control.id = V4L2_CID_MPEG_VIDEO_BITRATE;
+    control.value = (int32_t) (bitrate_kbps * 1000);
+
+    if (xioctl(encoder->fd, VIDIOC_S_CTRL, &control) == -1) {
+        log_warn("encode", "m2m: bitrate change to %u kbps rejected: "
+                           "errno=%d (%s)", bitrate_kbps, errno,
+                 strerror(errno));
+        return -1;
     }
 
     return 0;
@@ -187,7 +215,7 @@ static struct M2mBackend *m2m_open(const char *path,
 
     encoder->fd = open(path, O_RDWR | O_NONBLOCK);
     if (encoder->fd == -1) {
-        fprintf(stderr, "m2m: cannot open %s: %s\n", path, strerror(errno));
+        log_error("encode", "m2m: cannot open %s: %s", path, strerror(errno));
         free(encoder);
         return NULL;
     }
@@ -238,7 +266,7 @@ static struct M2mBackend *m2m_open(const char *path,
     }
 
     if (!input_ok) {
-        fprintf(stderr, "m2m: %s accepts neither NV12 nor YU12 input\n", path);
+        log_info("encode", "m2m: %s accepts neither NV12 nor YU12 input", path);
         goto fail;
     }
 
@@ -252,7 +280,7 @@ static struct M2mBackend *m2m_open(const char *path,
     format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
 
     if (xioctl(encoder->fd, VIDIOC_S_FMT, &format) == -1) {
-        perror("m2m: VIDIOC_S_FMT (capture)");
+        log_error("encode", "m2m: VIDIOC_S_FMT (capture): errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
@@ -275,7 +303,7 @@ static struct M2mBackend *m2m_open(const char *path,
 
     if (xioctl(encoder->fd, VIDIOC_REQBUFS, &request) == -1 ||
         request.count < 2) {
-        perror("m2m: VIDIOC_REQBUFS (output)");
+        log_error("encode", "m2m: VIDIOC_REQBUFS (output): errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
@@ -294,7 +322,7 @@ static struct M2mBackend *m2m_open(const char *path,
         buffer.m.planes = planes;
 
         if (xioctl(encoder->fd, VIDIOC_QUERYBUF, &buffer) == -1) {
-            perror("m2m: VIDIOC_QUERYBUF (output)");
+            log_error("encode", "m2m: VIDIOC_QUERYBUF (output): errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
 
@@ -306,7 +334,7 @@ static struct M2mBackend *m2m_open(const char *path,
                                           planes[0].m.mem_offset);
 
         if (encoder->out_bufs[i].start == MAP_FAILED) {
-            perror("m2m: mmap (output)");
+            log_error("encode", "m2m: mmap (output): errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
 
@@ -318,7 +346,7 @@ static struct M2mBackend *m2m_open(const char *path,
                                                  encoder->fd,
                                                  planes[1].m.mem_offset);
             if (encoder->out_bufs_uv[i].start == MAP_FAILED) {
-                perror("m2m: mmap (output uv)");
+                log_error("encode", "m2m: mmap (output uv): errno=%d (%s)", errno, strerror(errno));
                 goto fail;
             }
         }
@@ -339,7 +367,7 @@ static struct M2mBackend *m2m_open(const char *path,
 
     if (xioctl(encoder->fd, VIDIOC_REQBUFS, &request) == -1 ||
         request.count < 2) {
-        perror("m2m: VIDIOC_REQBUFS (capture)");
+        log_error("encode", "m2m: VIDIOC_REQBUFS (capture): errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
@@ -358,7 +386,7 @@ static struct M2mBackend *m2m_open(const char *path,
         buffer.m.planes = planes;
 
         if (xioctl(encoder->fd, VIDIOC_QUERYBUF, &buffer) == -1) {
-            perror("m2m: VIDIOC_QUERYBUF (capture)");
+            log_error("encode", "m2m: VIDIOC_QUERYBUF (capture): errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
 
@@ -370,7 +398,7 @@ static struct M2mBackend *m2m_open(const char *path,
                                           planes[0].m.mem_offset);
 
         if (encoder->cap_bufs[i].start == MAP_FAILED) {
-            perror("m2m: mmap (capture)");
+            log_error("encode", "m2m: mmap (capture): errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
 
@@ -385,7 +413,7 @@ static struct M2mBackend *m2m_open(const char *path,
         buffer.m.planes = planes;
 
         if (xioctl(encoder->fd, VIDIOC_QBUF, &buffer) == -1) {
-            perror("m2m: VIDIOC_QBUF (capture)");
+            log_error("encode", "m2m: VIDIOC_QBUF (capture): errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
     }
@@ -394,12 +422,12 @@ static struct M2mBackend *m2m_open(const char *path,
     enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
     if (xioctl(encoder->fd, VIDIOC_STREAMON, &cap_type) == -1) {
-        perror("m2m: VIDIOC_STREAMON (capture)");
+        log_error("encode", "m2m: VIDIOC_STREAMON (capture): errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
     if (xioctl(encoder->fd, VIDIOC_STREAMON, &out_type) == -1) {
-        perror("m2m: VIDIOC_STREAMON (output)");
+        log_error("encode", "m2m: VIDIOC_STREAMON (output): errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
@@ -408,7 +436,7 @@ static struct M2mBackend *m2m_open(const char *path,
              encoder->input_format == V4L2_PIX_FMT_NV12M ||
              encoder->input_format == V4L2_PIX_FMT_NV12 ? "NV12" : "YU12");
 
-    printf("m2m: encoder ready on %s, %ux%u\n", path, width, height);
+    log_info("encode", "m2m: encoder ready on %s, %ux%u", path, width, height);
 
     if (name_out != NULL && name_out_size > 0) {
         snprintf(name_out, name_out_size, "%s", encoder->name);
@@ -590,7 +618,7 @@ static int m2m_encode(struct M2mBackend *encoder,
     }
 
     if (xioctl(encoder->fd, VIDIOC_QBUF, &out_buffer) == -1) {
-        perror("m2m: VIDIOC_QBUF (output)");
+        log_error("encode", "m2m: VIDIOC_QBUF (output): errno=%d (%s)", errno, strerror(errno));
         encoder->errors++;
         return 0;
     }
@@ -627,7 +655,7 @@ static int m2m_encode(struct M2mBackend *encoder,
 
         if (bytes > 0) {
             if (*out_size + bytes > out_capacity) {
-                fprintf(stderr, "m2m: access unit overflow\n");
+                log_error("encode", "m2m: access unit overflow");
             } else {
                 memcpy(out + *out_size, encoder->cap_bufs[cap_index].start, bytes);
                 *out_size += bytes;
@@ -647,7 +675,7 @@ static int m2m_encode(struct M2mBackend *encoder,
         cap_buffer.m.planes = cap_planes;
 
         if (xioctl(encoder->fd, VIDIOC_QBUF, &cap_buffer) == -1) {
-            perror("m2m: VIDIOC_QBUF (capture)");
+            log_error("encode", "m2m: VIDIOC_QBUF (capture): errno=%d (%s)", errno, strerror(errno));
             break;
         }
 
@@ -711,6 +739,11 @@ int m2m_backend_encode(void *backend,
     return m2m_encode((struct M2mBackend *) backend,
                       plane_y, plane_u, plane_v, pts_us,
                       force_idr, out, out_capacity, out_size, out_is_idr);
+}
+
+int m2m_backend_set_bitrate(void *backend, uint32_t bitrate_kbps)
+{
+    return m2m_set_bitrate((struct M2mBackend *) backend, bitrate_kbps);
 }
 
 void m2m_backend_close(void *backend)

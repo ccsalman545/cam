@@ -26,7 +26,19 @@ void source_worker_stop(SourceWorker *worker);
  */
 void source_worker_join(SourceWorker *worker);
 
+/* Frames published into the hub since start. */
 uint64_t source_worker_captured(const SourceWorker *worker);
+
+/*
+ * Capture errors reported by the source (capture() returned -1) and
+ * whether the worker gave up. A camera that disappears keeps returning
+ * errors; after SOURCE_FATAL_ERRORS in a row the worker stops trying
+ * and marks itself failed so /api/status can say so instead of showing
+ * a healthy process with no video.
+ */
+uint64_t source_worker_errors(const SourceWorker *worker);
+
+int source_worker_failed(const SourceWorker *worker);
 
 void source_worker_destroy(SourceWorker *worker);
 

@@ -1,11 +1,25 @@
 /*
  * rtcp.c
  *
- * See rtcp.h.
+ * See rtcp.h. All parsing is bounds checked: a report block is only
+ * read when the packet is long enough to contain it.
  */
 #include "rtcp.h"
 
 #include <string.h>
+
+#define RTCP_PT_SR 200
+#define RTCP_PT_RR 201
+#define RTCP_PT_BYE 203
+#define RTCP_PT_RTPFB 205
+#define RTCP_PT_PSFB 206
+
+#define RTCP_FMT_NACK 1
+#define RTCP_FMT_PLI 1
+#define RTCP_FMT_FIR 4
+
+#define RTCP_HEADER_SIZE 8
+#define RTCP_REPORT_BLOCK_SIZE 24
 
 static uint16_t read_be16(const uint8_t *p)
 {
@@ -40,14 +54,15 @@ size_t rtcp_build_sender_report(uint8_t *out,
                                 uint32_t octet_count)
 {
     /*
-     * NTP timestamp: seconds since 1900-01-01 plus fraction.
+     * NTP timestamp: seconds since 1900-01-01 plus a 32 bit fraction.
+     * The 2208988800 offset converts the Unix epoch.
      */
     const uint64_t ntp_secs = ntp_wall_us / 1000000ULL + 2208988800ULL;
     const uint32_t ntp_frac =
         (uint32_t) (((ntp_wall_us % 1000000ULL) << 32) / 1000000ULL);
 
     out[0] = 0x80;               /* V=2, P=0, RC=0 */
-    out[1] = 200;                /* PT=SR */
+    out[1] = RTCP_PT_SR;
     write_be16(out + 2, 6);      /* length in 32 bit words minus one */
     write_be32(out + 4, ssrc);
 
@@ -59,6 +74,21 @@ size_t rtcp_build_sender_report(uint8_t *out,
     write_be32(out + 24, octet_count);
 
     return RTCP_SR_SIZE;
+}
+
+int rtcp_rtt_ms(uint32_t now_ntp_msw,
+                uint32_t rr_last_sr,
+                uint32_t rr_delay_since_sr)
+{
+    if (rr_last_sr == 0) {
+        /* The peer has not received a sender report yet. */
+        return -1;
+    }
+
+    /* RFC 3550 A.3, arithmetic in the 1/65536 second unit. */
+    uint32_t elapsed = now_ntp_msw - rr_last_sr - rr_delay_since_sr;
+
+    return (int) ((uint64_t) elapsed * 1000ULL / 65536ULL);
 }
 
 void rtcp_parse(const uint8_t *buffer,
@@ -81,75 +111,77 @@ void rtcp_parse(const uint8_t *buffer,
         const size_t words = read_be16(buffer + offset + 2);
         const size_t packet_len = (words + 1) * 4;
 
-        if (offset + packet_len > length || packet_len == 0) {
+        if (offset + packet_len > length || packet_len < 4) {
             return;
         }
 
+        const uint8_t *body = buffer + offset;
+        const size_t body_len = packet_len;
 
         switch (packet_type) {
-        case 205: {
+        case RTCP_PT_SR:
+            /* Sender reports from the peer carry no video feedback. */
+            break;
+
+        case RTCP_PT_RR: {
+            /* First report block only: we send one stream. */
+            if (count_or_fmt >= 1 &&
+                body_len >= RTCP_HEADER_SIZE + RTCP_REPORT_BLOCK_SIZE) {
+                const uint8_t *block = body + RTCP_HEADER_SIZE;
+
+                feedback->has_rr = 1;
+                feedback->rr_fraction_lost = block[4];
+                feedback->rr_highest_seq = read_be32(block + 8);
+                feedback->rr_jitter = read_be32(block + 16);
+                feedback->rr_last_sr = read_be32(block + 20);
+                feedback->rr_delay_since_sr = read_be32(block + 24);
+            }
+            break;
+        }
+
+        case RTCP_PT_BYE:
+            feedback->bye = 1;
+            break;
+
+        case RTCP_PT_RTPFB: {
             /*
-             * Generic NACK (RTPFB PT=205, FMT=1). PT 200 is
-             * Sender Report and must not be parsed as feedback.
-             * FCI entries are 4-byte (PID, bitmask of the 16
-             * following seqs).
+             * Generic NACK (FMT=1). Each FCI entry is a 16 bit packet
+             * id plus a bitmask of the following 16 sequence numbers.
              */
-            if (count_or_fmt == 1) {
-                const size_t fci = offset + 12;
+            if (count_or_fmt != RTCP_FMT_NACK) {
+                break;
+            }
 
-                for (size_t i = fci;
-                     i + 4 <= offset + packet_len &&
-                     feedback->nack_seqs < 128;
-                     i += 4) {
-                    uint16_t pid = read_be16(buffer + i);
-                    uint16_t mask = read_be16(buffer + i + 2);
+            for (size_t i = offset + 12;
+                 i + 4 <= offset + body_len &&
+                 feedback->nack_seqs < RTCP_MAX_NACK_SEQS;
+                 i += 4) {
+                uint16_t pid = read_be16(buffer + i);
+                uint16_t mask = read_be16(buffer + i + 2);
 
-                    if (feedback->nack_seqs < 128) {
-                        feedback->nack_seq[feedback->nack_seqs++] = pid;
-                    }
+                if (feedback->nack_seqs < RTCP_MAX_NACK_SEQS) {
+                    feedback->nack_seq[feedback->nack_seqs++] = pid;
+                }
 
-                    for (int bit = 0;
-                         bit < 16 &&
-                         feedback->nack_seqs < 128;
-                         bit++) {
-                        if (mask & (1u << bit)) {
-                            feedback->nack_seq[feedback->nack_seqs++] =
-                                (uint16_t) (pid + bit + 1);
-                        }
+                for (int bit = 0;
+                     bit < 16 && feedback->nack_seqs < RTCP_MAX_NACK_SEQS;
+                     bit++) {
+                    if (mask & (1u << bit)) {
+                        feedback->nack_seq[feedback->nack_seqs++] =
+                            (uint16_t) (pid + bit + 1);
                     }
                 }
             }
             break;
         }
 
-        case 201: {
-            /*
-             * Receiver Report: first report block only.
-             */
-            if (count_or_fmt >= 1 && packet_len >= 8 + 24) {
-                feedback->has_rr = 1;
-                feedback->rr_fraction_lost = buffer[offset + 12];
-                feedback->rr_highest_seq = read_be32(buffer + offset + 16);
-                feedback->rr_jitter = read_be32(buffer + offset + 20);
-            }
-            break;
-        }
-
-        case 203:
-            feedback->bye = 1;
-            break;
-
-        case 206: {
-            /*
-             * Payload-specific feedback.
-             */
-            if (count_or_fmt == 1) {
+        case RTCP_PT_PSFB:
+            if (count_or_fmt == RTCP_FMT_PLI) {
                 feedback->pli++;
-            } else if (count_or_fmt == 4) {
+            } else if (count_or_fmt == RTCP_FMT_FIR) {
                 feedback->fir++;
             }
             break;
-        }
 
         default:
             break;

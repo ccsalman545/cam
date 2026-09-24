@@ -1,8 +1,8 @@
 /*
  * app_server.h
  *
- * Top level server: wires source, encoder and WebRTC
- * transports into one process and runs the network loop.
+ * Top level server: wires the capture source, the encoder and the
+ * WebRTC transport into one process and runs the network loop.
  */
 #ifndef APP_APP_SERVER_H
 #define APP_APP_SERVER_H
@@ -12,9 +12,10 @@
 #include "app_config.h"
 
 /*
- * Run the server until *stop_flag becomes nonzero.
- * Returns a process exit code.
+ * Run until *stop_flag becomes nonzero. The configuration is taken by
+ * pointer because /api/config/reload may update the runtime parts of
+ * it. Returns the process exit code.
  */
-int app_server_run(const AppConfig *config, volatile sig_atomic_t *stop_flag);
+int app_server_run(AppConfig *config, volatile sig_atomic_t *stop_flag);
 
 #endif

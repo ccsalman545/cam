@@ -8,6 +8,8 @@
  */
 #include "encoder_worker.h"
 
+#include "log.h"
+
 #include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -59,7 +61,7 @@ static void *encoder_thread(void *arg)
 {
     EncoderWorker *worker = arg;
 
-    printf("encode worker: started\n");
+    log_info("encode", "encode worker: started");
 
     int was_active = 0;
     int stall_warned = 0;
@@ -117,10 +119,9 @@ static void *encoder_thread(void *arg)
         if (!stall_warned &&
             worker->frames_in - last_encode_at_seen >= STALL_WATCHDOG_FRAMES) {
             stall_warned = 1;
-            fprintf(stderr,
-                    "encode worker: stalled, no output for %llu frames while "
-                    "active (encoded total=%llu, skipped: mismatch=%llu "
-                    "bad-size=%llu, encoder-no-output=%llu)\n",
+            log_warn("encode", "encode worker: stalled, no output for %llu frames "
+                    "while active (encoded total=%llu, skipped: mismatch=%llu "
+                    "bad-size=%llu, encoder-no-output=%llu)",
                     (unsigned long long) (worker->frames_in -
                                           last_encode_at_seen),
                     (unsigned long long) worker->frames_encoded,
@@ -133,9 +134,8 @@ static void *encoder_thread(void *arg)
             frame->height != worker->height) {
             if (!mismatch_logged) {
                 mismatch_logged = 1;
-                fprintf(stderr,
-                        "encode worker: frame %ux%u does not match the "
-                        "encoder %ux%u, frames are dropped\n",
+                log_error("encode", "encode worker: frame %ux%u does not match the "
+                        "encoder %ux%u, frames are dropped",
                         frame->width, frame->height,
                         worker->width, worker->height);
             }
@@ -147,9 +147,8 @@ static void *encoder_thread(void *arg)
         if (frame->size == 0) {
             if (!bad_size_logged) {
                 bad_size_logged = 1;
-                fprintf(stderr,
-                        "encode worker: empty frame (size 0), "
-                        "frames are dropped\n");
+                log_info("encode", "encode worker: empty frame (size 0), "
+                        "frames are dropped");
             }
             worker->skipped_bad_size++;
             frame_unref(frame_hub_pool(worker->hub), frame);
@@ -207,7 +206,7 @@ static void *encoder_thread(void *arg)
         frame_unref(frame_hub_pool(worker->hub), frame);
 
         if (result < 0) {
-            fprintf(stderr, "encode worker: encoder error, stopping\n");
+            log_error("encode", "encode worker: encoder error, stopping");
             break;
         }
 
@@ -236,11 +235,11 @@ static void *encoder_thread(void *arg)
                          au_size,
                          pts_us,
                          is_idr) != 0) {
-            fprintf(stderr, "encode worker: access unit too large\n");
+            log_info("encode", "encode worker: access unit too large");
         }
     }
 
-    printf("encode worker: stopped (%llu frames in, %llu encoded)\n",
+    log_info("encode", "encode worker: stopped (%llu frames in, %llu encoded)",
            (unsigned long long) worker->frames_in,
            (unsigned long long) worker->frames_encoded);
 
@@ -265,9 +264,7 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
     size_t i420_size = (size_t) width * height * 3 / 2;
 
     if (i420_size > ENCODE_SCRATCH_MAX) {
-        fprintf(stderr,
-                "encode worker: %ux%u exceeds the scratch limit (%lu MB)\n",
-                width, height, (unsigned long) (ENCODE_SCRATCH_MAX / 1048576));
+        log_info("encode", "encode worker: %ux%u exceeds the scratch limit (%lu MB)", width, height, (unsigned long) (ENCODE_SCRATCH_MAX / 1048576));
         if (worker->consumer != NULL) {
             frame_hub_unsubscribe(hub, worker->consumer);
         }

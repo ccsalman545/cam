@@ -19,6 +19,8 @@
 
 #include "video_source.h"
 
+#include "log.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -109,10 +111,9 @@ static int check_camera_conflicts(void)
                 if (strcmp(comm, conflict_names[i]) == 0) {
                     fclose(f);
                     closedir(dir);
-                    fprintf(stderr,
-                            "csi: conflicting camera process detected: PID %d (%s).\n"
-                            "     The Raspberry Pi CSI camera sensor can only be accessed by one process at a time.\n"
-                            "     Please stop it before starting camstream (e.g. kill %d).\n",
+                    log_warn("capture", "csi: conflicting camera process detected: "
+                            "PID %d (%s); the CSI sensor is single-owner, stop it first "
+                            "with kill %d",
                             (int) pid, comm, (int) pid);
                     return -1;
                 }
@@ -135,7 +136,7 @@ static int find_rpicam_binary(const char *explicit_path, char *out_path, size_t 
             snprintf(out_path, out_size, "%s", explicit_path);
             return 0;
         }
-        fprintf(stderr, "csi: specified binary '%s' not found or not executable\n", explicit_path);
+        log_error("capture", "csi: specified binary '%s' not found or not executable", explicit_path);
         return -1;
     }
 
@@ -180,10 +181,8 @@ static int find_rpicam_binary(const char *explicit_path, char *out_path, size_t 
         }
     }
 
-    fprintf(stderr,
-            "csi: neither 'rpicam-vid' nor 'libcamera-vid' was found on this system.\n"
-            "     Install the official camera tools with:\n"
-            "       sudo apt update && sudo apt install -y rpicam-apps\n");
+    log_error("capture", "csi: neither rpicam-vid nor libcamera-vid found in PATH; "
+            "install them with: sudo apt install -y rpicam-apps");
     return -1;
 }
 
@@ -204,7 +203,7 @@ static int read_full_frame(int fd, uint8_t *buf, size_t total_bytes,
 
         if (poll_ret < 0) {
             if (errno == EINTR) continue;
-            perror("csi: poll error");
+            log_error("capture", "csi: poll: errno=%d (%s)", errno, strerror(errno));
             return -1;
         }
 
@@ -214,7 +213,7 @@ static int read_full_frame(int fd, uint8_t *buf, size_t total_bytes,
                 int status = 0;
                 pid_t r = waitpid(child_pid, &status, WNOHANG);
                 if (r == child_pid) {
-                    fprintf(stderr, "csi source: rpicam-vid exited unexpectedly (status %d)\n", status);
+                    log_error("capture", "csi: rpicam-vid exited unexpectedly (status %d)", status);
                     return -1;
                 }
             }
@@ -226,7 +225,7 @@ static int read_full_frame(int fd, uint8_t *buf, size_t total_bytes,
 
             if (n < 0) {
                 if (errno == EINTR || errno == EAGAIN) continue;
-                perror("csi: read error");
+                log_error("capture", "csi: read error: errno=%d (%s)", errno, strerror(errno));
                 return -1;
             }
 
@@ -234,10 +233,10 @@ static int read_full_frame(int fd, uint8_t *buf, size_t total_bytes,
                 /* EOF */
                 *running = 0;
                 if (bytes_read == 0) {
-                    fprintf(stderr, "camera source ended: rpicam-vid pipe closed (EOF)\n");
+                    log_error("capture", "camera source ended: rpicam-vid pipe closed (EOF)");
                 } else {
-                    fprintf(stderr, "csi source error: incomplete YUV420 frame (read %zu of %zu bytes)\n",
-                            bytes_read, total_bytes);
+                    log_error("capture", "csi: incomplete YUV420 frame (read %zu of %zu bytes)",
+                              bytes_read, total_bytes);
                 }
                 return -1;
             }
@@ -263,7 +262,7 @@ static int csi_start(VideoSource *source)
 
     if (impl->is_stdin) {
         impl->running = 1;
-        printf("csi: reading raw YUV420 frames from standard input (%ux%u @ %u fps, frame size %zu bytes)\n",
+        log_info("capture", "csi: reading raw YUV420 frames from standard input (%ux%u @ %u fps, frame size %zu bytes)",
                impl->width, impl->height, impl->fps, impl->frame_size);
         return 0;
     }
@@ -271,13 +270,13 @@ static int csi_start(VideoSource *source)
     /* Spawn rpicam-vid subprocess */
     int pipefds[2];
     if (pipe(pipefds) != 0) {
-        perror("csi: pipe creation failed");
+        log_error("capture", "csi: pipe creation failed: errno=%d (%s)", errno, strerror(errno));
         return -1;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
-        perror("csi: fork failed");
+        log_error("capture", "csi: fork failed: errno=%d (%s)", errno, strerror(errno));
         close(pipefds[0]);
         close(pipefds[1]);
         return -1;
@@ -289,7 +288,7 @@ static int csi_start(VideoSource *source)
 
         /* Redirect stdout to write end of pipe */
         if (dup2(pipefds[1], STDOUT_FILENO) == -1) {
-            perror("csi: dup2 stdout failed");
+            log_error("capture", "csi: dup2 stdout failed: errno=%d (%s)", errno, strerror(errno));
             _exit(127);
         }
         if (pipefds[1] != STDOUT_FILENO) {
@@ -323,7 +322,7 @@ static int csi_start(VideoSource *source)
         };
 
         execv(impl->bin_path, argv);
-        perror("csi: execv failed");
+        log_error("capture", "csi: execv failed: errno=%d (%s)", errno, strerror(errno));
         _exit(127);
     }
 
@@ -333,8 +332,7 @@ static int csi_start(VideoSource *source)
     impl->child_pid = pid;
     impl->running = 1;
 
-    printf("csi: spawned %s (PID %d) for %ux%u @ %u fps YUV420\n",
-           impl->bin_path, (int) pid, impl->width, impl->height, impl->fps);
+    log_info("capture", "csi: spawned %s (PID %d) for %ux%u @ %u fps YUV420", impl->bin_path, (int) pid, impl->width, impl->height, impl->fps);
 
     return 0;
 }
@@ -397,7 +395,9 @@ static void csi_close(VideoSource *source)
                     exited = 1;
                     break;
                 }
-                usleep(100000); /* 100ms */
+                struct timespec delay = { 0, 100000000L };
+
+                nanosleep(&delay, NULL);
             }
 
             if (!exited) {

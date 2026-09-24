@@ -53,10 +53,30 @@ typedef struct {
 /*
  * One time global init: certificate generation, shared
  * SSL_CTX, srtp_init(). Returns 0 on success.
+ *
+ * Safe to call again after dtls_srtp_global_shutdown(): a WebRTC
+ * restart generates a new certificate, so the fingerprint in the next
+ * SDP answer changes and viewers must reload the page.
  */
 int dtls_srtp_global_init(void);
 
 void dtls_srtp_global_shutdown(void);
+
+typedef struct {
+    uint64_t handshakes_started;
+    uint64_t handshakes_completed;
+    uint64_t handshake_failures;
+    uint64_t fingerprint_mismatches;
+} DtlsSrtpGlobalStats;
+
+/* Process wide DTLS counters, for the diagnostics API. */
+void dtls_srtp_global_stats(DtlsSrtpGlobalStats *out);
+
+/*
+ * Human readable reason for the last failure of this session, or an
+ * empty string. Valid until the session is destroyed.
+ */
+const char *dtls_srtp_failure_reason(const DtlsSrtp *session);
 
 /*
  * SHA-256 fingerprint of the local certificate, formatted for

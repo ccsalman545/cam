@@ -1,9 +1,8 @@
 /*
  * embed_assets.c
  *
- * Build time helper: embed text files as C byte arrays so the
- * web page can be served from the single camstream-janus binary
- * on an isolated LAN with no web_root.
+ * Build time helper: embed text files as C byte arrays so the single
+ * camstream binary can serve the web page with no web root on disk.
  *
  * usage:
  *   embed_assets <output.h> <guard> <var1> <file1> [<var2> <file2> ...]

@@ -3,7 +3,12 @@
 /*
  * webrtc_session.c
  *
- * Session state machine, see webrtc_session.h.
+ * Session state machine. See webrtc_session.h for the contract.
+ *
+ * Failure policy: a fatal protocol error (DTLS handshake failure,
+ * unauthenticated checks, an unusable socket) closes this session and
+ * nothing else. The HTTP management interface runs in the same loop but
+ * on a different socket, so a broken viewer can never take it down.
  */
 #include "webrtc_session.h"
 
@@ -19,6 +24,7 @@
 #include <openssl/rand.h>
 
 #include "ice_lite.h"
+#include "log.h"
 #include "rtp_h264.h"
 
 #define SESSION_IDLE_TIMEOUT_MS 15000
@@ -26,12 +32,12 @@
 #define IDR_MIN_INTERVAL_MS 400
 #define RTCP_SR_INTERVAL_MS 1000
 #define RETX_CACHE_SIZE 512
+#define MAX_SEND_ERROR_LOGS 5
 
 struct RtcSession {
     RtcSessionConfig config;
     RtcSessionState state;
     int udp_fd;
-    uint16_t udp_port;
 
     char local_ufrag[16];
     char local_pwd[44];
@@ -49,16 +55,21 @@ struct RtcSession {
     int idr_requested;
     int streaming_announced;
     unsigned datagrams_logged;
+    unsigned send_errors_logged;
 
     RtcSessionStats stats;
 
     /*
-     * Retransmission cache: rings indexed by sequence number.
-     * Entries store the protected packet exactly as it was
-     * sent, which is valid RFC 4588 style retransmission.
+     * Retransmission cache, indexed by (sequence % RETX_CACHE_SIZE).
+     * Each entry keeps the protected packet exactly as it was sent, so
+     * a NACK can be answered with the same bytes (RFC 4588 style), and
+     * the sequence number it belongs to, so a NACK for a packet that
+     * has already been overwritten is ignored instead of answered with
+     * a packet the peer never asked for.
      */
     uint8_t (*retx_data)[RTP_MAX_PACKET + 64];
     uint16_t retx_len[RETX_CACHE_SIZE];
+    uint16_t retx_seq[RETX_CACHE_SIZE];
 };
 
 static uint64_t now_ms(void)
@@ -81,6 +92,17 @@ static uint64_t wall_us(void)
            (uint64_t) ts.tv_nsec / 1000ULL;
 }
 
+/* RFC 3550 A.3 round trip time needs the middle 32 bits of the NTP time. */
+static uint32_t ntp_msw(uint64_t wall_us)
+{
+    uint64_t ntp_seconds = wall_us / 1000000ULL + 2208988800ULL;
+    uint32_t ntp_fraction =
+        (uint32_t) (((wall_us % 1000000ULL) << 32) / 1000000ULL);
+
+    return (uint32_t) (((ntp_seconds & 0xFFFFULL) << 16) |
+                       (ntp_fraction >> 16));
+}
+
 static void set_state(RtcSession *session, RtcSessionState state)
 {
     if (session->state == state) {
@@ -89,59 +111,102 @@ static void set_state(RtcSession *session, RtcSessionState state)
 
     session->state = state;
 
-    printf("rtc %08x: state -> %s\n",
-           session->config.id, rtc_session_state_name(session));
+    log_info("rtc", "%08x: state -> %s", session->config.id,
+             rtc_session_state_name(session));
 }
 
 /* ------------------------------------------------------------------ */
-/* DTLS callbacks                                                      */
+/* Socket helpers                                                      */
 /* ------------------------------------------------------------------ */
 
 static socklen_t peer_socklen(const struct sockaddr_storage *peer)
 {
-    if (peer->ss_family == AF_INET) {
-        return sizeof(struct sockaddr_in);
-    }
+    (void) peer;
 
-    if (peer->ss_family == AF_INET6) {
-        return sizeof(struct sockaddr_in6);
-    }
-
-    return sizeof(struct sockaddr_storage);
-}
-
-static void stun_send_error(const RtcSession *session,
-                            const uint8_t tid[12],
-                            uint16_t code,
-                            const struct sockaddr_storage *source)
-{
-    uint8_t err[64];
-    size_t err_len = 0;
-
-    if (stun_build_error_response(tid, code, err, sizeof(err), &err_len) == 0) {
-        sendto(session->udp_fd, err, err_len, 0,
-               (const struct sockaddr *) source,
-               peer_socklen(source));
-    }
+    /* The media socket is AF_INET; IPv6 peers cannot reach it. */
+    return sizeof(struct sockaddr_in);
 }
 
 static void format_peer(const struct sockaddr_storage *source,
                         char *ip, size_t ip_size, uint16_t *port)
 {
-    ip[0] = '?';
-    ip[1] = 0;
-    *port = 0;
-
     if (source->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const struct sockaddr_in *) source;
-        inet_ntop(AF_INET, &a->sin_addr, ip, (socklen_t) ip_size);
+
+        if (inet_ntop(AF_INET, &a->sin_addr, ip, (socklen_t) ip_size) == NULL) {
+            snprintf(ip, ip_size, "?");
+        }
         *port = ntohs(a->sin_port);
-    } else if (source->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) source;
-        inet_ntop(AF_INET6, &a->sin6_addr, ip, (socklen_t) ip_size);
-        *port = ntohs(a->sin6_port);
+        return;
+    }
+
+    snprintf(ip, ip_size, "?");
+    *port = 0;
+}
+
+/*
+ * Single send path: every RTP, RTCP, STUN and DTLS datagram leaves
+ * through here, so a failing socket is counted and reported once
+ * instead of silently dropping media.
+ */
+static int session_sendto(RtcSession *session,
+                          const uint8_t *data,
+                          size_t length,
+                          const struct sockaddr_storage *destination)
+{
+    ssize_t sent = sendto(session->udp_fd, data, length, 0,
+                          (const struct sockaddr *) destination,
+                          peer_socklen(destination));
+
+    if (sent == (ssize_t) length) {
+        return 0;
+    }
+
+    session->stats.send_errors++;
+
+    if (session->send_errors_logged < MAX_SEND_ERROR_LOGS) {
+        session->send_errors_logged++;
+
+        if (sent < 0) {
+            int error = errno;
+
+            log_warn("rtc", "%08x: sendto(%zu bytes) failed: errno=%d (%s)",
+                     session->config.id, length, error, strerror(error));
+        } else {
+            log_warn("rtc", "%08x: short sendto: %zd of %zu bytes",
+                     session->config.id, sent, length);
+        }
+    } else if (session->send_errors_logged == MAX_SEND_ERROR_LOGS) {
+        session->send_errors_logged++;
+        log_warn("rtc", "%08x: further send errors are counted in "
+                        "/api/stats but not logged", session->config.id);
+    }
+
+    return -1;
+}
+
+/*
+ * Answer a check we will not act on with a STUN error response
+ * (RFC 5245 section 16.5) so the peer stops retransmitting instead of
+ * concluding that the path is dead.
+ */
+static void stun_send_error(RtcSession *session,
+                            const uint8_t tid[12],
+                            uint16_t code,
+                            const struct sockaddr_storage *source)
+{
+    uint8_t response[128];
+    size_t response_len = 0;
+
+    if (stun_build_error_response(tid, code, response, sizeof(response),
+                                  &response_len) == 0) {
+        session_sendto(session, response, response_len, source);
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* DTLS callbacks                                                      */
+/* ------------------------------------------------------------------ */
 
 static void dtls_send_udp(void *user, const uint8_t *packet, size_t len)
 {
@@ -151,11 +216,7 @@ static void dtls_send_udp(void *user, const uint8_t *packet, size_t len)
         return;
     }
 
-    ssize_t sent = sendto(session->udp_fd, packet, len, 0,
-                          (struct sockaddr *) &session->remote,
-                          peer_socklen(&session->remote));
-
-    (void) sent;
+    session_sendto(session, packet, len, &session->remote);
 }
 
 static void dtls_on_connected(void *user)
@@ -164,13 +225,30 @@ static void dtls_on_connected(void *user)
 
     set_state(session, RTC_STREAMING);
 
-    /*
-     * A fresh viewer must receive a keyframe before anything
-     * else can be decoded.
-     */
+    /* A viewer that joins mid-GOP needs a keyframe before it can decode. */
     rtc_session_request_idr(session);
 
     session->next_sr_ms = now_ms() + RTCP_SR_INTERVAL_MS;
+}
+
+static void handle_nacks(RtcSession *session, const RtcpFeedback *feedback)
+{
+    for (size_t i = 0; i < feedback->nack_seqs; i++) {
+        uint16_t seq = feedback->nack_seq[i];
+        uint16_t slot = (uint16_t) (seq % RETX_CACHE_SIZE);
+
+        if (session->retx_len[slot] == 0 ||
+            session->retx_seq[slot] != seq) {
+            continue;
+        }
+
+        if (session_sendto(session,
+                           session->retx_data[slot],
+                           session->retx_len[slot],
+                           &session->remote) == 0) {
+            session->stats.retransmissions++;
+        }
+    }
 }
 
 static void dtls_on_rtcp(void *user, uint8_t *packet, size_t len)
@@ -182,7 +260,7 @@ static void dtls_on_rtcp(void *user, uint8_t *packet, size_t len)
     rtcp_parse(packet, len, &feedback);
 
     if (feedback.bye) {
-        printf("rtc %08x: BYE received\n", session->config.id);
+        log_info("rtc", "%08x: BYE received", session->config.id);
         rtc_session_close(session);
         return;
     }
@@ -190,23 +268,22 @@ static void dtls_on_rtcp(void *user, uint8_t *packet, size_t len)
     if (feedback.pli > 0 || feedback.fir > 0) {
         session->stats.pli_received += (uint32_t) feedback.pli +
                                        (uint32_t) feedback.fir;
+        log_debug("rtc", "%08x: keyframe request (pli=%d fir=%d)",
+                  session->config.id, feedback.pli, feedback.fir);
         rtc_session_request_idr(session);
+    }
+
+    if (feedback.has_rr) {
+        session->stats.fraction_lost = feedback.rr_fraction_lost;
+        session->stats.jitter = feedback.rr_jitter;
+        session->stats.rtt_ms = rtcp_rtt_ms(ntp_msw(wall_us()),
+                                            feedback.rr_last_sr,
+                                            feedback.rr_delay_since_sr);
     }
 
     if (feedback.nack_seqs > 0) {
         session->stats.nacks_received += (uint32_t) feedback.nack_seqs;
-
-        for (size_t i = 0; i < feedback.nack_seqs; i++) {
-            uint16_t seq = feedback.nack_seq[i];
-            uint16_t slot = seq % RETX_CACHE_SIZE;
-
-            if (session->retx_len[slot] > 0) {
-                dtls_send_udp(session,
-                              session->retx_data[slot],
-                              session->retx_len[slot]);
-                session->stats.retransmissions++;
-            }
-        }
+        handle_nacks(session, &feedback);
     }
 }
 
@@ -217,7 +294,8 @@ static void dtls_on_state(void *user, DtlsSrtpState state)
     if (state == DTLS_SRTP_HANDSHAKING) {
         set_state(session, RTC_DTLS);
     } else if (state == DTLS_SRTP_FAILED) {
-        printf("rtc %08x: DTLS handshake failed\n", session->config.id);
+        log_error("rtc", "%08x: DTLS failed: %s", session->config.id,
+                  dtls_srtp_failure_reason(session->dtls));
         rtc_session_close(session);
     } else if (state == DTLS_SRTP_CLOSED) {
         rtc_session_close(session);
@@ -230,7 +308,6 @@ static void dtls_on_state(void *user, DtlsSrtpState state)
 
 typedef struct {
     RtcSession *session;
-    int ok;
 } RtpSendContext;
 
 static void rtp_packet_sink(void *user,
@@ -244,8 +321,7 @@ static void rtp_packet_sink(void *user,
     RtpSendContext *ctx = user;
     RtcSession *session = ctx->session;
 
-    if (len > RTP_MAX_PACKET + 64) {
-        ctx->ok = 0;
+    if (len > RTP_MAX_PACKET + 64 || len < RTP_HEADER_SIZE) {
         return;
     }
 
@@ -256,17 +332,14 @@ static void rtp_packet_sink(void *user,
     size_t protected_len = len;
 
     if (dtls_srtp_send_rtp(session->dtls, buffer, &protected_len) != 0) {
-        ctx->ok = 0;
         return;
     }
 
-    /*
-     * Cache the protected packet for NACK retransmission.
-     */
-    uint16_t slot = sequence % RETX_CACHE_SIZE;
+    uint16_t slot = (uint16_t) (sequence % RETX_CACHE_SIZE);
 
     memcpy(session->retx_data[slot], buffer, protected_len);
     session->retx_len[slot] = (uint16_t) protected_len;
+    session->retx_seq[slot] = sequence;
 
     session->stats.packets_sent++;
     session->stats.bytes_sent += len;
@@ -276,32 +349,19 @@ static void rtp_packet_sink(void *user,
 /* Session API                                                         */
 /* ------------------------------------------------------------------ */
 
-static void generate_credentials(char *ufrag, size_t ufrag_size,
-                                 char *pwd, size_t pwd_size)
+static int generate_credentials(char *ufrag, size_t ufrag_size,
+                                char *pwd, size_t pwd_size)
 {
     unsigned char raw[32];
 
+    /*
+     * RAND_bytes fails only when the CSPRNG cannot be seeded, which
+     * would break DTLS too. Report it instead of falling back to weak
+     * credentials derived from the clock.
+     */
     if (RAND_bytes(raw, sizeof(raw)) != 1) {
-        /* Fallback: try /dev/urandom, then time-based entropy */
-        FILE *f = fopen("/dev/urandom", "rb");
-        if (f != NULL) {
-            size_t got = fread(raw, 1, sizeof(raw), f);
-            fclose(f);
-            if (got != sizeof(raw)) {
-                /* partial read, fill rest with time */
-                uint64_t t = (uint64_t) time(NULL) ^ (uint64_t) clock();
-                for (size_t i = got; i < sizeof(raw); i++) {
-                    raw[i] ^= (unsigned char) (t >> (i % 8));
-                }
-            }
-        } else {
-            /* Last resort: mix time and pid */
-            uint64_t seed = (uint64_t) time(NULL) ^ (uint64_t) getpid() ^ (uint64_t) clock();
-            for (size_t i = 0; i < sizeof(raw); i++) {
-                seed = seed * 6364136223846793005ULL + 1;
-                raw[i] = (unsigned char) (seed >> 24);
-            }
-        }
+        log_error("rtc", "RAND_bytes failed while generating ICE credentials");
+        return -1;
     }
 
     static const char alphabet[] =
@@ -320,8 +380,34 @@ static void generate_credentials(char *ufrag, size_t ufrag_size,
     }
     pwd[pos] = 0;
 
-    /* Wipe raw material */
     memset(raw, 0, sizeof(raw));
+
+    return 0;
+}
+
+/*
+ * Release the resources of a session that was never announced to the
+ * server (create failure) or is already closed. Deliberately does not
+ * call rtc_session_close(): the caller either owns a session that is
+ * already closed, or one that never reached the server's session table,
+ * and firing on_closed for it would report a session that never
+ * existed.
+ */
+static void session_free(RtcSession *session)
+{
+    if (session == NULL) {
+        return;
+    }
+
+    if (session->udp_fd >= 0) {
+        close(session->udp_fd);
+    }
+
+    dtls_srtp_session_destroy(session->dtls);
+    rtp_h264_destroy(session->rtp);
+
+    free(session->retx_data);
+    free(session);
 }
 
 int rtc_session_create(const RtcSessionConfig *config,
@@ -341,23 +427,35 @@ int rtc_session_create(const RtcSessionConfig *config,
     session->config = *config;
     session->udp_fd = -1;
     session->state = RTC_NEW;
+    session->stats.rtt_ms = -1;
+    snprintf(session->stats.peer, sizeof(session->stats.peer), "-");
 
     session->retx_data = malloc((size_t) RETX_CACHE_SIZE *
                                 (RTP_MAX_PACKET + 64));
 
     if (session->retx_data == NULL) {
+        log_error("rtc", "%08x: retransmission cache allocation failed "
+                         "(%zu bytes)", config->id,
+                  (size_t) RETX_CACHE_SIZE * (RTP_MAX_PACKET + 64));
         free(session);
         return -1;
     }
 
-    generate_credentials(session->local_ufrag, sizeof(session->local_ufrag),
-                         session->local_pwd, sizeof(session->local_pwd));
+    if (generate_credentials(session->local_ufrag,
+                             sizeof(session->local_ufrag),
+                             session->local_pwd,
+                             sizeof(session->local_pwd)) != 0) {
+        session_free(session);
+        return -1;
+    }
 
-    session->udp_fd = udp_socket_create(config->udp_port, &session->udp_port);
+    uint16_t bound_port = 0;
+
+    session->udp_fd = udp_socket_create(config->udp_port, &bound_port);
 
     if (session->udp_fd < 0) {
-        fprintf(stderr, "rtc %08x: UDP port %u unavailable\n",
-                config->id, config->udp_port);
+        log_error("rtc", "%08x: UDP port %u unavailable: errno=%d (%s)",
+                  config->id, config->udp_port, errno, strerror(errno));
         free(session->retx_data);
         free(session);
         return -1;
@@ -374,9 +472,8 @@ int rtc_session_create(const RtcSessionConfig *config,
     session->dtls = dtls_srtp_session_create(&dtls_callbacks);
 
     if (session->dtls == NULL) {
-        close(session->udp_fd);
-        free(session->retx_data);
-        free(session);
+        log_error("rtc", "%08x: DTLS session setup failed", config->id);
+        session_free(session);
         return -1;
     }
 
@@ -385,11 +482,18 @@ int rtc_session_create(const RtcSessionConfig *config,
 
     session->rtp = rtp_h264_create();
 
+    if (session->rtp == NULL) {
+        log_error("rtc", "%08x: packetizer allocation failed", config->id);
+        session_free(session);
+        return -1;
+    }
+
     uint32_t ssrc = 0;
 
-    RAND_bytes((unsigned char *) &ssrc, sizeof(ssrc));
-    if (ssrc == 0) {
-        ssrc = 0x1234ABCD;
+    if (RAND_bytes((unsigned char *) &ssrc, sizeof(ssrc)) != 1 || ssrc == 0) {
+        log_error("rtc", "%08x: SSRC generation failed", config->id);
+        session_free(session);
+        return -1;
     }
 
     rtp_h264_reset(session->rtp, ssrc,
@@ -398,50 +502,37 @@ int rtc_session_create(const RtcSessionConfig *config,
     session->created_ms = now_ms();
     session->last_rx_ms = session->created_ms;
 
-    size_t built = 0;
-    if (config->extra_ips != NULL && config->extra_ip_count > 0) {
-        built = sdp_build_answer_multi(&config->offer,
-                                       dtls_srtp_local_fingerprint(),
-                                       session->local_ufrag,
-                                       session->local_pwd,
-                                       config->advertise_ip,
-                                       config->extra_ips,
-                                       config->extra_ip_count,
-                                       session->udp_port,
-                                       ssrc,
-                                       answer_sdp,
-                                       answer_capacity);
-    } else {
-        built = sdp_build_answer(&config->offer,
-                                 dtls_srtp_local_fingerprint(),
-                                 session->local_ufrag,
-                                 session->local_pwd,
-                                 config->advertise_ip,
-                                 session->udp_port,
-                                 ssrc,
-                                 answer_sdp,
-                                 answer_capacity);
+    SdpAnswerConfig answer_config;
+
+    memset(&answer_config, 0, sizeof(answer_config));
+    answer_config.fingerprint = dtls_srtp_local_fingerprint();
+    answer_config.ice_ufrag = session->local_ufrag;
+    answer_config.ice_pwd = session->local_pwd;
+    answer_config.udp_port = bound_port;
+    answer_config.ssrc = ssrc;
+    answer_config.candidate_count = config->candidate_count;
+
+    for (size_t i = 0; i < config->candidate_count &&
+                       i < SDP_MAX_CANDIDATES; i++) {
+        answer_config.candidate_ips[i] = config->candidate_ips[i];
     }
 
+    size_t built = sdp_build_answer(&config->offer, &answer_config,
+                                    answer_sdp, answer_capacity);
+
     if (built == 0) {
-        fprintf(stderr, "rtc %08x: SDP answer overflow\n", config->id);
-        rtc_session_destroy(session);
+        log_error("rtc", "%08x: SDP answer does not fit in %zu bytes",
+                  config->id, answer_capacity);
+        session_free(session);
         return -1;
     }
 
     *answer_length = built;
-
-    /* Clear dangling extra IP pointers that were on the caller's stack.
-     * The SDP has already been built, we don't need them anymore. */
-    session->config.extra_ips = NULL;
-    session->config.extra_ip_count = 0;
-
     *session_out = session;
 
-    printf("rtc %08x: created, UDP %u, ice-ufrag %s, payload type %d, candidates %zu\n",
-           config->id, session->udp_port, session->local_ufrag,
-           config->offer.h264_payload_type,
-           1 + config->extra_ip_count);
+    log_info("rtc", "%08x: created, UDP %u, payload type %d, %zu candidates",
+             config->id, bound_port, config->offer.h264_payload_type,
+             config->candidate_count);
 
     return 0;
 }
@@ -451,8 +542,113 @@ int rtc_session_fd(const RtcSession *session)
     return session != NULL ? session->udp_fd : -1;
 }
 
+static void handle_stun(RtcSession *session,
+                        const uint8_t *buffer,
+                        size_t length,
+                        const struct sockaddr_storage *source,
+                        const char *ip,
+                        uint16_t port)
+{
+    uint8_t tid[12] = { 0 };
+    char username[160] = "";
+
+    session->stats.stun_rx++;
+    session->last_rx_ms = now_ms();
+
+    if (stun_is_binding_indication(buffer, length)) {
+        /* Keepalive: no transaction to answer, just refreshed liveness. */
+        return;
+    }
+
+    if (!stun_is_binding_request(buffer, length, tid)) {
+        log_debug("ice", "%08x: STUN message is not a binding request "
+                         "(len %zu from %s:%u)",
+                  session->config.id, length, ip, port);
+        return;
+    }
+
+    stun_copy_username(buffer, length, username, sizeof(username));
+
+    /*
+     * RFC 5389 section 7.2 / RFC 5245: verify MESSAGE-INTEGRITY before
+     * acting on a check. The ice-ufrag is public in the SDP answer, so
+     * without this any host on the LAN could claim the peer slot.
+     * Unauthenticated checks are answered with 401 (RFC 5245 section
+     * 16.5) rather than dropped silently.
+     */
+    if (!stun_verify_mi(buffer, length, session->local_pwd)) {
+        session->stats.stun_bad++;
+        log_warn("ice", "%08x: STUN MESSAGE-INTEGRITY invalid from %s:%u "
+                        "(user '%s'); answering 401",
+                 session->config.id, ip, port,
+                 username[0] ? username : "(missing)");
+        stun_send_error(session, tid, 401, source);
+        return;
+    }
+
+    if (!stun_username_matches(buffer, length, session->local_ufrag)) {
+        session->stats.stun_bad++;
+        log_warn("ice", "%08x: STUN USERNAME mismatch from %s:%u (got '%s', "
+                        "expected '%s:<peer-ufrag>'); answering 401",
+                 session->config.id, ip, port,
+                 username[0] ? username : "(missing)", session->local_ufrag);
+        stun_send_error(session, tid, 401, source);
+        return;
+    }
+
+    session->stats.stun_ok++;
+
+    /*
+     * ICE-lite (RFC 8445 section 6.2) tracks the source of the latest
+     * authenticated check. A client whose NAT rebinds sends its
+     * keepalives, DTLS and RTCP from a new source address; pinning the
+     * first address would keep sending media into a dead 5-tuple.
+     */
+    if (!session->have_remote) {
+        session->remote = *source;
+        session->have_remote = 1;
+        snprintf(session->stats.peer, sizeof(session->stats.peer),
+                 "%s:%u", ip, port);
+
+        log_info("ice", "%08x: ICE validated (%s:%u) user=%s",
+                 session->config.id, ip, port, username);
+    } else {
+        char old_ip[INET_ADDRSTRLEN];
+        uint16_t old_port = 0;
+
+        format_peer(&session->remote, old_ip, sizeof(old_ip), &old_port);
+
+        if (strcmp(old_ip, ip) != 0 || old_port != port) {
+            log_warn("ice", "%08x: peer moved %s:%u -> %s:%u (NAT rebind), "
+                            "media follows the latest valid check",
+                     session->config.id, old_ip, old_port, ip, port);
+            session->remote = *source;
+            session->stats.peer_moved++;
+            snprintf(session->stats.peer, sizeof(session->stats.peer),
+                     "%s:%u", ip, port);
+        }
+    }
+
+    if (session->state == RTC_NEW) {
+        set_state(session, RTC_ICE);
+    }
+
+    uint8_t response[128];
+    size_t response_len = 0;
+
+    if (stun_build_binding_response(session->local_pwd,
+                                    buffer, length, source,
+                                    response, sizeof(response),
+                                    &response_len) == 0) {
+        session_sendto(session, response, response_len, source);
+    } else {
+        log_warn("ice", "%08x: could not build a binding response", 
+                 session->config.id);
+    }
+}
+
 void rtc_session_on_udp(RtcSession *session,
-                        uint8_t *buffer,
+                        const uint8_t *buffer,
                         size_t length,
                         const struct sockaddr_storage *source)
 {
@@ -460,10 +656,11 @@ void rtc_session_on_udp(RtcSession *session,
         return;
     }
 
-    session->last_rx_ms = now_ms();
+    session->stats.datagrams_rx++;
 
-    char ip[INET6_ADDRSTRLEN];
+    char ip[INET_ADDRSTRLEN];
     uint16_t port = 0;
+
     format_peer(source, ip, sizeof(ip), &port);
 
     RtcPacketClass kind = rtc_classify_packet(buffer, length);
@@ -479,155 +676,53 @@ void rtc_session_on_udp(RtcSession *session,
             name = "RTP/RTCP";
         }
 
-        printf("rtc %08x: UDP %s %zu bytes from %s:%u\n",
-               session->config.id, name, length, ip, port);
+        log_debug("rtc", "%08x: UDP %s %zu bytes from %s:%u",
+                  session->config.id, name, length, ip, port);
         session->datagrams_logged++;
     }
 
     switch (kind) {
-
-    case RTC_PKT_STUN: {
-        uint8_t tid[12];
-        char username[160] = "";
-
-        session->stats.stun_rx++;
-        stun_copy_username(buffer, length, username, sizeof(username));
-
-        if (!stun_is_binding_request(buffer, length, tid)) {
-            /*
-             * STUN Binding *indication* (0x0011, RFC 5245 §10
-             * keepalive) is a legitimate packet that needs no
-             * response; count it quietly instead of logging
-             * one line every 15 s per viewer.
-             */
-            uint16_t stype = (uint16_t) (((uint16_t) buffer[0] << 8) |
-                                         (uint16_t) buffer[1]);
-
-            if (stype == 0x0011 && length >= STUN_HEADER_SIZE) {
-                session->stats.stun_ok++;
-                break;
-            }
-
-            printf("rtc %08x: STUN ignored (not a binding request) "
-                   "from %s:%u len=%zu\n",
-                   session->config.id, ip, port, length);
-            break;
-        }
-
-        /*
-         * RFC 5389 §7.2 / RFC 5245: verify MESSAGE-INTEGRITY
-         * before acting on the request.  The ice-ufrag is in
-         * the public SDP answer, so without this any host on
-         * the network can forge a "valid" check from its own
-         * address and claim the peer slot.  Answer 401 per
-         * RFC 5245 §16.5 instead of dropping silently.
-         */
-        if (!stun_verify_mi(buffer, length, session->local_pwd)) {
-            session->stats.stun_bad_user++;
-            printf("rtc %08x: STUN MESSAGE-INTEGRITY invalid from %s:%u "
-                   "(user '%s'); sending 401\n",
-                   session->config.id, ip, port,
-                   username[0] ? username : "(missing)");
-            stun_send_error(session, tid, 401, source);
-            break;
-        }
-
-        if (!stun_username_matches(buffer, length, session->local_ufrag)) {
-            session->stats.stun_bad_user++;
-            printf("rtc %08x: STUN username mismatch from %s:%u "
-                   "(got '%s', want '%s:<peer-ufrag>'); sending 401\n",
-                   session->config.id, ip, port,
-                   username[0] ? username : "(missing)",
-                   session->local_ufrag);
-            stun_send_error(session, tid, 401, source);
-            break;
-        }
-
-        session->stats.stun_ok++;
-
-        /*
-         * Valid connectivity check (or RFC 7675 consent
-         * freshness check): record the peer address and
-         * answer.
-         *
-         * ICE-lite (RFC 8445 §6.2) tracks the peer as the
-         * source of the LATEST valid check: when the client's
-         * NAT rebinds (Wi-Fi <-> cellular, router restart,
-         * per-flow mapping changes) the browser's keepalives,
-         * DTLS and RTCP all arrive from the new source
-         * address.  Locking the first check's address would
-         * keep sending media into a dead 5-tuple and the
-         * stream dies silently, so the peer follows every
-         * valid check.
-         */
-        if (!session->have_remote) {
-            session->remote = *source;
-            session->have_remote = 1;
-
-            printf("rtc %08x: ICE validated (%s:%u) username=%s\n",
-                   session->config.id, ip, port, username);
-        } else {
-            const struct sockaddr_in *s4 = (const struct sockaddr_in *) source;
-            const struct sockaddr_in *r4 =
-                (const struct sockaddr_in *) &session->remote;
-
-            if (s4->sin_addr.s_addr != r4->sin_addr.s_addr ||
-                s4->sin_port != r4->sin_port) {
-                char old_ip[INET6_ADDRSTRLEN];
-                uint16_t old_port = 0;
-
-                format_peer(&session->remote, old_ip, sizeof(old_ip),
-                            &old_port);
-                printf("rtc %08x: peer moved %s:%u -> %s:%u (NAT rebind); "
-                       "media follows latest valid check\n",
-                       session->config.id, old_ip, old_port, ip, port);
-                session->remote = *source;
-                session->stats.peer_moved++;
-            }
-        }
-
-        if (session->state == RTC_NEW) {
-            set_state(session, RTC_ICE);
-        }
-
-        uint8_t response[128];
-        size_t response_len = 0;
-
-        if (stun_build_binding_response(session->local_pwd,
-                                        buffer, length,
-                                        source,
-                                        response, sizeof(response),
-                                        &response_len) == 0) {
-            sendto(session->udp_fd, response, response_len, 0,
-                   (struct sockaddr *) source,
-                   peer_socklen(source));
-        }
+    case RTC_PKT_STUN:
+        handle_stun(session, buffer, length, source, ip, port);
         break;
-    }
 
     case RTC_PKT_DTLS:
-        if (session->have_remote) {
-            dtls_srtp_on_udp(session->dtls, buffer, length);
-        } else {
-            printf("rtc %08x: DTLS before ICE from %s:%u, %zu bytes\n",
-                   session->config.id, ip, port, length);
+        if (!session->have_remote) {
+            log_debug("rtc", "%08x: DTLS from %s:%u before ICE validation",
+                      session->config.id, ip, port);
+            break;
         }
+        session->last_rx_ms = now_ms();
+        dtls_srtp_on_udp(session->dtls, buffer, length);
         break;
 
     case RTC_PKT_RTP: {
         /*
-         * The second byte decides RTP versus RTCP. RTCP
-         * payload types are 192 to 223, which the 0x7F mask
-         * folds into 64 to 95. We are sendonly: inbound RTP is
-         * dropped, inbound RTCP is processed.
+         * The second byte decides RTP versus RTCP: RTCP payload types
+         * are 192 to 223, which the 0x7F mask folds to 64 to 95. This
+         * server is sendonly, so inbound RTP is dropped and only
+         * feedback (RTCP) is processed.
          */
         uint8_t pt = buffer[1] & 0x7F;
 
         if (pt >= 64 && pt <= 95 && session->state == RTC_STREAMING) {
-            size_t len = length;
+            session->last_rx_ms = now_ms();
 
-            if (dtls_srtp_unprotect_rtcp(session->dtls, buffer, &len) == 0) {
-                dtls_on_rtcp(session, buffer, len);
+            size_t len = length;
+            uint8_t plain[1500];
+
+            if (len > sizeof(plain)) {
+                break;
+            }
+
+            memcpy(plain, buffer, len);
+
+            if (dtls_srtp_unprotect_rtcp(session->dtls, plain, &len) == 0) {
+                dtls_on_rtcp(session, plain, len);
+            } else {
+                log_debug("rtc", "%08x: SRTCP authentication failed "
+                                  "(%zu bytes from %s:%u)",
+                          session->config.id, length, ip, port);
             }
         }
         break;
@@ -645,56 +740,41 @@ void rtc_session_tick(RtcSession *session, uint64_t now)
     }
 
     /*
-     * Idle timeout. last_rx_ms starts at creation, so a session
-     * that never receives even the first STUN check is reaped
-     * too (otherwise a vanished browser would hold the slot
-     * forever).
+     * Idle timeout. last_rx_ms starts at creation, so a session whose
+     * browser vanished before the first check is reaped as well.
+     * A timestamp ahead of 'now' means "fresh"; treat the underflow as
+     * zero rather than as a huge age.
      */
-    /*
-     * A future timestamp means "fresh" (the clock source can lag
-     * behind the value a just created session was stamped with),
-     * so treat underflow as zero instead of as a huge age.
-     */
-    uint64_t idle_ms = now >= session->last_rx_ms ?
-        now - session->last_rx_ms : 0;
+    uint64_t idle_ms = now >= session->last_rx_ms ? now - session->last_rx_ms : 0;
 
     if (idle_ms > SESSION_IDLE_TIMEOUT_MS) {
-        printf("rtc %08x: idle timeout (stun_rx=%u stun_ok=%u stun_bad_user=%u)\n",
-               session->config.id,
-               session->stats.stun_rx,
-               session->stats.stun_ok,
-               session->stats.stun_bad_user);
+        log_info("rtc", "%08x: idle timeout after %llums (stun_rx=%u ok=%u "
+                        "bad=%u dtls=%s)",
+                 session->config.id, (unsigned long long) idle_ms,
+                 session->stats.stun_rx, session->stats.stun_ok,
+                 session->stats.stun_bad,
+                 rtc_session_state_name(session));
         rtc_session_close(session);
         return;
     }
 
-    /*
-     * Handshake watchdog. Same underflow guard as the idle
-     * timeout above.
-     */
-    uint64_t age_ms = now >= session->created_ms ?
-        now - session->created_ms : 0;
+    uint64_t age_ms = now >= session->created_ms ? now - session->created_ms : 0;
 
-    if (session->state == RTC_ICE &&
-        age_ms > SESSION_DTLS_WATCHDOG_MS) {
-        printf("rtc %08x: DTLS never started\n", session->config.id);
+    if (session->state == RTC_ICE && age_ms > SESSION_DTLS_WATCHDOG_MS) {
+        log_warn("rtc", "%08x: ICE validated but no DTLS ClientHello within "
+                        "%ums (wrong fingerprint or one way UDP?)",
+                 session->config.id, SESSION_DTLS_WATCHDOG_MS);
         rtc_session_close(session);
         return;
     }
 
     dtls_srtp_tick(session->dtls);
 
-    /*
-     * Sender reports.
-     */
     if (session->state == RTC_STREAMING && now >= session->next_sr_ms) {
         /*
-         * srtp_protect_rtcp() works in place and expands the 32 bit
-         * RTCP header to a 64 bit SRTCP header (+4 bytes) while
-         * appending the auth tag (+10 bytes), so the buffer needs
-         * 14 bytes of headroom beyond the RTCP payload. Sizing it
-         * to exactly RTCP_SR_SIZE overflowed the stack on every
-         * sender report.
+         * srtp_protect_rtcp() expands the 32 bit RTCP header to the 64
+         * bit SRTCP header (+4) and appends a 10 byte auth tag, so the
+         * buffer needs 14 bytes of headroom beyond the report.
          */
         uint8_t sr[RTCP_SR_SIZE + 16];
 
@@ -721,21 +801,16 @@ int rtc_session_send_access_unit(RtcSession *session,
                                  uint64_t pts_us,
                                  int is_idr)
 {
-    if (session == NULL) {
+    if (session == NULL || session->state != RTC_STREAMING) {
         return 0;
     }
 
-    if (is_idr && session->idr_requested) {
+    if (is_idr) {
         session->idr_requested = 0;
     }
 
-    if (session->state != RTC_STREAMING) {
-        return 0;
-    }
-
     RtpSendContext ctx = {
-        .session = session,
-        .ok = 1
+        .session = session
     };
 
     int packets = rtp_h264_packetize(session->rtp,
@@ -744,7 +819,7 @@ int rtc_session_send_access_unit(RtcSession *session,
 
     if (!session->streaming_announced && packets > 0) {
         session->streaming_announced = 1;
-        printf("rtc %08x: streaming video\n", session->config.id);
+        log_info("rtc", "%08x: streaming video", session->config.id);
     }
 
     return packets;
@@ -808,11 +883,10 @@ void rtc_session_close(RtcSession *session)
     }
 
     /*
-     * Mark the session closed BEFORE tearing down DTLS:
-     * dtls_srtp_close() fires the state callback, which calls
-     * rtc_session_close() back. With the state still open, that
-     * re-entrant call would run the whole close sequence (and the
-     * on_closed callback) a second time.
+     * Mark the session closed BEFORE tearing down DTLS: dtls_srtp_close()
+     * fires the state callback, which calls back into this function. With
+     * the state still open, that re-entrant call would run the whole
+     * close sequence and the on_closed hook a second time.
      */
     set_state(session, RTC_CLOSED);
 
@@ -833,22 +907,7 @@ void rtc_session_destroy(RtcSession *session)
         rtc_session_close(session);
     }
 
-    if (session->udp_fd >= 0) {
-        close(session->udp_fd);
-    }
-
-    dtls_srtp_session_destroy(session->dtls);
-    rtp_h264_destroy(session->rtp);
-
-    free(session->retx_data);
-    free(session);
-}
-
-int rtc_session_add_ice_candidate(RtcSession *session, const char *candidate)
-{
-    (void) session;
-    (void) candidate;
-    return 0; /* Native ICE-lite responds to STUN checks directly */
+    session_free(session);
 }
 
 int rtc_session_dtls_timeout_ms(const RtcSession *session)

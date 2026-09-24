@@ -3,115 +3,308 @@
 /*
  * app_config.c
  *
- * Dependency free command line parsing (short and long
- * options, "=" and separate value forms).
+ * Command line and config file parsing. No dependency beyond libc:
+ * the parser is table-free and every accepted key is spelled out in
+ * app_config_set_key() so the set of options is auditable in one place.
  */
 #include "app_config.h"
+#include "log.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 void app_config_defaults(AppConfig *config)
 {
+    memset(config, 0, sizeof(*config));
+
     config->source_kind = SOURCE_V4L2;
-    config->source_name = "v4l2";
-    config->rpicam_bin = NULL;
-    config->device = "/dev/video0";
-    config->use_test_source = 0;
+    snprintf(config->source_name, sizeof(config->source_name), "v4l2");
+    snprintf(config->device, sizeof(config->device), "/dev/video0");
+    snprintf(config->listen, sizeof(config->listen), "0.0.0.0");
+    snprintf(config->encoder, sizeof(config->encoder), "auto");
 
     config->width = 640;
     config->height = 480;
     config->fps = 30;
-
-    config->listen = "0.0.0.0";
-#ifdef USE_LIBPEER
-    config->http_port = 8000;
-#else
-    config->http_port = 8080;
-#endif
-    config->udp_base_port = 50000;
-
-#ifdef USE_JANUS_TRANSPORT
-    config->webrtc_backend = "janus";
-    config->janus_host = "127.0.0.1";
-    config->janus_rtp_port = 5004;
-    config->janus_rtcp_port = 5005;
-    config->janus_rtcp_listen = 5006;
-#elif defined(USE_LIBPEER)
-    config->webrtc_backend = "libpeer";
-#else
-    config->webrtc_backend = "native";
-#endif
-
     config->bitrate_kbps = 2500;
     config->keyframe_seconds = 2;
 
-    config->encoder = "auto";
+    config->http_port = 8080;
+    config->udp_base_port = 50000;
 
     config->verbose = 0;
 }
 
-static int match_opt(const char *arg,
-                     const char *short_name,
-                     const char *long_name,
-                     const char **value,
-                     int argc,
-                     char **argv,
-                     int *index)
+static int copy_string(char *destination, size_t capacity, const char *value)
 {
-    /*
-     * Accepts: -x value, -x=value, --name value, --name=value
-     */
-    const char *eq = strchr(arg, '=');
-    size_t head_len = eq != NULL ? (size_t) (eq - arg) : strlen(arg);
+    size_t length = strlen(value);
 
-    char head[64];
-
-    if (head_len >= sizeof(head)) {
-        return 0;
+    if (length == 0 || length >= capacity) {
+        return -1;
     }
 
-    memcpy(head, arg, head_len);
-    head[head_len] = 0;
+    memcpy(destination, value, length + 1);
 
-    int matched_short = short_name != NULL && strcmp(head, short_name) == 0;
-    int matched_long = long_name != NULL && strcmp(head, long_name) == 0;
-
-    if (!matched_short && !matched_long) {
-        return 0;
-    }
-
-    if (eq != NULL) {
-        *value = eq + 1;
-        return 1;
-    }
-
-    if (*index + 1 < argc) {
-        *value = argv[++(*index)];
-        return 1;
-    }
-
-    fprintf(stderr, "missing value for %s\n", head);
-    exit(2);
+    return 0;
 }
 
-static long parse_long(const char *value, const char *name)
+static int parse_source_kind(const char *value, AppConfig *config)
 {
-    char *end = NULL;
-
-    long result = strtol(value, &end, 10);
-
-    if (end == NULL || *end != 0 || result < 0) {
-        fprintf(stderr, "invalid number for %s: %s\n", name, value);
-        exit(2);
+    if (strcmp(value, "v4l2") == 0) {
+        config->source_kind = SOURCE_V4L2;
+    } else if (strcmp(value, "csi") == 0) {
+        config->source_kind = SOURCE_CSI;
+    } else if (strcmp(value, "stdin") == 0) {
+        config->source_kind = SOURCE_STDIN;
+    } else if (strcmp(value, "test") == 0) {
+        config->source_kind = SOURCE_TEST;
+    } else {
+        return -1;
     }
 
-    return result;
+    snprintf(config->source_name, sizeof(config->source_name), "%s", value);
+
+    return 0;
+}
+
+static int parse_unsigned(const char *value, uint32_t *out)
+{
+    if (value[0] == 0) {
+        return -1;
+    }
+
+    for (const char *p = value; *p != 0; p++) {
+        if (!isdigit((unsigned char) *p)) {
+            return -1;
+        }
+    }
+
+    unsigned long parsed = strtoul(value, NULL, 10);
+
+    if (parsed > 0xFFFFFFFFUL) {
+        return -1;
+    }
+
+    *out = (uint32_t) parsed;
+
+    return 0;
+}
+
+/*
+ * Apply one key/value pair. Used by both the config file reader and
+ * (through app_config_parse) the command line, so the two can never
+ * drift apart in accepted spelling or validation.
+ *
+ * Returns 0 on success, -1 when the key is unknown or the value is
+ * malformed.
+ */
+static int app_config_set_key(AppConfig *config,
+                              const char *key,
+                              const char *value)
+{
+    uint32_t number = 0;
+
+    if (strcmp(key, "source") == 0) {
+        return parse_source_kind(value, config);
+    }
+
+    if (strcmp(key, "device") == 0) {
+        return copy_string(config->device, sizeof(config->device), value);
+    }
+
+    if (strcmp(key, "rpicam_bin") == 0) {
+        return copy_string(config->rpicam_bin, sizeof(config->rpicam_bin),
+                           value);
+    }
+
+    if (strcmp(key, "listen") == 0) {
+        return copy_string(config->listen, sizeof(config->listen), value);
+    }
+
+    if (strcmp(key, "encoder") == 0) {
+        return copy_string(config->encoder, sizeof(config->encoder), value);
+    }
+
+    if (strcmp(key, "width") == 0) {
+        return parse_unsigned(value, &config->width) == 0 ? 0 : -1;
+    }
+
+    if (strcmp(key, "height") == 0) {
+        return parse_unsigned(value, &config->height) == 0 ? 0 : -1;
+    }
+
+    if (strcmp(key, "fps") == 0) {
+        return parse_unsigned(value, &config->fps) == 0 ? 0 : -1;
+    }
+
+    if (strcmp(key, "bitrate_kbps") == 0) {
+        return parse_unsigned(value, &config->bitrate_kbps) == 0 ? 0 : -1;
+    }
+
+    if (strcmp(key, "keyframe_seconds") == 0) {
+        return parse_unsigned(value, &config->keyframe_seconds) == 0 ? 0 : -1;
+    }
+
+    if (strcmp(key, "http_port") == 0) {
+        if (parse_unsigned(value, &number) != 0 || number == 0 ||
+            number > 65535) {
+            return -1;
+        }
+        config->http_port = (uint16_t) number;
+        return 0;
+    }
+
+    if (strcmp(key, "udp_port") == 0) {
+        if (parse_unsigned(value, &number) != 0 || number == 0 ||
+            number > 65535) {
+            return -1;
+        }
+        config->udp_base_port = (uint16_t) number;
+        return 0;
+    }
+
+    if (strcmp(key, "verbose") == 0) {
+        if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+            strcmp(value, "yes") == 0) {
+            config->verbose = 1;
+            return 0;
+        }
+        if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+            strcmp(value, "no") == 0) {
+            config->verbose = 0;
+            return 0;
+        }
+        return -1;
+    }
+
+    return -1;
+}
+
+static char *trim(char *text)
+{
+    while (*text != 0 && isspace((unsigned char) *text)) {
+        text++;
+    }
+
+    char *end = text + strlen(text);
+
+    while (end > text && isspace((unsigned char) end[-1])) {
+        end--;
+    }
+
+    *end = 0;
+
+    return text;
+}
+
+int app_config_load_file(AppConfig *config,
+                         const char *path,
+                         char *error,
+                         size_t error_size)
+{
+    if (path == NULL || path[0] == 0) {
+        return 0;
+    }
+
+    FILE *file = fopen(path, "r");
+
+    if (file == NULL) {
+        snprintf(error, error_size, "config: cannot open %s", path);
+        return -1;
+    }
+
+    if (copy_string(config->config_path, sizeof(config->config_path),
+                    path) != 0) {
+        fclose(file);
+        snprintf(error, error_size, "config: path too long: %s", path);
+        return -1;
+    }
+
+    char line[512];
+    unsigned line_number = 0;
+    int status = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        line_number++;
+
+        char *comment = strchr(line, '#');
+
+        if (comment != NULL) {
+            *comment = 0;
+        }
+
+        char *text = trim(line);
+
+        if (*text == 0) {
+            continue;
+        }
+
+        char *equals = strchr(text, '=');
+
+        if (equals == NULL) {
+            snprintf(error, error_size,
+                     "config: %s:%u: expected 'key = value', got '%s'",
+                     path, line_number, text);
+            status = -1;
+            break;
+        }
+
+        *equals = 0;
+
+        char *key = trim(text);
+        char *value = trim(equals + 1);
+
+        if (*key == 0 || *value == 0) {
+            snprintf(error, error_size,
+                     "config: %s:%u: empty key or value", path, line_number);
+            status = -1;
+            break;
+        }
+
+        if (app_config_set_key(config, key, value) != 0) {
+            snprintf(error, error_size,
+                     "config: %s:%u: unknown key or bad value: %s = %s",
+                     path, line_number, key, value);
+            status = -1;
+            break;
+        }
+    }
+
+    fclose(file);
+
+    return status;
 }
 
 int app_config_parse(AppConfig *config, int argc, char **argv)
 {
+    int status = 0;
+
+    /*
+     * Pass one: --config is honoured before everything else so that
+     * command line options override the file regardless of order.
+     */
+    for (int i = 1; i < argc && status == 0; i++) {
+        const char *value = NULL;
+
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            value = argv[i + 1];
+        } else if (strncmp(argv[i], "--config=", 9) == 0) {
+            value = argv[i] + 9;
+        }
+
+        if (value != NULL) {
+            char error[256] = "";
+
+            if (app_config_load_file(config, value, error, sizeof(error)) != 0) {
+                fprintf(stderr, "%s\n", error);
+                return -1;
+            }
+        }
+    }
+
+    /* Pass two: the remaining options. */
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         const char *value = NULL;
@@ -122,48 +315,7 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
 
         if (strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) {
             printf("camstream %s\n", APP_VERSION);
-            exit(0);
-        }
-
-        if (strcmp(arg, "-t") == 0 || strcmp(arg, "--test") == 0) {
-            config->use_test_source = 1;
-            config->source_kind = SOURCE_TEST;
-            config->source_name = "test";
-            continue;
-        }
-
-        if (strcmp(arg, "--stdin-yuv420") == 0) {
-            config->source_kind = SOURCE_STDIN;
-            config->source_name = "stdin";
-            continue;
-        }
-
-        if (match_opt(arg, "-s", "--source", &value, argc, argv, &i)) {
-            if (strcmp(value, "csi") == 0) {
-                config->source_kind = SOURCE_CSI;
-                config->source_name = "csi";
-            } else if (strcmp(value, "v4l2") == 0) {
-                config->source_kind = SOURCE_V4L2;
-                config->source_name = "v4l2";
-            } else if (strcmp(value, "stdin") == 0) {
-                config->source_kind = SOURCE_STDIN;
-                config->source_name = "stdin";
-            } else if (strcmp(value, "test") == 0) {
-                config->source_kind = SOURCE_TEST;
-                config->source_name = "test";
-                config->use_test_source = 1;
-            } else {
-                fprintf(stderr,
-                        "invalid --source '%s' (csi, v4l2, stdin or test)\n",
-                        value);
-                return -1;
-            }
-            continue;
-        }
-
-        if (match_opt(arg, NULL, "--rpicam-bin", &value, argc, argv, &i)) {
-            config->rpicam_bin = value;
-            continue;
+            return 1;
         }
 
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
@@ -171,143 +323,181 @@ int app_config_parse(AppConfig *config, int argc, char **argv)
             continue;
         }
 
-        if (match_opt(arg, "-d", "--device", &value, argc, argv, &i)) {
-            config->device = value;
+        if (strcmp(arg, "-t") == 0 || strcmp(arg, "--test") == 0) {
+            config->source_kind = SOURCE_TEST;
+            snprintf(config->source_name, sizeof(config->source_name), "test");
             continue;
         }
 
-        if (match_opt(arg, "-W", "--width", &value, argc, argv, &i)) {
-            config->width = (uint32_t) parse_long(value, "width");
+        if (strcmp(arg, "--stdin-yuv420") == 0) {
+            config->source_kind = SOURCE_STDIN;
+            snprintf(config->source_name, sizeof(config->source_name), "stdin");
             continue;
         }
 
-        if (match_opt(arg, "-H", "--height", &value, argc, argv, &i)) {
-            config->height = (uint32_t) parse_long(value, "height");
-            continue;
-        }
+        /*
+         * Options that take a value accept both "--opt value" and
+         * "--opt=value".
+         */
+        char head[64];
+        const char *key = NULL;
 
-        if (match_opt(arg, "-F", "--fps", &value, argc, argv, &i)) {
-            config->fps = (uint32_t) parse_long(value, "fps");
-            continue;
-        }
+        if (strncmp(arg, "--", 2) == 0) {
+            /* head holds the option name without the leading dashes. */
+            const char *name = arg + 2;
+            const char *equals = strchr(name, '=');
+            size_t name_len = equals != NULL ? (size_t) (equals - name)
+                                             : strlen(name);
 
-        if (match_opt(arg, "-l", "--listen", &value, argc, argv, &i)) {
-            config->listen = value;
-            continue;
-        }
-
-        if (match_opt(arg, "-p", "--http-port", &value, argc, argv, &i)) {
-            config->http_port = (uint16_t) parse_long(value, "http-port");
-            continue;
-        }
-
-        if (match_opt(arg, "-u", "--udp-port", &value, argc, argv, &i)) {
-            config->udp_base_port = (uint16_t) parse_long(value, "udp-port");
-            continue;
-        }
-
-        if (match_opt(arg, NULL, "--webrtc", &value, argc, argv, &i)) {
-            if (strcmp(value, "native") != 0 &&
-                strcmp(value, "libpeer") != 0 &&
-                strcmp(value, "janus") != 0) {
-                fprintf(stderr,
-                        "invalid --webrtc '%s' (native, libpeer or janus)\n",
-                        value);
+            if (name_len == 0 || name_len >= sizeof(head)) {
+                fprintf(stderr, "unknown option: %s (try --help)\n", arg);
                 return -1;
             }
-            config->webrtc_backend = value;
-            continue;
+
+            memcpy(head, name, name_len);
+            head[name_len] = 0;
+            key = head;
+            value = equals != NULL ? equals + 1 : NULL;
+        } else if (arg[0] == '-' && arg[1] != 0 && arg[2] == 0) {
+            /* Short option, value in the next argv element. */
+            head[0] = arg[1];
+            head[1] = 0;
+            key = head;
+            value = NULL;
+        } else if (arg[0] == '-' && arg[1] != 0 && arg[2] == '=') {
+            /* Short option with an inline value: -s=test. */
+            head[0] = arg[1];
+            head[1] = 0;
+            key = head;
+            value = arg + 3;
+        } else {
+            fprintf(stderr, "unknown option: %s (try --help)\n", arg);
+            return -1;
         }
 
-        if (match_opt(arg, NULL, "--janus-host", &value, argc, argv, &i)) {
-            config->janus_host = value;
-            continue;
+        static const struct {
+            const char *short_name;
+            const char *long_name;
+            const char *config_key;
+        } options[] = {
+            { "s", "source",           "source" },
+            { "d", "device",           "device" },
+            { "W", "width",            "width" },
+            { "H", "height",           "height" },
+            { "F", "fps",              "fps" },
+            { "l", "listen",           "listen" },
+            { "p", "http-port",        "http_port" },
+            { "u", "udp-port",         "udp_port" },
+            { "e", "encoder",          "encoder" },
+            { "b", "bitrate",          "bitrate_kbps" },
+            { "K", "keyframe",         "keyframe_seconds" },
+            { NULL, "rpicam-bin",      "rpicam_bin" },
+            { NULL, "config",          NULL }
+        };
+
+        int matched = 0;
+
+        for (size_t o = 0; o < sizeof(options) / sizeof(options[0]); o++) {
+            int is_short = options[o].short_name != NULL &&
+                           strcmp(key, options[o].short_name) == 0;
+            int is_long = strcmp(key, options[o].long_name) == 0;
+
+            if (!is_short && !is_long) {
+                continue;
+            }
+
+            matched = 1;
+
+            if (value == NULL) {
+                if (i + 1 < argc) {
+                    value = argv[++i];
+                } else {
+                    fprintf(stderr, "missing value for %s\n", arg);
+                    return -1;
+                }
+            }
+
+            if (options[o].config_key != NULL &&
+                app_config_set_key(config, options[o].config_key, value) != 0) {
+                fprintf(stderr, "invalid value for %s: %s\n", arg, value);
+                return -1;
+            }
+            break;
         }
 
-        if (match_opt(arg, NULL, "--janus-rtp-port", &value, argc, argv, &i)) {
-            config->janus_rtp_port = (uint16_t) parse_long(value, "janus-rtp-port");
-            continue;
+        if (!matched) {
+            fprintf(stderr, "unknown option: %s (try --help)\n", arg);
+            return -1;
         }
+    }
 
-        if (match_opt(arg, NULL, "--janus-rtcp-port", &value, argc, argv, &i)) {
-            config->janus_rtcp_port = (uint16_t) parse_long(value, "janus-rtcp-port");
-            continue;
-        }
+    char error[256] = "";
 
-        if (match_opt(arg, NULL, "--janus-rtcp-listen", &value, argc, argv, &i)) {
-            config->janus_rtcp_listen = (uint16_t) parse_long(value, "janus-rtcp-listen");
-            continue;
-        }
-
-        if (match_opt(arg, "-b", "--bitrate", &value, argc, argv, &i)) {
-            config->bitrate_kbps = (uint32_t) parse_long(value, "bitrate");
-            continue;
-        }
-
-        if (match_opt(arg, "-K", "--keyframe", &value, argc, argv, &i)) {
-            config->keyframe_seconds = (uint32_t) parse_long(value, "keyframe");
-            continue;
-        }
-
-        if (match_opt(arg, "-e", "--encoder", &value, argc, argv, &i)) {
-            config->encoder = value;
-            continue;
-        }
-
-        fprintf(stderr, "unknown option: %s (try --help)\n", arg);
+    if (app_config_validate(config, error, sizeof(error)) != 0) {
+        fprintf(stderr, "%s\n", error);
         return -1;
     }
 
-    if (config->width < 2 || config->width > 4096 ||
-        config->height < 2 || config->height > 4096 ||
-        config->fps == 0 || config->fps > 120 ||
-        config->http_port == 0 || config->udp_base_port == 0 ||
-        config->bitrate_kbps == 0 || config->keyframe_seconds == 0) {
-        fprintf(stderr, "invalid configuration: dimensions, fps, ports, bitrate "
-                        "and keyframe interval must be positive and in range\n");
+    return 0;
+}
+
+int app_config_validate(const AppConfig *config, char *error, size_t error_size)
+{
+    if (config->width < 16 || config->width > 4096 || config->width % 2 != 0) {
+        snprintf(error, error_size,
+                 "config: width must be an even number between 16 and 4096, "
+                 "got %u", config->width);
         return -1;
     }
 
-    /*
-     * Each build is compiled for exactly one transport; refuse to
-     * pretend to run a transport that was not linked in.
-     */
-#if defined(USE_JANUS_TRANSPORT)
-    if (strcmp(config->webrtc_backend, "janus") != 0) {
-        fprintf(stderr,
-                "this binary is the Janus transport build (camstream-janus). "
-                "Use camstream for native WebRTC or camstream-libpeer for "
-                "libpeer, with --webrtc native or --webrtc libpeer.\n");
+    if (config->height < 16 || config->height > 4096 ||
+        config->height % 2 != 0) {
+        snprintf(error, error_size,
+                 "config: height must be an even number between 16 and 4096, "
+                 "got %u", config->height);
         return -1;
     }
 
-    if (config->janus_rtp_port == 0 || config->janus_rtcp_port == 0 ||
-        config->janus_rtcp_listen == 0) {
-        fprintf(stderr, "invalid Janus ports: --janus-rtp-port, "
-                        "--janus-rtcp-port and --janus-rtcp-listen must be "
-                        "nonzero\n");
+    if (config->fps < 1 || config->fps > 120) {
+        snprintf(error, error_size,
+                 "config: fps must be between 1 and 120, got %u",
+                 config->fps);
         return -1;
     }
-#elif defined(USE_LIBPEER)
-    if (strcmp(config->webrtc_backend, "libpeer") != 0) {
-        fprintf(stderr,
-                "this binary is the libpeer build (camstream-libpeer). "
-                "Use camstream for native WebRTC or camstream-janus for the "
-                "Janus transport.\n");
+
+    if (config->bitrate_kbps < 100 || config->bitrate_kbps > 100000) {
+        snprintf(error, error_size,
+                 "config: bitrate_kbps must be between 100 and 100000, got %u",
+                 config->bitrate_kbps);
         return -1;
     }
-#else
-    if (strcmp(config->webrtc_backend, "native") != 0) {
-        fprintf(stderr,
-                "this binary is the native WebRTC build (camstream). "
-                "The %s transport is a separate binary: %s\n",
-                config->webrtc_backend,
-                strcmp(config->webrtc_backend, "libpeer") == 0 ?
-                    "make libpeer && make camstream-libpeer" :
-                    "make camstream-janus");
+
+    if (config->keyframe_seconds < 1 || config->keyframe_seconds > 60) {
+        snprintf(error, error_size,
+                 "config: keyframe_seconds must be between 1 and 60, got %u",
+                 config->keyframe_seconds);
         return -1;
     }
-#endif
+
+    if (config->http_port == 0) {
+        snprintf(error, error_size, "config: http_port must not be 0");
+        return -1;
+    }
+
+    if (config->udp_base_port == 0) {
+        snprintf(error, error_size, "config: udp_port must not be 0");
+        return -1;
+    }
+
+    if (config->listen[0] == 0) {
+        snprintf(error, error_size, "config: listen address must not be empty");
+        return -1;
+    }
+
+    if (config->encoder[0] == 0) {
+        snprintf(error, error_size, "config: encoder must not be empty");
+        return -1;
+    }
 
     return 0;
 }
@@ -317,111 +507,81 @@ void app_config_print_usage(const char *program)
     printf(
         "camstream %s\n"
         "\n"
-        "Low latency camera to browser streaming server with real WebRTC\n"
-        "media transport (ICE-lite, DTLS 1.2, SRTP, RTP H.264).\n"
+        "Low latency LAN camera streaming server: V4L2 capture, H.264\n"
+        "encode, and real WebRTC (ICE-lite, DTLS 1.2, SRTP, RTP) straight\n"
+        "to a browser tab.\n"
         "\n"
         "Usage: %s [options]\n"
         "\n"
-        "Source:\n"
-        "  -s, --source MODE     csi (Raspberry Pi CSI camera via rpicam-vid),\n"
-        "                        v4l2 (USB/V4L2 capture, default),\n"
-        "                        stdin (raw YUV420 pipe), or test\n"
-        "  -d, --device PATH     V4L2 device (default /dev/video0)\n"
-        "      --stdin-yuv420    convenience alias for --source stdin\n"
-        "      --rpicam-bin PATH path to rpicam-vid or libcamera-vid\n"
-        "  -t, --test            use the synthetic test pattern source\n"
-        "  -W, --width N         capture width (default 640)\n"
-        "  -H, --height N        capture height (default 480)\n"
-        "  -F, --fps N           frames per second (default 30)\n"
-        "\n"
-        "Network:\n"
-        "  -l, --listen ADDR     HTTP listen address (default 0.0.0.0)\n"
-        "  -p, --http-port N     HTTP port for the web UI and\n"
-        "                        WebRTC signaling (default 8080)\n"
-        "  -u, --udp-port N      base UDP port for media sessions\n"
-        "                        (default 50000, one port per viewer)\n"
-        "\n"
-        "WebRTC transport:\n"
-        "  --webrtc MODE         native (default), libpeer or janus.\n"
-        "                        Each build is compiled for exactly one:\n"
-        "                        camstream (native), camstream-libpeer\n"
-        "                        and camstream-janus respectively.\n"
-#ifdef USE_JANUS_TRANSPORT
-        "\n"
-        "Janus transport (camstream-janus build):\n"
-        "  --janus-host ADDR     Janus gateway address (default 127.0.0.1)\n"
-        "  --janus-rtp-port N    Janus video RTP port, videoport\n"
-        "                        (default 5004)\n"
-        "  --janus-rtcp-port N   Janus video RTCP port, videortcpport,\n"
-        "                        receives sender reports (default 5005)\n"
-        "  --janus-rtcp-listen N local port for PLI/FIR feedback from\n"
-        "                        Janus (default 5006)\n"
-#endif
+        "Capture:\n"
+        "  -s, --source KIND      v4l2 (default), csi, stdin or test\n"
+        "  -d, --device PATH      V4L2 capture device (default /dev/video0)\n"
+        "  -t, --test             synthetic test pattern, no camera needed\n"
+        "      --stdin-yuv420     read raw YUV420 frames from stdin\n"
+        "      --rpicam-bin PATH  rpicam-vid or libcamera-vid for -s csi\n"
+        "  -W, --width N          capture width (default 640)\n"
+        "  -H, --height N         capture height (default 480)\n"
+        "  -F, --fps N            capture frame rate (default 30)\n"
         "\n"
         "Encoding:\n"
-        "  -e, --encoder MODE    auto (default), hw, hw:/dev/videoNN, sw\n"
-        "  -b, --bitrate KBPS    target bitrate (default 2500)\n"
-        "  -K, --keyframe SEC    keyframe interval in seconds (default 2)\n"
+        "  -e, --encoder MODE     auto (default), hw, hw:/dev/videoN or sw\n"
+        "  -b, --bitrate KBPS     target bitrate (default 2500)\n"
+        "  -K, --keyframe SEC     keyframe interval in seconds (default 2)\n"
         "\n"
-        "Misc:\n"
-        "  -v, --verbose         verbose logging\n"
-        "  -V, --version         print version and exit\n"
-        "  -h, --help            this help\n"
+        "Network:\n"
+        "  -l, --listen ADDR      HTTP bind address (default 0.0.0.0)\n"
+        "  -p, --http-port N      HTTP port for the web UI and WebRTC\n"
+        "                         signaling (default 8080)\n"
+        "  -u, --udp-port N       first UDP media port (default 50000, one\n"
+        "                         port per viewer)\n"
+        "\n"
+        "General:\n"
+        "      --config PATH      read settings from a config file; command\n"
+        "                         line options override the file\n"
+        "  -v, --verbose          log DEBUG level messages\n"
+        "  -V, --version          print version and exit\n"
+        "  -h, --help             this help\n"
+        "\n"
+        "Config file keys: source, device, rpicam_bin, width, height, fps,\n"
+        "encoder, bitrate_kbps, keyframe_seconds, listen, http_port,\n"
+        "udp_port, verbose.\n"
         "\n"
         "Examples:\n"
-        "  %s --source csi -W 1280 -H 720 -e sw   Raspberry Pi 5 CSI camera\n"
+        "  %s --test --encoder sw                 pipeline check, no camera\n"
         "  %s -d /dev/video0 -W 1280 -H 720       USB webcam\n"
-        "  %s -t -e sw                            synthetic test pattern\n"
-#ifdef USE_JANUS_TRANSPORT
-        "  %s -t -e hw --janus-host 127.0.0.1 "
-        "--janus-rtp-port 5004\n"
-        "                                         H.264 -> RTP -> Janus -> "
-        "WebRTC (install config/janus/*.jcfg into /etc/janus first)\n"
-#endif
+        "  %s -s csi -W 1280 -H 720               Raspberry Pi CSI camera\n"
+        "  %s --config /etc/camstream.conf\n"
         "\n",
-        APP_VERSION, program, program, program, program
-#ifdef USE_JANUS_TRANSPORT
-        , program
-#endif
-        );
+        APP_VERSION, program, program, program, program, program);
 }
 
 void app_config_print_summary(const AppConfig *config)
 {
     const char *source_desc = "unknown";
-    if (config->source_kind == SOURCE_TEST) {
-        source_desc = "test pattern";
-    } else if (config->source_kind == SOURCE_CSI) {
-        source_desc = "CSI camera (rpicam-vid)";
-    } else if (config->source_kind == SOURCE_STDIN) {
-        source_desc = "stdin (raw YUV420 pipe)";
-    } else {
-        source_desc = config->device;
+
+    switch (config->source_kind) {
+    case SOURCE_TEST:  source_desc = "test pattern"; break;
+    case SOURCE_CSI:   source_desc = "CSI camera (rpicam-vid)"; break;
+    case SOURCE_STDIN: source_desc = "stdin (raw YUV420)"; break;
+    case SOURCE_V4L2:  source_desc = config->device; break;
     }
 
-    printf("source        : %s [%s]\n", source_desc, config->source_name);
-    printf("resolution    : %ux%u @ %u fps\n",
-           config->width, config->height, config->fps);
-    printf("encoder       : %s, %u kbps, keyframe every %us\n",
-           config->encoder, config->bitrate_kbps, config->keyframe_seconds);
-    printf("transport     : %s\n", config->webrtc_backend);
-    printf("http          : http://%s:%u/  (web UI%s)\n",
-           config->listen, config->http_port,
-#ifdef USE_JANUS_TRANSPORT
-           ""
-#else
-           " + WebRTC signaling"
-#endif
-           );
-#ifdef USE_JANUS_TRANSPORT
-    printf("janus rtp     : %s:%u (RTP H.264 video -> Janus)\n",
-           config->janus_host, config->janus_rtp_port);
-    printf("janus rtcp    : %s:%u (sender reports -> Janus)\n",
-           config->janus_host, config->janus_rtcp_port);
-    printf("rtcp listen   : :%u (PLI/FIR keyframe requests <- Janus)\n",
-           config->janus_rtcp_listen);
-    printf("signaling     : handled by Janus (see config/janus/janus.jcfg)\n");
-#else
-    printf("udp media     : ports from %u\n", config->udp_base_port);
-#endif
+    log_info("app", "source     : %s [%s]", source_desc, config->source_name);
+
+    if (config->source_kind == SOURCE_CSI && config->rpicam_bin[0] != 0) {
+        log_info("app", "rpicam     : %s", config->rpicam_bin);
+    }
+
+    log_info("app", "capture    : %ux%u @ %u fps",
+             config->width, config->height, config->fps);
+    log_info("app", "encoder    : %s, %u kbps, keyframe every %us",
+             config->encoder, config->bitrate_kbps, config->keyframe_seconds);
+    log_info("app", "http       : http://%s:%u/ (web UI and signaling)",
+             config->listen, config->http_port);
+    log_info("app", "udp media  : one port per viewer from %u",
+             config->udp_base_port);
+
+    if (config->config_path[0] != 0) {
+        log_info("app", "config file: %s", config->config_path);
+    }
 }

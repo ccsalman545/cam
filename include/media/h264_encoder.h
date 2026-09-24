@@ -67,6 +67,14 @@ int h264_encoder_encode(H264Encoder *encoder,
                         size_t *out_size,
                         int *out_is_idr);
 
+/*
+ * Change the target bitrate of a running encoder. Returns 0 when the
+ * backend accepted the new rate and -1 when it cannot (the caller then
+ * reports the setting as requiring a restart). The picture size and
+ * frame rate cannot change on a live encoder.
+ */
+int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps);
+
 void h264_encoder_close(H264Encoder *encoder);
 
 #endif

@@ -1,360 +1,304 @@
 #
-# camstream build
+# camstream
 #
-# Target : build/camstream  (WebRTC camera server)
+# Builds the single binary build/camstream and the standalone tests.
 #
-# Dependency overrides (all optional when system packages are
-# installed):
+# Targets
+#   make                 build/camstream
+#   make test            build and run the unit tests
+#   make install         install camstream, the sample config and the unit file
+#   make clean           remove build/
+#   make help            this list
 #
-#   make OPENSSL_DIR=/path SRTP_DIR=/path X264_DIR=/path HAVE_X264=1
+# Dependency locations
+#   DEPS_PREFIX=/opt/cam   prefix holding OpenSSL, libsrtp2 and libx264
+#   X264_DIR=/opt/x264     prefix for libx264 only
+#   HAVE_X264=0            build without libx264 even when it is installed
 #
-# System packages on Debian, Ubuntu and Raspberry Pi OS:
-#   sudo apt install build-essential libssl-dev libsrtp2-dev libx264-dev
-# Fedora:
-#   sudo dnf install gcc make openssl-devel libsrtp-devel x264-devel
-#
+# Every dependency is located by searching $(DEPS_PREFIX), then /usr/local,
+# then /usr. pkg-config is not used: the only thing needed is a header and a
+# library file, and Pi images occasionally ship without pkg-config.
 
-CC      ?= gcc
-CFLAGS  ?= -O2
-WARN     = -Wall -Wextra -Wpedantic
-BASE    = -std=c11 -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+CC       ?= gcc
+CSTD      = -std=c11 -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+WARN      = -Wall -Wextra -Wpedantic -Wshadow -Wundef -Wformat=2 \
+            -Wstrict-prototypes -Wpointer-arith -Wvla
+OPT      ?= -O2 -g
+CFLAGS   ?=
+LDFLAGS  ?=
 
-BUILD_DIR = build
+PREFIX   ?= /usr/local
+BINDIR   ?= $(PREFIX)/bin
+SYSCONFDIR ?= /etc
+UNITDIR  ?= /lib/systemd/system
+BUILD    ?= build
+DESTDIR  ?=
 
-# Optional dependency prefixes -----------------------------------------
-
-OPENSSL_DIR ?=
-SRTP_DIR    ?=
+DEPS_PREFIX ?=
 X264_DIR    ?=
 
-DEP_INCLUDES =
-DEP_LIBDIRS  =
+# Dependency search paths ----------------------------------------------------
+#
+# lib64 before lib: an OpenSSL built from source installs into lib64 on
+# x86_64, a distribution package into lib/<multiarch>.
 
-ifneq ($(OPENSSL_DIR),)
-  DEP_INCLUDES += -I$(OPENSSL_DIR)/include
-  DEP_LIBDIRS  += -L$(OPENSSL_DIR)/lib
-endif
-
-ifneq ($(SRTP_DIR),)
-  DEP_INCLUDES += -I$(SRTP_DIR)/include
-  DEP_LIBDIRS  += -L$(SRTP_DIR)/lib
+ifneq ($(DEPS_PREFIX),)
+  PREFIX_INCLUDE := $(DEPS_PREFIX)/include
+  PREFIX_LIBDIRS := $(wildcard $(DEPS_PREFIX)/lib64) \
+                    $(wildcard $(DEPS_PREFIX)/lib)
+else
+  PREFIX_INCLUDE :=
+  PREFIX_LIBDIRS :=
 endif
 
 ifneq ($(X264_DIR),)
-  DEP_INCLUDES += -I$(X264_DIR)/include
-  DEP_LIBDIRS  += -L$(X264_DIR)/lib
-endif
-
-# libx264 autodetection --------------------------------------------------
-
-X264_CANDIDATES = $(X264_DIR)/include/x264.h /usr/include/x264.h \
-                  /usr/local/include/x264.h
-
-HAVE_X264 ?= $(firstword $(foreach f,$(X264_CANDIDATES),$(if $(wildcard $f),1,)))
-ifeq ($(HAVE_X264),)
-  HAVE_X264 = 0
-endif
-
-# Primary target: camstream ----------------------------------------------
-
-APP_INCLUDES = -Iinclude -Iinclude/app -Iinclude/media -Iinclude/webrtc \
-               -Iinclude/janus -Ithird_party/mongoose $(DEP_INCLUDES)
-
-APP_CFLAGS = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) \
-             -DHAVE_X264=$(HAVE_X264)
-
-# Native WebRTC stack (OpenSSL + libsrtp2)
-NATIVE_WEBRTC = \
-	src/webrtc/ice_lite.c \
-	src/webrtc/dtls_srtp.c \
-	src/webrtc/rtp_h264.c \
-	src/webrtc/rtcp.c \
-	src/webrtc/webrtc_session.c
-
-# libpeer backend (mbedTLS + libsrtp + usrsctp)
-LIBPEER_WEBRTC = \
-	src/webrtc/libpeer_global.c \
-	src/webrtc/webrtc_session_libpeer.c
-
-# Janus transport backend (plain RTP to an external Janus gateway).
-# No OpenSSL/libsrtp: Janus owns signaling, ICE, DTLS and SRTP.
-# Reuses the existing RFC 6184 packetizer and the RTCP helpers.
-JANUS_TRANSPORT = \
-	src/janus/janus_rtp_sender.c \
-	src/webrtc/rtp_h264.c \
-	src/webrtc/rtcp.c
-
-# Common sources (including SDP parser used by both backends for logging)
-APP_COMMON = \
-	src/camstream_main.c \
-	src/app/app_server.c \
-	src/app/app_config.c \
-	src/app/web_ui.c \
-	src/media/frame_pool.c \
-	src/media/frame_hub.c \
-	src/media/au_ring.c \
-	src/media/source_worker.c \
-	src/media/encoder_worker.c \
-	src/media/v4l2_source.c \
-	src/media/csi_source.c \
-	src/media/test_source.c \
-	src/media/yuv_convert.c \
-	src/media/h264_encoder.c \
-	src/media/encoder_v4l2m2m.c \
-	src/webrtc/sdp.c \
-	third_party/mongoose/mongoose.c
-
-APP_SOURCES = $(APP_COMMON) $(NATIVE_WEBRTC)
-
-# The libx264 backend is only compiled in when x264 was detected.
-ifeq ($(HAVE_X264),1)
-  APP_SOURCES += src/media/encoder_x264.c
-endif
-
-APP_OBJECTS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(APP_SOURCES))
-
-# libm last: x264 math symbols resolve from archives seen later
-X264_LIB =
-ifeq ($(HAVE_X264),1)
-  X264_LIB = -lx264
-endif
-
-APP_LIBS = $(DEP_LIBDIRS) -lssl -lcrypto -lsrtp2 -lpthread $(X264_LIB) -lm
-
-# libpeer build detection
-LIBPEER_SRC ?= $(BUILD_DIR)/libpeer-src
-LIBPEER_BUILD ?= $(BUILD_DIR)/libpeer
-LIBPEER_DIST = $(LIBPEER_BUILD)/dist
-LIBPEER_INCLUDES = -I$(LIBPEER_DIST)/include -I$(LIBPEER_SRC)/src -I$(LIBPEER_SRC)/include -I$(LIBPEER_SRC)/third_party/cJSON
-LIBPEER_LIBDIR = -L$(LIBPEER_DIST)/lib
-# libpeer static libs (order matters) - only if built
-LIBPEER_LIB_EXISTS = $(wildcard $(LIBPEER_DIST)/lib/libpeer.a)
-ifeq ($(LIBPEER_LIB_EXISTS),)
-  LIBPEER_LIBS = -lpthread -lm
+  X264_INCLUDE := $(X264_DIR)/include
+  X264_LIBDIRS := $(wildcard $(X264_DIR)/lib64) \
+                  $(wildcard $(X264_DIR)/lib)
 else
-  LIBPEER_LIBS = $(LIBPEER_LIBDIR) -lpeer -lsrtp2 -lusrsctp -lmbedtls -lmbedx509 -lmbedcrypto -lcjson -lpthread -lm
+  X264_INCLUDE :=
+  X264_LIBDIRS :=
 endif
 
-# libpeer variant objects
-APP_SOURCES_LIBPEER = $(APP_COMMON) $(LIBPEER_WEBRTC)
+MULTIARCH  := $(shell $(CC) -print-multiarch 2>/dev/null)
+SYSTEM_INCLUDE := /usr/local/include /usr/include
+SYSTEM_LIBDIRS := /usr/local/lib /usr/lib/$(MULTIARCH) /usr/lib64 /usr/lib
+
+# find_header(DIRS, RELATIVE_PATH) -> first directory containing the header
+find_header = $(firstword $(foreach d,$(1),$(if $(wildcard $(d)/$(2)),$(d))))
+
+OPENSSL_INCLUDE := $(call find_header,$(PREFIX_INCLUDE) $(SYSTEM_INCLUDE),openssl/ssl.h)
+SRTP_INCLUDE    := $(call find_header,$(PREFIX_INCLUDE) $(SYSTEM_INCLUDE),srtp2/srtp.h)
+X264_HEADER     := $(call find_header,$(X264_INCLUDE) $(PREFIX_INCLUDE) $(SYSTEM_INCLUDE),x264.h)
+
+OPENSSL_LIBDIR := $(firstword $(foreach d,$(PREFIX_LIBDIRS) $(SYSTEM_LIBDIRS),\
+                    $(if $(wildcard $(d)/libssl.so* $(d)/libssl.a),$(d))))
+SRTP_LIBDIR    := $(firstword $(foreach d,$(PREFIX_LIBDIRS) $(SYSTEM_LIBDIRS),\
+                    $(if $(wildcard $(d)/libsrtp2.so* $(d)/libsrtp2.a),$(d))))
+X264_LIBDIR    := $(firstword $(foreach d,$(X264_LIBDIRS) $(PREFIX_LIBDIRS) $(SYSTEM_LIBDIRS),\
+                    $(if $(wildcard $(d)/libx264.so* $(d)/libx264.a),$(d))))
+
+ifeq ($(X264_HEADER),)
+  ifeq ($(HAVE_X264),1)
+    $(error HAVE_X264=1 was requested but x264.h was not found. Install \
+libx264-dev or pass X264_DIR=/path)
+  endif
+  HAVE_X264 := 0
+else
+  HAVE_X264 ?= 1
+  ifeq ($(X264_LIBDIR),)
+    $(error x264.h was found in $(X264_HEADER) but no libx264 library was. \
+Install libx264-dev or pass X264_DIR=/path)
+  endif
+endif
+
+# Missing dependencies are only fatal for goals that compile or install
+# something. `make clean` and `make help` must work on a machine that has
+# no OpenSSL at all, so the checks are skipped for those two. Switching to
+# a build goal then reports the same messages as before.
+SAFE_GOALS := clean help
+BUILD_GOALS := $(filter-out $(SAFE_GOALS),$(or $(MAKECMDGOALS),all))
+
+ifneq ($(BUILD_GOALS),)
+ifeq ($(OPENSSL_INCLUDE),)
+  $(error OpenSSL headers not found. Install libssl-dev, or build OpenSSL and \
+pass DEPS_PREFIX=/path. See the build section of README.md)
+endif
+ifeq ($(SRTP_INCLUDE),)
+  $(error libsrtp2 headers not found. Install libsrtp2-dev, or build libsrtp \
+with --prefix=/path --enable-openssl and pass DEPS_PREFIX=/path. See the build \
+section of README.md)
+endif
+ifeq ($(SRTP_LIBDIR),)
+  $(error libsrtp2 library not found although srtp2/srtp.h is in \
+$(SRTP_INCLUDE))
+endif
+ifeq ($(OPENSSL_LIBDIR),)
+  $(error libssl not found although openssl/ssl.h is in $(OPENSSL_INCLUDE))
+endif
+endif
+
+# A prefix that only holds static archives needs no run time path; a shared
+# library outside the default search path does.
+DEP_LIBDIRS_ALL := $(OPENSSL_LIBDIR) $(SRTP_LIBDIR) $(X264_LIBDIR)
+RPATH_DIRS := $(filter-out $(SYSTEM_LIBDIRS),$(DEP_LIBDIRS_ALL))
+
+DEP_CFLAGS := $(addprefix -I,$(filter-out /usr/include,$(sort \
+                $(OPENSSL_INCLUDE) $(SRTP_INCLUDE) $(X264_HEADER))))
+# A comma inside addprefix would be read as its argument separator.
+comma := ,
+DEP_LDFLAGS := $(addprefix -L,$(sort $(OPENSSL_LIBDIR) $(SRTP_LIBDIR))) \
+               $(addprefix -Wl$(comma)-rpath$(comma),$(sort $(RPATH_DIRS)))
+
+DEP_LIBS := -lssl -lcrypto -lsrtp2 -lpthread
 ifeq ($(HAVE_X264),1)
-  APP_SOURCES_LIBPEER += src/media/encoder_x264.c
+  DEP_CFLAGS += $(addprefix -I,$(filter-out /usr/include,$(X264_INCLUDE)))
+  DEP_LDFLAGS += -L$(X264_LIBDIR)
+  DEP_LIBS += -lx264
 endif
-APP_OBJECTS_LIBPEER = $(patsubst %.c,$(BUILD_DIR)/libpeer/%.o,$(APP_SOURCES_LIBPEER))
-APP_CFLAGS_LIBPEER = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) $(LIBPEER_INCLUDES) -DUSE_LIBPEER=1 -DHAVE_X264=$(HAVE_X264)
-APP_LIBS_LIBPEER = $(DEP_LIBDIRS) $(LIBPEER_LIBS) -lpthread $(X264_LIB) -lm
+# libm last: a static libx264 has its math symbols resolved from here.
+DEP_LIBS += -lm
 
-# Janus variant objects: C application + RTP output, no WebRTC stack
-APP_SOURCES_JANUS = $(APP_COMMON) $(JANUS_TRANSPORT)
-ifeq ($(HAVE_X264),1)
-  APP_SOURCES_JANUS += src/media/encoder_x264.c
-endif
-APP_OBJECTS_JANUS = $(patsubst %.c,$(BUILD_DIR)/janus/%.o,$(APP_SOURCES_JANUS))
-APP_CFLAGS_JANUS = $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) -DUSE_JANUS_TRANSPORT=1 -DHAVE_X264=$(HAVE_X264)
-# Minimal deps: no OpenSSL, no libsrtp. Janus is a separate process.
-APP_LIBS_JANUS = $(DEP_LIBDIRS) $(X264_LIB) -lpthread -lm
+# Sources -------------------------------------------------------------------
 
-# The Janus web page is embedded at build time from web/janus/.
-JANUS_WEB_SOURCES = web/janus/index.html web/janus/janus-client.js
-JANUS_WEB_HEADER  = $(BUILD_DIR)/janus/janus_web_assets.h
+APP_INCLUDE_DIRS := include include/app include/media include/webrtc \
+                    $(BUILD)/generated
+APP_INCLUDES     := $(addprefix -I,$(APP_INCLUDE_DIRS)) \
+                    -isystem third_party/mongoose $(DEP_CFLAGS)
 
-# Rules ------------------------------------------------------------------
+SOURCES := $(wildcard src/*.c src/*/*.c) third_party/mongoose/mongoose.c
+OBJECTS := $(patsubst %.c,$(BUILD)/obj/%.o,$(SOURCES))
 
-.PHONY: all camstream camstream-janus camstream-libpeer libpeer vision-capture clean help test vision-test libpeer-backend test-janus
+COMMON_CFLAGS := $(CSTD) $(WARN) $(OPT) $(CFLAGS) $(APP_INCLUDES) \
+                 -DHAVE_X264=$(HAVE_X264)
 
-all: camstream
+# Objects are only reusable while the flags that produced them stay the
+# same. This stamp is rewritten when they change, which makes every object
+# stale, so `make HAVE_X264=0` or `make OPT=-O3` after a normal build
+# recompiles instead of relinking a mix of the two.
+FLAG_STAMP := $(BUILD)/.flags
+$(shell mkdir -p $(BUILD); \
+        printf '%s\n' '$(COMMON_CFLAGS)' > $(FLAG_STAMP).tmp; \
+        if ! cmp -s $(FLAG_STAMP).tmp $(FLAG_STAMP) 2>/dev/null; then \
+            mv -f $(FLAG_STAMP).tmp $(FLAG_STAMP); \
+        else \
+            rm -f $(FLAG_STAMP).tmp; \
+        fi)
 
-# Optional: clone and build upstream libpeer in ignored build/ directories.
-# This is deliberately separate: libpeer uses mbedTLS and its own SRTP
-# dependency graph, while camstream uses OpenSSL/libsrtp2.
-libpeer:
-	tools/setup-libpeer.sh
+BINARY    := $(BUILD)/camstream
+WEB_PAGE  := web/index.html
+WEB_ASSETS := $(BUILD)/generated/web_assets.h
+EMBED_TOOL := $(BUILD)/embed_assets
 
-camstream: $(BUILD_DIR)/camstream
+# Rules ---------------------------------------------------------------------
 
-# Native backend (OpenSSL + libsrtp2)
-$(BUILD_DIR)/camstream: $(APP_OBJECTS)
+.PHONY: all test install clean help
+
+all: $(BINARY)
+
+$(BINARY): $(OBJECTS) $(WEB_ASSETS)
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS) $(APP_OBJECTS) -o $@ $(APP_LIBS)
-	@echo ""
-	@echo "built $(BUILD_DIR)/camstream (native WebRTC, x264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
+	$(CC) $(OBJECTS) -o $@ $(LDFLAGS) $(DEP_LDFLAGS) $(DEP_LIBS)
+	@echo "built $(BINARY) (libx264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
 
-# Janus transport backend (RTP to an external Janus gateway)
-camstream-janus: $(BUILD_DIR)/camstream-janus
-
-$(BUILD_DIR)/camstream-janus: $(APP_OBJECTS_JANUS) $(JANUS_WEB_HEADER)
+$(BUILD)/obj/%.o: %.c $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS_JANUS) $(APP_OBJECTS_JANUS) -o $@ $(APP_LIBS_JANUS)
-	@echo ""
-	@echo "built $(BUILD_DIR)/camstream-janus (Janus RTP transport, x264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
-	@echo "  deps: none beyond libc/libpthread (Janus runs as a separate process)"
-	@echo "  run: ./build/camstream-janus --test --encoder sw"
-	@echo "  then install config/janus/*.jcfg into /etc/janus/ and start janus"
+	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/janus/%.o: %.c
+# Only the server serves the page, so only its object depends on it.
+$(BUILD)/obj/src/app/app_server.o: $(WEB_ASSETS)
+
+# Vendored third party code: built without the project warning set because it is
+# not ours to fix, with the alloca declaration its allocator relies on, and with
+# its own logging compiled out so mongoose never writes to stderr behind the
+# logger (the spec requires one log stream and a quiet hot path).
+$(BUILD)/obj/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c \
+        $(FLAG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS_JANUS) -c $< -o $@
+	$(CC) $(CSTD) $(OPT) $(CFLAGS) -Ithird_party/mongoose -include alloca.h \
+	      -DMG_ENABLE_LOG=0 -c $< -o $@
 
-# The Janus dashboard, embedded from web/janus/ at build time.
-$(BUILD_DIR)/embed_assets: tools/embed_assets.c
+# The web page is embedded in the binary, so a deployment needs no web root.
+# Regenerating it only when web/index.html changes keeps rebuilds cheap.
+$(EMBED_TOOL): tools/embed_assets.c
 	@mkdir -p $(dir $@)
-	$(CC) $(BASE) -O2 -o $@ $<
+	$(CC) $(CSTD) -O2 -o $@ $<
 
-$(JANUS_WEB_HEADER): $(JANUS_WEB_SOURCES) $(BUILD_DIR)/embed_assets
+$(WEB_ASSETS): $(WEB_PAGE) $(EMBED_TOOL)
 	@mkdir -p $(dir $@)
-	$(BUILD_DIR)/embed_assets $@ JANUS_WEB_ASSETS_H \
-		janus_web_index_html web/janus/index.html \
-		janus_web_client_js web/janus/janus-client.js
+	$(EMBED_TOOL) $@ CAMSTREAM_WEB_ASSETS_H web_index_html $(WEB_PAGE)
 
-# The Janus dashboard string is generated; same pedantic exemption
-# as the hand-written page above.
-$(BUILD_DIR)/janus/src/app/web_ui.o: src/app/web_ui.c $(JANUS_WEB_HEADER)
+# Tests ---------------------------------------------------------------------
+#
+# Each test links the real module under test. Tests never link the network
+# server: app_server.c is exercised by running the binary (see README.md).
+
+TEST_BUILD := $(BUILD)/tests
+
+$(TEST_BUILD)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/ice_lite.h
 	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(filter-out -Wpedantic,$(WARN)) $(CFLAGS) $(APP_INCLUDES) \
-	       -I$(BUILD_DIR)/janus -DUSE_JANUS_TRANSPORT=1 -DHAVE_X264=$(HAVE_X264) \
-	       -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/webrtc \
+	      $(DEP_CFLAGS) tests/test_stun.c src/webrtc/ice_lite.c -o $@ \
+	      $(DEP_LDFLAGS) -lcrypto
 
-$(BUILD_DIR)/janus/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c
+$(TEST_BUILD)/test_encoder_worker: tests/test_encoder_worker.c \
+        src/media/encoder_worker.c src/media/frame_hub.c src/media/frame_pool.c \
+        src/media/au_ring.c src/media/yuv_convert.c src/app/log.c
 	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(CFLAGS) -Ithird_party/mongoose -include alloca.h -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/media \
+	      -Iinclude/app tests/test_encoder_worker.c src/media/encoder_worker.c \
+	      src/media/frame_hub.c src/media/frame_pool.c src/media/au_ring.c \
+	      src/media/yuv_convert.c src/app/log.c -o $@ -lpthread
 
-# libpeer backend (mbedTLS + bundled deps) - fully migrated runtime
-camstream-libpeer: $(BUILD_DIR)/camstream-libpeer
-
-libpeer-backend: camstream-libpeer
-
-$(LIBPEER_DIST)/lib/libpeer.a:
-	tools/setup-libpeer.sh
-
-$(BUILD_DIR)/camstream-libpeer: $(LIBPEER_DIST)/lib/libpeer.a $(APP_OBJECTS_LIBPEER)
+$(TEST_BUILD)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c \
+        src/media/test_source.c src/app/log.c
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS_LIBPEER) $(APP_OBJECTS_LIBPEER) -o $@ $(APP_LIBS_LIBPEER)
-	@echo ""
-	@echo "built $(BUILD_DIR)/camstream-libpeer (libpeer WebRTC, x264: $(if $(filter 1,$(HAVE_X264)),yes,no))"
-	@echo "  deps: mbedTLS + libsrtp2 + usrsctp + cJSON (bundled via libpeer)"
-	@echo "  run: ./build/camstream-libpeer --test --encoder sw --listen 0.0.0.0 --http-port 8000"
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/media \
+	      -Iinclude/app tests/test_csi_source.c src/media/csi_source.c \
+	      src/media/test_source.c src/app/log.c -o $@ -lpthread
 
-$(BUILD_DIR)/libpeer/%.o: %.c
+# The session test needs the whole WebRTC stack: STUN, DTLS, SRTP,
+# RTP packetization, RTCP parsing and SDP answer generation.
+WEBRTC_TEST_SOURCES := src/webrtc/webrtc_session.c src/webrtc/dtls_srtp.c \
+                       src/webrtc/ice_lite.c src/webrtc/rtp_h264.c \
+                       src/webrtc/rtcp.c src/webrtc/sdp.c src/app/log.c
+
+$(TEST_BUILD)/test_rtc_session: tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES)
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS_LIBPEER) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) -Iinclude -Iinclude/app \
+	      -Iinclude/media -Iinclude/webrtc $(DEP_CFLAGS) \
+	      tests/test_rtc_session.c $(WEBRTC_TEST_SOURCES) -o $@ \
+	      $(DEP_LDFLAGS) -lssl -lcrypto -lsrtp2 -lpthread -lm
 
-$(BUILD_DIR)/%.o: %.c
+# This one drives the real binary over HTTP, so it takes the server path
+# as its only argument and needs the binary built first.
+$(TEST_BUILD)/test_server_api: tests/test_server_api.c $(BINARY)
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS) tests/test_server_api.c -o $@
 
-# The embedded web page is one long string literal, beyond the
-# 4095 byte ISO minimum, so pedantic mode is disabled for it.
-$(BUILD_DIR)/src/app/web_ui.o: src/app/web_ui.c
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(filter-out -Wpedantic,$(WARN)) $(CFLAGS) $(APP_INCLUDES) \
-	       -DHAVE_X264=$(HAVE_X264) -c $< -o $@
+TEST_BINARIES := $(TEST_BUILD)/test_stun $(TEST_BUILD)/test_encoder_worker \
+                 $(TEST_BUILD)/test_csi_source $(TEST_BUILD)/test_rtc_session \
+                 $(TEST_BUILD)/test_server_api
 
-$(BUILD_DIR)/libpeer/src/app/web_ui.o: src/app/web_ui.c
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(filter-out -Wpedantic,$(WARN)) $(CFLAGS) $(APP_INCLUDES) $(LIBPEER_INCLUDES) \
-	       -DUSE_LIBPEER=1 -DHAVE_X264=$(HAVE_X264) -c $< -o $@
+test: $(TEST_BINARIES) $(BINARY)
+	@for test_binary in $(TEST_BINARIES); do \
+	    echo "== $$test_binary"; \
+	    $$test_binary $(BINARY) || exit 1; \
+	done
+	@echo "all tests passed"
 
-$(BUILD_DIR)/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(CFLAGS) -Ithird_party/mongoose -include alloca.h -c $< -o $@
+# Install -------------------------------------------------------------------
 
-$(BUILD_DIR)/libpeer/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(CFLAGS) -Ithird_party/mongoose -include alloca.h -c $< -o $@
-
-$(BUILD_DIR)/test_stun: tests/test_stun.c src/webrtc/ice_lite.c include/webrtc/ice_lite.h
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) $(APP_INCLUDES) \
-	      tests/test_stun.c src/webrtc/ice_lite.c -o $@ $(DEP_LIBDIRS) -lcrypto
-
-$(BUILD_DIR)/test_vision: tests/test_vision.c src/vision/frame_matrix.c include/vision/frame_matrix.h
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude/vision \
-	      tests/test_vision.c src/vision/frame_matrix.c -o $@
-
-$(BUILD_DIR)/test_encoder_worker: tests/test_encoder_worker.c \
-        src/media/encoder_worker.c src/media/frame_hub.c \
-        src/media/frame_pool.c src/media/au_ring.c \
-        src/media/yuv_convert.c include/media/encoder_worker.h
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
-	  tests/test_encoder_worker.c src/media/encoder_worker.c \
-	  src/media/frame_hub.c src/media/frame_pool.c \
-	  src/media/au_ring.c src/media/yuv_convert.c -o $@ -lpthread
-
-$(BUILD_DIR)/test_csi_source: tests/test_csi_source.c src/media/csi_source.c src/media/test_source.c include/media/video_source.h
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
-	  tests/test_csi_source.c src/media/csi_source.c src/media/test_source.c -o $@ -lpthread
-
-# Janus sender test: synthetic AUs through the real sender against
-# a local fake-Janus UDP socket. No camera, no x264, no Janus needed.
-$(BUILD_DIR)/test_janus_sender: tests/test_janus_sender.c \
-        src/janus/janus_rtp_sender.c src/webrtc/rtp_h264.c \
-        src/webrtc/rtcp.c src/media/au_ring.c
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media \
-	  -Iinclude/webrtc -Iinclude/janus \
-	  tests/test_janus_sender.c src/janus/janus_rtp_sender.c \
-	  src/webrtc/rtp_h264.c src/webrtc/rtcp.c src/media/au_ring.c \
-	  -o $@ -lpthread
-
-$(BUILD_DIR)/vision-capture: src/vision/vision_capture.c src/vision/vision_worker.c \
-        src/vision/frame_matrix.c src/media/source_worker.c src/media/frame_hub.c \
-        src/media/frame_pool.c src/media/v4l2_source.c src/media/test_source.c \
-        include/vision/vision_worker.h include/vision/frame_matrix.h
-	@mkdir -p $(dir $@)
-	$(CC) $(BASE) $(WARN) $(CFLAGS) -Iinclude -Iinclude/media -Iinclude/vision \
-	      src/vision/vision_capture.c src/vision/vision_worker.c src/vision/frame_matrix.c \
-	      src/media/source_worker.c src/media/frame_hub.c src/media/frame_pool.c \
-	      src/media/v4l2_source.c src/media/test_source.c -o $@ -lpthread -lm
-
-vision-capture: $(BUILD_DIR)/vision-capture
-
-vision-test: $(BUILD_DIR)/test_vision
-	$(BUILD_DIR)/test_vision
-
-test: $(BUILD_DIR)/test_stun $(BUILD_DIR)/test_vision $(BUILD_DIR)/test_encoder_worker $(BUILD_DIR)/test_csi_source
-	$(BUILD_DIR)/test_stun
-	$(BUILD_DIR)/test_vision
-	$(BUILD_DIR)/test_encoder_worker
-	$(BUILD_DIR)/test_csi_source
-
-test-janus: $(BUILD_DIR)/test_janus_sender
-	$(BUILD_DIR)/test_janus_sender
-
-# Documentation lint: dash style, link resolution, anchor and index coverage.
-.PHONY: check-docs
-check-docs:
-	./tools/check_docs.sh
+install: $(BINARY)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(BINARY) $(DESTDIR)$(BINDIR)/camstream
+	install -d $(DESTDIR)$(SYSCONFDIR)
+	install -m 0644 config/camstream.conf $(DESTDIR)$(SYSCONFDIR)/camstream.conf
+	install -d $(DESTDIR)$(UNITDIR)
+	install -m 0644 packaging/camstream.service \
+	        $(DESTDIR)$(UNITDIR)/camstream.service
 
 clean:
-	rm -rf $(BUILD_DIR)/camstream $(BUILD_DIR)/camstream-janus $(BUILD_DIR)/camstream-libpeer $(BUILD_DIR)/src $(BUILD_DIR)/third_party $(BUILD_DIR)/janus $(BUILD_DIR)/libpeer/src $(BUILD_DIR)/libpeer/third_party
-
-distclean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD)
 
 help:
 	@echo "targets:"
-	@echo "  make                  build build/camstream (native WebRTC, minimal deps)"
-	@echo "  make camstream-janus  build build/camstream-janus (H.264 RTP -> external Janus gateway)"
-	@echo "  make camstream-libpeer build build/camstream-libpeer (libpeer runtime, Phase 3 fully migrated)"
-	@echo "  make libpeer          clone/build upstream libpeer in build/ (needs network)"
-	@echo "  make libpeer-backend  alias for camstream-libpeer"
-	@echo "  make test             run the STUN, vision and encoder-worker unit tests"
-	@echo "  make test-janus       unit test for the Janus RTP sender (no camera/Janus needed)"
-	@echo "  make vision-capture   build the PGM/OBJ mosaic smoke tool"
-	@echo "  make vision-test      build and run the vision unit test alone"
-	@echo "  make check-docs       lint README.md and docs/ (dash style, links, index)"
-	@echo "  make clean            remove build/"
+	@echo "  make             build build/camstream"
+	@echo "  make test        build and run the unit tests"
+	@echo "  make install     install camstream and its support files"
+	@echo "  make clean       remove build/"
 	@echo ""
-	@echo "examples:"
-	@echo "  make -j2 && ./build/camstream --test --encoder sw --listen 0.0.0.0 --http-port 8080"
-	@echo "  make camstream-janus -j2 && ./build/camstream-janus --test --encoder sw"
-	@echo "      (first: install config/janus/*.jcfg into /etc/janus/ and start janus)"
-	@echo "  make libpeer && make camstream-libpeer -j2 && ./build/camstream-libpeer --test --encoder sw --listen 0.0.0.0 --http-port 8000"
+	@echo "variables:"
+	@echo "  DEPS_PREFIX=/path  OpenSSL, libsrtp2 and libx264 prefix"
+	@echo "  X264_DIR=/path     libx264 prefix only"
+	@echo "  HAVE_X264=0        build without libx264"
+	@echo "  PREFIX=/usr/local  install prefix"
+	@echo "  DESTDIR=/tmp/root  staging directory for packaging"
+	@echo "  OPT='-O0 -g'       override optimisation flags"
 	@echo ""
-	@echo "overrides:"
-	@echo "  OPENSSL_DIR=... SRTP_DIR=... X264_DIR=...  dependency prefixes"
-	@echo "  HAVE_X264=0/1                               force x264 on or off"
-	@echo "  USE_LIBPEER=1                               force libpeer backend"
+# Detection is printed whether or not a dependency was found, because the
+# usual reason to run `make help` on a fresh machine is a missing one.
+	@echo "detected (pass DEPS_PREFIX=/path to point elsewhere):"
+	@echo "  OpenSSL   headers: $(if $(OPENSSL_INCLUDE),$(OPENSSL_INCLUDE),NOT FOUND)  libraries: $(if $(OPENSSL_LIBDIR),$(OPENSSL_LIBDIR),NOT FOUND)"
+	@echo "  libsrtp2  headers: $(if $(SRTP_INCLUDE),$(SRTP_INCLUDE),NOT FOUND)  libraries: $(if $(SRTP_LIBDIR),$(SRTP_LIBDIR),NOT FOUND)"
+	@echo "  libx264   $(if $(filter 1,$(HAVE_X264)),headers: $(X264_HEADER)  libraries: $(X264_LIBDIR),not used (HAVE_X264=0 or no header found))"
