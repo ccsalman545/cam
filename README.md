@@ -1,522 +1,319 @@
-# camstream
+# camstream — Pure C WebRTC Camera Server + Minimal HTTP Server for Embedded Linux
 
-`camstream` turns a Raspberry Pi (or any Linux box with a V4L2 camera) into a
-low latency WebRTC camera server for a LAN. One C binary captures frames,
-encodes H.264, and speaks real WebRTC to a browser tab: ICE-lite, DTLS 1.2,
-SRTP, RTP/RTCP. No gateway, no signaling server, no relay, no JavaScript
-build step, nothing to install on the viewer side beyond a browser.
+> Turn any Linux box (Raspberry Pi, x86, ARM) with a V4L2 or CSI camera into a low-latency WebRTC camera that any browser can view — **no gateway, no cloud, no JavaScript build step**. Plus a 18-line portable HTTP static file server for embedded projects.
 
-The problem it solves: a browser cannot consume a raw V4L2 camera. Some piece
-of software has to capture, encode, negotiate a peer connection, and keep the
-connection alive when the viewer closes a tab or walks out of Wi-Fi range.
-`camstream` is that piece. The project is about 18,000 lines of C across 50 files (plus libpeer), plus the vendored HTTP server.
+[![C](https://img.shields.io/badge/language-C-blue)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi-green)](https://www.raspberrypi.com/)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Build](https://img.shields.io/badge/build-make%20%7C%20cmake-orange)](#building)
+
+**Project size:** ~18k lines of C across 50 files (+ libpeer vendored), plus vendored Mongoose HTTP server. Everything is native C — no Python/Node/Go runtime needed on the device.
+
+---
 
 ## Contents
 
-- [Architecture](#architecture)
-- [Data flow](#data-flow)
-- [WebRTC flow](#webrtc-flow)
-- [Camera pipeline](#camera-pipeline)
-- [Networking model](#networking-model)
-- [Automatic LAN connection](#automatic-lan-connection)
+- [What is this?](#what-is-this)
+- [Who is this for?](#who-is-this-for)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Components](#components)
+  - [camstream (native WebRTC)](#camstream-native-webrtc)
+  - [camstream-libpeer (libpeer WebRTC)](#camstream-libpeer-libpeer-webrtc)
+  - [server.c — Minimal HTTP Server](#serverc--minimal-http-server)
+- [Hardware](#hardware)
 - [Building](#building)
 - [Running](#running)
 - [Configuration](#configuration)
-- [Camera setup](#camera-setup)
-- [Firewall](#firewall)
-- [LAN access: step-by-step check](#lan-access-step-by-step-check)
-- [Web interface](#web-interface)
+- [Camera Setup](#camera-setup)
+- [Networking Model](#networking-model)
+- [Automatic LAN Connection (mDNS)](#automatic-lan-connection-mdns)
+- [Web Interface](#web-interface)
 - [Diagnostics API](#diagnostics-api)
-- [Recovery](#recovery)
-- [Latency and performance](#latency-and-performance)
-- [Security model](#security-model)
-- [Project structure](#project-structure)
+- [Architecture Deep Dive](#architecture-deep-dive)
+- [Camera Pipeline Explained](#camera-pipeline-explained)
+- [WebRTC Flow Explained](#webrtc-flow-explained)
+- [Latency & Performance](#latency--performance)
+- [Security Model](#security-model)
+- [Project Structure](#project-structure)
 - [Testing](#testing)
-- [WebRTC via libpeer (camstream-libpeer)](#webrtc-via-libpeer-camstream-libpeer)
-- [Deployment](#deployment)
+- [Deployment (systemd)](#deployment-systemd)
 - [Troubleshooting](#troubleshooting)
-- [Known limitations](#known-limitations)
+- [Known Limitations](#known-limitations)
+- [Extending / Contributing](#extending--contributing)
 
-## Architecture
+---
 
-Two binaries share the same camera pipeline. `build/camstream` uses the
-in-house WebRTC stack; `build/camstream-libpeer` uses
-[sepfy/libpeer](https://github.com/sepfy/libpeer) (pinned as a submodule).
+## What is this?
 
-In both, the media path runs in its own threads and never touches the network:
+A browser **cannot** consume a raw V4L2 camera (`/dev/video0`). You need something that:
 
-    camera (V4L2, CSI via rpicam-vid, stdin, or a synthetic pattern)
-      -> frame pool (fixed count, refcounted, no allocation in the loop)
-      -> frame hub (keep-newest mailbox per consumer)
-      -> encoder thread (hardware V4L2 M2M or libx264)
-      -> access-unit ring (8 slots x 512 KiB, overwrite oldest)
+1. Captures frames (V4L2 mmap, or Pi CSI via `rpicam-vid`)
+2. Encodes H.264 (hardware V4L2 M2M `/dev/video11` or libx264)
+3. Negotiates WebRTC (ICE-lite, DTLS 1.2, SRTP, RTP/RTCP)
+4. Serves a web page and signaling over HTTP
+5. Keeps alive when tabs close or Wi-Fi roams
 
-The control path runs on the main thread and owns everything asynchronous:
-HTTP, WebRTC signaling, ICE, DTLS, SRTP, RTP, RTCP, and the timers for all of
-them. The main thread never blocks; it polls the UDP sockets, runs Mongoose's
-`mg_mgr_poll`, ticks every session, and pushes access units to viewers.
+`camstream` is that piece — **one binary, one process, pure C**.
 
-```mermaid
-flowchart TB
-    SRC["V4L2 device or test pattern<br/>source thread: grab, never block"]
-    HUB["frame hub<br/>keep-newest mailbox per consumer"]
-    ENC["encode thread<br/>I420 conversion then H.264"]
-    RING["AU ring<br/>8 slots x 512 KiB, overwrite oldest"]
-    MAIN["main thread, one non-blocking poll loop<br/>HTTP and signaling, ICE, DTLS timers, RTCP"]
-    V1["viewer 1<br/>RTP packetize, SRTP, UDP"]
-    V2["viewer 2<br/>RTP packetize, SRTP, UDP"]
-    VN["viewer 8<br/>RTP packetize, SRTP, UDP"]
+It also includes:
 
-    SRC --> HUB --> ENC --> RING --> MAIN
-    MAIN --> V1
-    MAIN --> V2
-    MAIN --> VN
-```
+- **`camstream-libpeer`**: same camera pipeline, but WebRTC via [sepfy/libpeer](https://github.com/sepfy/libpeer) — pure C, ARM/Linux target, ECDSA certs, so you can A/B latency.
+- **`server.c`**: 18-line portable HTTP static file server (Mongoose single-file) — useful as standalone building block for any embedded Linux project. `gcc -O2 server.c mongoose.c -o web_server`.
 
-Why one loop instead of a thread per viewer: a LAN has one operator and up to
-eight viewers, the per-packet work is a few microseconds, and a single thread
-removes every lock between packetization, retransmission, and the RTCP state
-that decides what to retransmit. The encoder is the only heavy consumer, and
-it only runs while at least one viewer holds a session.
+---
 
-Removed along the way: a Janus RTP transport (requires an external
-gateway, which this project explicitly does not need) and a vision/mosaic
-experiment (no role in streaming, pulled in its own dependencies). See
-`git log` for the removal commits; the interfaces they used are gone, not the
-functionality. The libpeer stack now lives in its own binary
-`camstream-libpeer` so the two implementations can be compared side by side.
+## Who is this for?
 
-## Data flow
+- **Raspberry Pi camera projects** (IMX219, IMX477, IMX708) needing browser view with near-zero latency over Ethernet.
+- **Embedded Linux** developers who want WebRTC without GStreamer, Janus, or Node.
+- **Students / researchers** learning WebRTC internals in C (STUN, DTLS, SRTP, RTP packetization).
+- **Anyone needing a tiny HTTP server** in C without containers — `server.c` is reusable.
 
-1. The source thread fills a frame from the pool, timestamps it with
-   `CLOCK_MONOTONIC`, publishes it to the hub, and waits for the next slot.
-   The hub keeps only the newest frame per consumer, so a slow encoder drops
-   frames instead of buffering them. This is where latency would otherwise
-   accumulate.
-2. The encoder thread converts YUYV/YU12 to I420 in a scratch buffer, encodes
-   to Annex B H.264, and pushes the access unit with its presentation
-   timestamp into the ring. The ring has 8 slots and overwrites the oldest,
-   so the encoder can never block on the network.
-3. The main thread drains the ring every iteration, splits each access unit
-   into RTP packets (single NAL or FU-A, at most 1200 bytes of UDP payload),
-   encrypts with SRTP, and sends one copy per viewer socket.
-4. A per-viewer retransmission cache keeps the last 512 protected packets.
-   An RTCP NACK from the browser is answered by re-sending the cached bytes,
-   so a lost packet costs a repair instead of a stalled decoder.
-5. Sender reports go out every second with the wall-clock NTP timestamp, so
-   the browser can compute RTT and hold its jitter buffer small. A viewer
-   that joins mid-GOP triggers an IDR request, so the encoder turns the next
-   frame into a keyframe; requests are rate limited to one per 400 ms per
-   session.
+---
 
-## WebRTC flow
+## Features
 
-```mermaid
-stateDiagram-v2
-    [*] --> new
-    new --> ice: first authenticated STUN check
-    ice --> dtls: first ClientHello
-    dtls --> streaming: RFC 5764 keys exported
-    new --> closed: idle 15 s
-    ice --> closed: DTLS watchdog 30 s
-    dtls --> closed: DTLS watchdog 30 s
-    streaming --> closed: BYE, idle, fatal error, or shutdown
-    closed --> [*]
+- **Pure C, no runtime** — builds with `make`, runs on Pi OS, Debian, any Linux.
+- **Two WebRTC stacks** in one repo:
+  - Native: ICE-lite, DTLS 1.2 self-signed P-256, SRTP AES128_CM_SHA1_80, RTP/RTCP, NACK retransmit cache (512 packets), Sender Reports.
+  - libpeer: same pipeline, one thread per viewer, STUN consent checks (2s/10s), FU-A reassembly, IDR-gated start.
+- **Camera pipeline**: V4L2 mmap, CSI via `rpicam-vid` pipe (handles 64-byte stride padding), stdin YUV420, synthetic test pattern. Frame pool (refcounted, no alloc in loop), hub (keep-newest mailbox), AU ring (8×512 KiB overwrite oldest).
+- **Encoder**: auto → hardware V4L2 M2M (`/dev/video11` on Pi Zero2/3/4) → libx264 `superfast/zerolatency` sliced threads (up to 4 cores, no latency). VBV CBR-like, fixed GOP, SPS/PPS on every IDR.
+- **HTTP + mDNS**: Mongoose embedded, page embedded at build time, `camstream.local` via mDNS responder (probes, rename to `-2..-10` on conflict).
+- **Diagnostics**: `/api/status`, `/api/stats`, `/api/logs`, pipeline layers, per-session RTT/loss/jitter, capture/encode FPS, CPU%.
+- **Recovery**: camera/encoder watchdog, automatic rebuild with backoff 5s→60s, HW→SW fallback.
+- **Minimal HTTP server**: 177 KB binary (`-O2`), 163 KB with `-DMG_ENABLE_LOG=0`, serves `./web_root`.
 
-    note right of new: answer sent, UDP port bound
-    note right of closed: slot freed in the same loop iteration
-```
+---
 
-1. The browser loads `/`, builds an offer with a receive-only video
-   transceiver, and POSTs the SDP to `/api/webrtc/offer`.
-2. The server parses the offer (ICE credentials, DTLS fingerprint, H.264
-   payload type, mid, setup), allocates one UDP port for the session, and
-   answers with `a=ice-lite`, `a=setup:passive`, a host candidate for every
-   local IPv4 address, and the DTLS certificate fingerprint. The fingerprint
-   is regenerated per process start and rotated by `POST /api/webrtc/restart`.
-3. ICE: the server is ICE-lite. It never sends connectivity checks; it waits
-   for the browser's STUN binding request, verifies MESSAGE-INTEGRITY with
-   the negotiated credentials, answers with XOR-MAPPED-ADDRESS, and locks the
-   session to that source address. A peer that moves (Wi-Fi roaming, DHCP
-   change) is re-locked when an authenticated check arrives from the new
-   address on the same port.
-4. DTLS 1.2 handshake, server side passive. The certificate is a self-signed
-   P-256 key generated in memory at startup and never written to disk. The
-   server verifies the peer certificate against the fingerprint in the offer,
-   and the browser verifies the server the same way with the answer; media
-   flows only after the handshake completes and both sides are authenticated.
-5. SRTP with `SRTP_AES128_CM_SHA1_80`, keys exported from the DTLS handshake
-   (`EXTRACTOR-dtls_srtp`). The session moves to `streaming` only after the
-   handshake completes and only when the peer actually negotiated a `use_srtp`
-   profile; a peer that never offered the extension is refused rather than
-   sent media encrypted with keys it does not have. The first keyframe is
-   requested the moment the session reaches `streaming`.
+## Quick Start
 
-Ports: one UDP port per session from `--udp-port`, up to 8 sessions. The
-server binds each port when the session is created and closes it when the
-session ends, so an idle server listens on TCP only.
-
-## Camera pipeline
-
-Capture sources, selected with `--source`:
-
-| Source | How it works | Typical use |
-| --- | --- | --- |
-| `v4l2` | Opens the device, negotiates YUYV then YU12, uses 4 mmap buffers | USB camera, `/dev/video0` |
-| `csi` | Spawns `rpicam-vid` (or `libcamera-vid`) and reads raw YUV420 from its pipe | Raspberry Pi CSI camera (IMX219, IMX477, IMX708, ...) |
-| `stdin` | Reads raw YUV420 frames from standard input | Feeding test footage, `ffmpeg -i clip.mp4 -f rawvideo -pix_fmt yuv420p -` |
-| `test` | Synthetic pattern at the requested size and rate | Bench testing, no hardware |
-
-The CSI source is a pipe reader, not a libcamera client: the Pi camera stack
-is a moving target and `rpicam-vid` is the interface that survives Pi OS
-upgrades. The chain is
-
-```
-IMX219 -> libcamera ISP -> rpicam-vid --codec yuv420 --flush -o - -> pipe
-       -> camstream -> H.264 -> RTP -> SRTP -> WebRTC -> browser
-```
-
-`rpicam-vid` pads every luma row to a multiple of 64 bytes (chroma to 32);
-the source reports that stride and the encoder removes the padding, so any
-even width works, but 640, 1280 and 1920 avoid the extra copy. The child is
-started with `posix_spawn`, inherits no camstream socket (everything is
-close-on-exec), gets a 1 MB pipe, and runs with `LIBCAMERA_LOG_LEVELS=*:WARN`
-unless `--verbose` is given. EOF, a dead child, a truncated frame or 5 s
-without data (15 s for the first frame) ends the source; the pipeline is then
-rebuilt automatically (see [Recovery](#recovery)).
-
-Why not `--source v4l2 --device /dev/video0` for a CSI camera: on current Pi
-OS the sensor's `/dev/video0` is the raw Unicam/CFE capture node. It only
-produces Bayer data, and only after libcamera has configured the media
-graph, so opening it directly fails (`VIDIOC_STREAMON` errno 22, or a
-3280x2464 pad format mismatch on the IMX219). That is expected; use
-`--source csi`.
-
-Encoders, selected with `--encoder`:
-
-| Mode | Backend | Notes |
-| --- | --- | --- |
-| `auto` | Hardware first, then libx264 | Default. Also switches to libx264 if the hardware encoder fails while running |
-| `hw` | V4L2 memory-to-memory, `/dev/video11` first, then any M2M H.264 encoder | Pi Zero 2/3/4 (bcm2835-codec). The Pi 5 has no H.264 encoder block |
-| `hw:/dev/video11` | Same, explicit device | When the numbering is unusual |
-| `sw` | libx264 | Needs `libx264-dev` at build time |
-
-libx264 runs with preset `superfast`, tune `zerolatency` (no lookahead, no
-B-frames, no frame delay), sliced threads (one per core, at most 4: slices
-add no latency, unlike frame threads), constrained baseline, CBR-like VBV
-(max rate = target, buffer = half a second), a fixed GOP of
-`keyframe_seconds` with SPS/PPS repeated on every IDR. `/api/status` shows
-`capture_fps`, `encode_fps` and `cpu_percent` to confirm the rate on the
-device.
-
-The hardware backend sets the capture (H.264) format with the real picture
-size. The previous version left it at 0x0, which the bcm2835 encoder accepts
-at `S_FMT` time and rejects when the port is enabled, surfacing as
-`VIDIOC_STREAMON` errno 11 (EAGAIN); that is fixed, and a genuine
-`EAGAIN`/`EBUSY` is retried three times before `auto` falls back to libx264.
-
-The encoder runs only while a viewer is connected. With no viewer the source
-keeps running (so `/api/status` still reports capture frames and errors) and
-the encoder thread counts frames as `skipped_idle`. That is the difference
-between a warm camera and a busy CPU on a Pi.
-
-## Networking model
-
-LAN only, deliberately. There is no STUN server, no TURN relay, no ICE
-gathering beyond host candidates, and no cloud dependency of any kind. The
-server and the browser must be able to reach each other directly.
-
-```mermaid
-flowchart LR
-    subgraph PI["Raspberry Pi, 192.168.1.10/24"]
-        CAM["camera<br/>/dev/video0"] --> CS["camstream"]
-    end
-    subgraph LAP["Laptop, 192.168.1.20/24"]
-        BR["browser only"]
-    end
-    CS -->|"TCP 8080: page and signaling"| BR
-    BR -->|"UDP 50000 and up: media"| CS
-```
-
-| Port | Protocol | Direction | Purpose |
-| --- | --- | --- | --- |
-| 8080 | TCP | browser to server | Web page, `/api/*`, WebRTC signaling |
-| 50000 to 50007 | UDP | browser to server | STUN, DTLS, SRTP (one port per session) |
-| 5353 | UDP | both ways | mDNS name and service announcement (multicast 224.0.0.251) |
-
-Outbound traffic from the browser uses an ephemeral UDP port that the
-browser chose; the server learns it from the first valid STUN check and
-answers to it. Nothing needs to be opened on the browser side beyond ordinary
-client rules.
-
-Browser requirements: a browser with `RTCPeerConnection`, DTLS 1.2, and
-H.264 in WebRTC. Current Chrome, Chromium, Edge, Firefox and Safari all
-qualify. The page is served over plain HTTP, which is fine because the page
-only receives video; `getUserMedia` is not used, so the HTTPS requirement for
-camera capture does not apply.
-
-Finding the Pi: the server publishes `camstream.local` over mDNS, so the page
-is at `http://camstream.local:8080/` with no address to look up, from a
-router or over a single cable. The name appears in the startup log, in
-`/api/status` under `mdns.url`, and in the footer of the page itself.
-`/api/status` lists every non-loopback IPv4 address with its interface name
-as the fallback, and the startup log prints those URLs as well; `hostname -I`
-and `ip -4 addr` show them too.
-
-## Automatic LAN connection
-
-Three things make the server reachable without typing an address and
-without touching the page after it loads: the name published over mDNS, the
-page that connects itself, and the unit that starts the server at boot.
-
-Start at boot (see [Deployment](#deployment) for the account and paths):
+### Native WebRTC (Pi CSI)
 
 ```sh
-sudo make install
-sudo systemctl daemon-reload
-sudo systemctl enable --now camstream
-systemctl status camstream
+sudo apt update && sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev rpicam-apps
+git clone https://github.com/ccsalman545/cam.git camstream && cd camstream
+make -j4
+sudo systemctl stop camstream  # if installed
+./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
+# open http://<pi-ip>:8080/ on same LAN, type http:// explicitly
 ```
 
-The page connects on load. It creates the peer connection, posts the offer
-and starts the video as soon as the first keyframe arrives, which works
-without a click because the video element is muted and there is no audio
-track to play. The Connect button stays for a manual reconnect, and pressing
-Disconnect stops the automatic path until Connect is pressed again. A failed
-attempt is retried five times with a growing delay, then the state stops
-changing and says so.
-
-The name is announced on every non-loopback interface and re-announced when
-an address appears or disappears, so plugging the cable in after boot needs
-no restart. On a normal LAN the router hands out an address and the name
-resolves through it. Between the Pi and one laptop with a single cable there
-is no DHCP server, and both ends fall back to a link-local address in
-169.254.0.0/16, which mDNS carries over the same cable.
-
-Raspberry Pi OS (NetworkManager, Bookworm and later) does the link-local
-fallback on its own, but waits for DHCP first and can withdraw the link-local
-address when DHCP finally reports a failure. Pinning both makes it
-immediate and stable:
+### Libpeer Variant
 
 ```sh
-nmcli con show                              # find the wired profile name
-sudo nmcli con mod "Wired connection 1" ipv4.method auto \
-     ipv4.link-local enabled ipv4.dhcp-timeout infinity
-sudo nmcli con up "Wired connection 1"
-ip -4 addr show dev eth0                    # expect a 169.254.x.x and DHCP address
+git submodule update --init --recursive
+sudo apt install -y cmake python3-jsonschema python3-jinja2
+make camstream-libpeer -j4
+./build/camstream-libpeer --source csi --width 1280 --height 720 --fps 30 --listen 0.0.0.0 --http-port 8080
 ```
 
-`ipv4.link-local enabled` needs NetworkManager 1.40 or newer, and
-`ipv4.link-local fallback`, which keeps the link-local address only when DHCP
-fails, needs 1.52. On older images (dhcpcd) the fallback is built in and
-needs no configuration. Windows and macOS clients configured for DHCP assign
-themselves a 169.254.x.x address the same way, so nothing has to be set on
-the laptop side.
-
-Which clients resolve `.local`:
-
-| Client | Resolution |
-| --- | --- |
-| macOS, iOS | Built in |
-| Windows 10 1809 and later, Windows 11 | Built in |
-| Linux with `systemd-resolved` | Enable with `resolvectl mdns eth0 yes` |
-| Linux with avahi | Install `avahi-daemon` and `libnss-mdns` |
-| Android 12 and later | Built in; older versions need the IP address |
-
-If a client cannot resolve the name, the addresses printed at startup and
-listed by `/api/status` work unchanged; the name is a convenience, not a
-dependency.
-
-Two cameras on one LAN must not share a name. The default is `camstream`,
-and the responder probes before it claims the name, takes `camstream-2` and
-up to `camstream-10` when it is taken, and logs a warning each time. Set
-`mdns_name` explicitly when you run more than one:
+### Minimal HTTP Server (standalone)
 
 ```sh
-camstream --config /etc/camstream.conf --mdns-name porch
+# mongoose.c/h are symlinks to third_party/mongoose/ — satisfies requested command
+gcc -O2 -Wall server.c mongoose.c -o web_server
+mkdir -p web_root && echo "hello Pi" > web_root/index.html
+./web_server
+# http://0.0.0.0:8000 serving ./web_root
+curl http://127.0.0.1:8000/
 ```
+
+---
+
+## Components
+
+### camstream (native WebRTC)
+
+- **Binary**: `build/camstream`
+- **Stack**: in-house ICE-lite, DTLS, SRTP, RTP/RTCP (OpenSSL + libsrtp2)
+- **Ports**: TCP 8080 (HTTP+signaling), UDP 50000-50007 (one per viewer), UDP 5353 (mDNS)
+- **Viewers**: up to 8, one UDP socket each, same encoded stream
+- **Pros**: single thread for all viewers (no locks), full control, detailed stats
+
+### camstream-libpeer (libpeer WebRTC)
+
+- **Binary**: `build/camstream-libpeer`
+- **Stack**: [sepfy/libpeer](https://github.com/sepfy/libpeer) pinned at `5b849de`, vendored mbedtls/libsrtp2/usrsctp/cJSON
+- **Why separate binary?** Different code paths for same protocols — easy A/B, fallback, comparison. No OpenSSL system dep needed.
+- **Architecture**:
+  ```
+  camera -> source thread -> frame_hub -> encoder thread (single slice) -> AU ring
+                                                          |
+  media thread (poll AU ring, fan-out)
+     -> one session thread per viewer (PeerConnection, DTLS, SRTP, RTP)
+  ```
+- **Key details**:
+  - Encoder opened with `H264_ENCODER_SINGLE_SLICE` — libpeer treats each slice as a frame (marker+timestamp per slice). Single slice = 1 thread, no latency. HW encoder always single slice.
+  - Signaling: Pi offers, browser answers. Candidates **inside answer** (libpeer only pairs while applying remote desc).
+  - SDP sanitizer `lp_sdp.c` protects libpeer's fixed buffers (foundation 32, address 45, etc.) — validates CRLF, line length 250, fingerprint sha-256 uppercased, only UDP/IPv4 or `.local` mDNS, max 8 candidates.
+  - Browser client `web/libpeer.html`: waits gathering complete, `jitterBufferTarget=0`, `playoutDelayHint=0`, shows delay = jitter+decode+RTT/2.
+- **Build quirk**: upstream `config.h` defines `CONFIG_MTU` without `#ifndef`. Test receiver uses forced include `tests/libpeer_rx_config.h` → 1500 bytes (room for SRTP tag). Browsers unaffected.
+
+### server.c — Minimal HTTP Server
+
+**Why useful?** Every embedded project needs to serve files. This is **18 lines**, one dependency, no container.
+
+- **File**: `server.c` at repo root
+- **Dep**: `mongoose.c` + `mongoose.h` (single-file, 1.2M + 223K, MIT)
+- **Build**: `gcc -O2 -Wall server.c mongoose.c -o web_server`
+- **Run**: `./web_server` → `http://0.0.0.0:8000` serving `./web_root`
+- **Size**: 177K (`-O2`), 163K (`-DMG_ENABLE_LOG=0 -s`)
+- **Portable**: Linux, Pi, any POSIX — only libc.
+- **Reusable**: copy `server.c` + `mongoose.c/h` + `web_root/` to any project. Change `root_dir` to your folder.
+
+```c
+#include "mongoose.h"
+static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_HTTP_MSG) {
+    struct mg_http_serve_opts opts = {.root_dir = "./web_root"};
+    mg_http_serve_dir(c, (struct mg_http_message *) ev_data, &opts);
+  }
+}
+int main(void) {
+  struct mg_mgr mgr; mg_mgr_init(&mgr);
+  mg_http_listen(&mgr, "http://0.0.0.0:8000", ev_handler, NULL);
+  for (;;) mg_mgr_poll(&mgr, 1000);
+}
+```
+
+---
+
+## Hardware
+
+| Device | Camera | Encoder | Notes |
+|---|---|---|---|
+| Pi Zero 2 / 3 / 4 | CSI IMX219/477/708 via `rpicam-vid` | HW `/dev/video11` (bcm2835-codec) | Best latency, low CPU |
+| Pi 5 | Same CSI | No HW H.264 block → libx264 | Use `--encoder sw` |
+| x86 / any Linux | USB V4L2 `/dev/video0` | libx264 | Test with `--source v4l2` |
+| No camera | `--test` synthetic pattern | libx264 | For CI / dev |
+
+---
 
 ## Building
 
-Runtime and build dependencies:
+### Dependencies
 
-| Dependency | Needed for | Debian/Ubuntu package |
-| --- | --- | --- |
-| OpenSSL 1.1.1 or 3.x | DTLS for `camstream` | `libssl-dev` |
-| libsrtp2 | SRTP for `camstream` | `libsrtp2-dev` |
-| libx264 (optional) | Software encoder (both binaries) | `libx264-dev` |
-| cmake, python3-jsonschema, python3-jinja2 | Build libpeer (mbedtls) | `cmake`, `python3-jsonschema`, `python3-jinja2` |
-| pthreads, libm | Threads and math | libc |
-| Linux kernel headers | V4L2 ioctl definitions | `linux-libc-dev` |
-| `rpicam-vid` (optional) | CSI camera | `rpicam-apps` |
+| Dep | For | Debian package |
+|---|---|---|
+| OpenSSL 1.1.1/3.x | DTLS for native | `libssl-dev` |
+| libsrtp2 | SRTP for native | `libsrtp2-dev` |
+| libx264 | SW encoder (both) | `libx264-dev` |
+| cmake, python3-jsonschema, jinja2 | Build libpeer (mbedtls gen) | `cmake python3-jsonschema python3-jinja2` |
+| pthreads, libm | Threads, math | libc |
+| kernel headers | V4L2 ioctls | `linux-libc-dev` |
+| rpicam-apps | CSI | `rpicam-apps` |
 
-`camstream-libpeer` does not need OpenSSL or libsrtp2: libpeer vendors
-mbedtls and libsrtp2 inside its submodule, so `make camstream-libpeer` works
-even when those system packages are missing.
+`camstream-libpeer` **does not need** OpenSSL/libsrtp2 — libpeer vendors mbedtls/libsrtp2.
 
-On a Raspberry Pi OS or Debian machine:
-
-```sh
-sudo apt update
-sudo apt install -y build-essential libssl-dev libsrtp2-dev libx264-dev
-git clone https://github.com/ccsalman545/cam.git camstream
-cd camstream
-make -j4
-```
-
-That produces `build/camstream`, one executable with the web page embedded in
-it. `make` locates OpenSSL, libsrtp2 and libx264 in `/usr/local`, then `/usr`;
-`pkg-config` is not used, because Pi images often ship without it.
-
-Building against dependencies installed somewhere else:
-
-```sh
-make DEPS_PREFIX=/opt/cam        # OpenSSL, libsrtp2, x264 under one prefix
-make X264_DIR=/opt/x264          # only libx264 is elsewhere
-make HAVE_X264=0                 # build without the software encoder
-make OPT="-O3 -march=armv8-a"    # override optimisation
-```
-
-Without libx264 the binary still builds. `--encoder sw` then fails with
-`libx264 support is not compiled in: install libx264-dev and rebuild`, and
-`auto` tries the hardware encoder only.
-
-A note on linking, so the claims here stay checkable: OpenSSL and libsrtp2
-are linked as shared libraries when the system provides them, and as static
-archives when only `.a` files are present. libx264 is frequently static
-(`libx264.a`, no `.so`). Check what a given build actually needs with:
-
-```sh
-ldd build/camstream
-```
-
-Targets:
+### Targets
 
 | Target | Effect |
-| --- | --- |
-| `make` | Build `build/camstream` |
-| `make camstream-libpeer` | Build `build/camstream-libpeer` (needs the libpeer submodule and cmake) |
-| `make test` | Build and run the native stack tests |
-| `make test-libpeer` | Build and run the libpeer tests (SDP sanitizer + full ICE/DTLS/SRTP/H.264 flow) |
-| `make install` | Install `camstream`, sample config and systemd unit |
-| `make install-libpeer` | Install `camstream-libpeer` and its systemd unit |
+|---|---|
+| `make` | `build/camstream` |
+| `make camstream-libpeer` | `build/camstream-libpeer` (needs submodule + cmake) |
+| `make test` | Native stack tests (8) |
+| `make test-libpeer` | Libpeer tests (SDP sanitizer + full flow) |
+| `make install` | Install camstream + config + systemd |
+| `make install-libpeer` | Install camstream-libpeer + unit |
 | `make clean` | Remove `build/` |
-| `make help` | List targets |
+| `make help` | List |
 
-`camstream-libpeer` reuses the same capture and encoder code as `camstream`
-(V4L2, `rpicam-vid` pipe with 64-byte stride handling, libx264 superfast
-zerolatency and V4L2 M2M) and only replaces the WebRTC stack with libpeer.
-
-`make install` honours `PREFIX` (default `/usr/local`), `SYSCONFDIR`
-(default `/etc`), `UNITDIR` (default `/lib/systemd/system`) and `DESTDIR` for
-packaging:
+`make` searches `DEPS_PREFIX`, then `/usr/local`, then `/usr` — no pkg-config needed (Pi images often lack it).
 
 ```sh
-sudo make install
-sudo make DESTDIR=/tmp/pkg PREFIX=/usr install
+make DEPS_PREFIX=/opt/cam        # all deps under one prefix
+make X264_DIR=/opt/x264
+make HAVE_X264=0                 # without SW encoder
+make OPT="-O3 -march=armv8-a"
 ```
 
-Build logging: every source is compiled with `-Wall -Wextra -Wpedantic
--Wshadow -Wundef -Wformat=2 -Wstrict-prototypes -Wpointer-arith -Wvla`. The
-vendored Mongoose file is the only exception; it is compiled without the
-warning set and with its own logging compiled out, so nothing writes to
-stderr behind the logger.
+### Cross Compile for Pi 4 (aarch64) from x86_64
+
+Zig provides `zig cc` cross toolchain:
+
+```sh
+pip install ziglang  # gives zig cc
+make camstream-libpeer CMAKE=cmake \
+  LIBPEER_CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=cmake/zig-aarch64.cmake" \
+  CC="zig cc -target aarch64-linux-gnu"
+```
+
+Toolchain file at `cmake/zig-aarch64.cmake` sets `CMAKE_C_COMPILER` to `zig cc`.
+
+### Minimal HTTP Server Only
+
+No OpenSSL, no libsrtp2, no cmake needed:
+
+```sh
+gcc -O2 -Wall server.c mongoose.c -o web_server
+```
+
+---
 
 ## Running
 
 ```sh
-# Test pattern, no camera: the quickest way to check the whole path
+# Test pattern — quickest check, no camera
 ./build/camstream --test
+./build/camstream-libpeer --test -W 640 -H 480 -F 30
 
-# A USB camera
+# USB camera
 ./build/camstream --source v4l2 --device /dev/video0 --width 1280 --height 720
 
-# Raspberry Pi CSI camera (IMX219 etc.), hardware encoder when available
+# Pi CSI, HW encoder when available
 ./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
-
-# The same with libx264 (always available, required on a Pi 5)
 ./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder sw --listen 0.0.0.0 --http-port 8080
 
-# From a config file, which also enables POST /api/config/reload
+# Libpeer variant (UDP range unused, ephemeral per viewer)
+./build/camstream-libpeer --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
+
+# From config file (enables POST /api/config/reload)
 ./build/camstream --config /etc/camstream.conf
 ```
 
-The libpeer variant takes the same options (the UDP range is unused:
-libpeer binds an ephemeral port per viewer):
+Stop service first if installed (`sudo systemctl stop camstream`), else port 8080 busy.
 
-```sh
-./build/camstream-libpeer --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
-./build/camstream-libpeer --test -W 640 -H 480 -F 30
-```
+Open `http://camstream.local:8080/` or `http://<pi-ip>:8080/` — **type `http://` explicitly**. Server speaks plain HTTP only; browsers forcing `https://` get `PR_END_OF_FILE_ERROR`. Server replies with TLS alert and logs `TLS handshake on plain HTTP port`.
 
-It is built with:
-
-```sh
-git submodule update --init --recursive   # first time only, fetches libpeer and its deps
-sudo apt install -y cmake python3-jsonschema python3-jinja2   # Pi OS: mbedtls code generation
-make camstream-libpeer -j4
-```
-
-Cross compiling for a Pi 4 (aarch64) from an x86_64 host works with Zig as the
-C toolchain (`pip install ziglang` gives `zig cc`):
-
-```sh
-make camstream-libpeer CMAKE=cmake LIBPEER_CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=cmake/zig-aarch64.cmake" CC="zig cc -target aarch64-linux-gnu"
-```
-
-Stop the service first if it is installed (`sudo systemctl stop camstream`
-and `sudo systemctl stop camstream-libpeer`), otherwise the second instance
-reports that TCP 8080 is already in use.
-
-Then open `http://camstream.local:8080/` (or `http://<pi-address>:8080/`) in a
-browser on the same LAN. Type the `http://` explicitly: the server speaks
-plain HTTP only, and a browser that upgrades the address to `https://`
-(Firefox HTTPS-Only mode, Chrome's "Always use secure connections", a
-bookmarked https URL) gets `PR_END_OF_FILE_ERROR` / "secure connection
-failed". The server answers such a TLS handshake with a TLS alert and logs
-`TLS handshake on the plain HTTP port, the browser is using https://`.
-WebRTC itself works from a plain-HTTP page on a LAN address because the page
-only receives video (no camera or microphone permission is requested). The page connects itself; see
-[Automatic LAN connection](#automatic-lan-connection). All options:
+### CLI Options (both camstream binaries)
 
 | Option | Default | Meaning |
-| --- | --- | --- |
+|---|---|---|
 | `-s, --source KIND` | `v4l2` | `v4l2`, `csi`, `stdin`, `test` |
 | `-d, --device PATH` | `/dev/video0` | V4L2 device |
 | `-t, --test` | off | Shorthand for `--source test` |
-| `--stdin-yuv420` | off | Shorthand for `--source stdin` |
-| `--rpicam-bin PATH` | autodetect | Camera tool for `--source csi` |
+| `--stdin-yuv420` | off | `--source stdin` |
+| `--rpicam-bin PATH` | autodetect | `rpicam-vid` binary |
 | `-W, --width N` | 640 | Capture width |
-| `-H, --height N` | 480 | Capture height |
-| `-F, --fps N` | 30 | Capture rate |
+| `-H, --height N` | 480 | Height |
+| `-F, --fps N` | 30 | FPS |
 | `-e, --encoder MODE` | `auto` | `auto`, `hw`, `hw:/dev/videoN`, `sw` |
 | `-b, --bitrate KBPS` | 2500 | Target bitrate |
 | `-K, --keyframe SEC` | 2 | IDR interval |
-| `-l, --listen ADDR` | `0.0.0.0` | HTTP bind address |
+| `-l, --listen ADDR` | `0.0.0.0` | HTTP bind |
 | `-p, --http-port N` | 8080 | HTTP port |
-| `-u, --udp-port N` | 50000 | First UDP media port |
-| `-n, --mdns-name NAME` | `camstream` | Published as `NAME.local`; empty value turns the responder off |
-| `--mdns on\|off` | on | Answer mDNS queries |
-| `--mdns-port N` | 5353 | Responder UDP port |
+| `-u, --udp-port N` | 50000 | First UDP media port (native only) |
+| `-n, --mdns-name NAME` | `camstream` | Published as `NAME.local` |
+| `--mdns on|off` | on | mDNS responder |
+| `--mdns-port N` | 5353 | Responder port |
 | `--config PATH` | none | Config file |
-| `-v, --verbose` | off | DEBUG to stderr as well as `/api/logs` |
-| `-h, --help` | | Usage |
-| `-V, --version` | | Version |
+| `-v, --verbose` | off | DEBUG to stderr + `/api/logs` |
 
-The server exits with status 0 on SIGINT and SIGTERM after closing sessions,
-stopping the capture thread, and freeing the DTLS context.
+Exits 0 on SIGINT/SIGTERM after closing sessions, stopping threads, freeing DTLS.
+
+---
 
 ## Configuration
 
-Every option has a config file equivalent. The file is read first, command
-line options override it, and an unknown key or an out-of-range value makes
-the server refuse to start rather than silently ignoring a typo:
+Config file = CLI equivalents, `key = value`, unknown/out-of-range → refuse to start:
 
 ```ini
-source = v4l2
+source = csi
 device = /dev/video0
-width = 640
-height = 480
+width = 1280
+height = 720
 fps = 30
 encoder = auto
 bitrate_kbps = 2500
@@ -530,417 +327,360 @@ mdns_port = 5353
 verbose = 0
 ```
 
-`config/camstream.conf` is that file with comments and is installed to
-`/etc/camstream.conf`. `make install` copies it; edit the installed copy.
+`config/camstream.conf` is commented sample, installed to `/etc/camstream.conf`.
 
-`POST /api/config/reload` re-reads the file and applies what can change
-without interrupting the stream:
+`POST /api/config/reload` re-reads file:
 
-- applied live: `bitrate_kbps` (queued to the encode thread, which owns
-  the encoder handle and applies it before its next frame)
-- reported under `restart_required`: everything else that changed
-  (`source`, `device`, `width`, `height`, `fps`, `encoder`, ports, `listen`,
-  `mdns`, `mdns_name`, `mdns_port`)
+- Live: `bitrate_kbps` (queued to encode thread)
+- Needs restart: `source`, `device`, `width`, `height`, `fps`, `encoder`, ports, `listen`, `mdns`, `mdns_name`, `mdns_port`
 
-`mdns_name` is the single label published as `<name>.local`; letters, digits
-and `-` only. `mdns_port` is the responder's UDP port and only needs changing
-when something else on the same host must not see these packets, for example
-a test run. Turning the responder off (`mdns = off`, or `--mdns-name ""` for
-one run) removes the name but leaves the HTTP interface untouched.
+Response lists applied vs restart_required. File error → reload refused, running config untouched.
 
-The response lists exactly which keys were applied and which need a restart.
-A viewer is never dropped by a reload. If the file has an error, the reload
-is refused with the reason and the running configuration is untouched.
+---
 
-## Camera setup
+## Camera Setup
 
-USB camera:
-
+**USB:**
 ```sh
-ls /dev/video*                    # device nodes the kernel created
-v4l2-ctl --list-devices           # which node belongs to which camera
+ls /dev/video* && v4l2-ctl --list-devices
 v4l2-ctl -d /dev/video0 --list-formats-ext
 ./build/camstream --source v4l2 --device /dev/video0
+# if not root: sudo usermod -aG video $USER && re-login
 ```
 
-If the user running `camstream` is not root, it needs access to the device:
-`sudo usermod -aG video $USER`, then log out and back in.
-
-Raspberry Pi camera:
-
+**Pi CSI:**
 ```sh
 sudo apt install -y rpicam-apps
-rpicam-hello --list-cameras     # confirms the sensor is detected (imx219 ...)
+rpicam-hello --list-cameras
 rpicam-vid -t 2000 -n --width 1280 --height 720 --codec yuv420 -o /dev/null
 ./build/camstream --source csi --width 1280 --height 720 --fps 30
 ```
 
-Do not point `--source v4l2` at the CSI sensor's `/dev/video0`; see
-[Camera pipeline](#camera-pipeline).
+Do **not** use `--source v4l2 --device /dev/video0` for CSI — sensor's `/dev/video0` is raw Bayer, needs libcamera graph, fails with errno 22. Use `csi`.
 
-The CSI sensor is single-owner: `camstream` logs a warning naming the process
-holding it if another program (a `libcamera` preview, another server) has the
-camera open. Stop that process first. `camstream` spawns `rpicam-vid` and
-reads raw YUV420 from its stdout, so the child's own errors appear in the
-same log stream.
-
-Isolated test pattern, no camera at all:
-
+**Test pattern:**
 ```sh
 ./build/camstream --test --encoder sw
 ```
 
-## Firewall
+---
 
-The default install needs TCP 8080 and UDP 50000 to 50007 from the LAN. With
-`ufw`:
+## Networking Model
 
-```sh
-sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
-sudo ufw allow from 192.168.1.0/24 to any port 50000:50007 proto udp
+LAN only by design — no STUN/TURN/cloud.
+
+```mermaid
+flowchart LR
+    subgraph PI["Pi 192.168.1.10"]
+        CAM["camera"] --> CS["camstream"]
+    end
+    subgraph LAP["Laptop 192.168.1.20"]
+        BR["browser"]
+    end
+    CS -->|"TCP 8080: page+signaling"| BR
+    BR -->|"UDP 50000+: media"| CS
 ```
 
-With `firewalld` (Fedora-style images, some Pi setups):
+| Port | Proto | Dir | Purpose |
+|---|---|---|---|
+| 8080 | TCP | browser→server | Web UI, `/api/*`, signaling |
+| 50000-50007 | UDP | browser→server | STUN, DTLS, SRTP (native, one per viewer) |
+| ephemeral | UDP | server (libpeer) | One per viewer, libpeer binds |
+| 5353 | UDP | both | mDNS `224.0.0.251` |
+
+Browser needs `RTCPeerConnection`, DTLS 1.2, H.264 — all modern browsers qualify. Page served over plain HTTP is fine (only receives video, no `getUserMedia` → no HTTPS requirement).
+
+---
+
+## Automatic LAN Connection (mDNS)
+
+- **Name**: `camstream.local` published via mDNS responder, re-announced on address change. Log and `/api/status` show it, footer shows `mdns.url`. Fallback: `/api/status` lists every non-loopback IPv4 + interface, `hostname -I`, `ip -4 addr`.
+- **Page auto-connect**: muted video, no audio track → autoplay without click. Connect button for manual, Disconnect stops retries. Failed attempts retried 5× with backoff.
+- **Boot**: `sudo make install && sudo systemctl enable --now camstream`.
+- **Single cable Pi↔Laptop**: no DHCP → both fallback to link-local `169.254.0.0/16`, mDNS works over same cable.
+
+Pi OS Bookworm (NetworkManager) link-local tuning:
 
 ```sh
-sudo firewall-cmd --list-all
-sudo firewall-cmd --permanent --add-port=8080/tcp --add-port=50000-50007/udp
-sudo firewall-cmd --reload
+nmcli con show
+sudo nmcli con mod "Wired connection 1" ipv4.method auto ipv4.link-local enabled ipv4.dhcp-timeout infinity
+sudo nmcli con up "Wired connection 1"
+ip -4 addr show dev eth0
 ```
 
-With `iptables` or `nftables` the same two rules, restricted to the LAN
-interface, are enough. Do not port-forward these to the internet: the
-management endpoints have no authentication, by design, because the threat
-model is a trusted LAN (see [Security model](#security-model)).
+**mDNS clients:**
 
-If the browser connects to the page but the video stays black, a blocked UDP
-range is the first thing to check. `POST /api/webrtc/restart` frees the UDP
-ports if another process is holding one.
+| Client | Support |
+|---|---|
+| macOS, iOS | Built-in |
+| Win 10 1809+, Win 11 | Built-in |
+| Linux systemd-resolved | `resolvectl mdns eth0 yes` |
+| Linux avahi | `avahi-daemon` + `libnss-mdns` |
+| Android 12+ | Built-in |
 
-## LAN access: step-by-step check
+Two cameras: set different `mdns_name` (`porch`), else responder probes and renames to `camstream-2..-10`.
 
-Go down this list in order and stop at the first step that fails; each one
-depends on the ones above it. Run steps 1 to 6 on the Pi.
+---
 
-```sh
-# 1. build and start (service stopped, so the port is free)
-make clean && make
-sudo systemctl stop camstream
-./build/camstream --source csi --width 1280 --height 720 --fps 30 --encoder auto --listen 0.0.0.0 --http-port 8080
-#    the log must show:  http: listening on 0.0.0.0:8080
-#                        media: pipeline running: capture csi (rpicam-vid) 1280x720 @ 30 fps -> ...
+## Web Interface
 
-# 2. port 8080 is listening on all interfaces, UDP media ports are free
-sudo ss -ltnp 'sport = :8080'          # LISTEN 0.0.0.0:8080 users:(("camstream",...))
-sudo ss -lunp | grep -E ':500[0-9]{2}' # one line per connected viewer
+`web/index.html` (native) and `web/libpeer.html` (libpeer) — plain HTML/CSS/JS, embedded at build time via `tools/embed_assets.c`, no drift.
 
-# 3. addresses and link state
-ip -4 addr show
-nmcli device status
+- Video, connection state (`streaming` only when `video` element plays decoded frames)
+- Pipeline layers panel
+- Camera/encoder state (codec, resolution, capture/encode FPS, bitrate)
+- Transport counters (packets, bytes, retransmits, NACKs, PLIs, RTT, loss)
+- CPU/memory, server log with level filter
+- Buttons: Connect/Disconnect, camera restart, WebRTC restart, config reload
+- Footer: addresses, UDP range, HTTP port, `mdns.url`
 
-# 4. HTTP from the Pi itself, loopback and LAN address (use your eth0 address)
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/
-curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.0.28:8080/
-curl -sS http://127.0.0.1:8080/api/status | python3 -m json.tool | head -60
+Uses `RTCPeerConnection` with `iceServers: []`, `fetch()` for API, no framework.
 
-# 5. firewall
-sudo firewall-cmd --list-all 2>/dev/null || sudo ufw status verbose 2>/dev/null || sudo nft list ruleset | head -50
-
-# 6. from another PC on the LAN
-curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.0.28:8080/
-```
-
-Then in a browser on the other PC open `http://192.168.0.28:8080/` (typed
-with `http://`). The "Pipeline layers" panel on the page, and `layers` in
-`/api/status`, show where the stream stops:
-
-| Layer | Meaning when not flowing | Where to look |
-| --- | --- | --- |
-| `capture` | no frames from the camera | log `capture:` lines, `rpicam-hello --list-cameras` |
-| `encoder` | `idle` without a viewer is normal; `stalled`/`failed` is not | log `encode:` lines, `encoder.kind` |
-| `http` | the page itself would not load | steps 2 to 6 above |
-| `ice` | no authenticated STUN check: UDP 50000-50007 blocked, or the browser tried an unreachable candidate | firewall, `stun_rejected` in `/api/stats` |
-| `dtls` | handshake did not complete | log `dtls:` lines, `handshake_failures` |
-| `rtp` | connected but no media sent in the last 2 s (encoder, or waiting for a keyframe) | `frames_sent`, `frames_held`, `waiting_keyframe` in `/api/stats` |
-| `rtcp` | media sent but no receiver report from the browser | packets are lost on the way; `peer` address in `/api/stats` |
-| `browser_decode` | the page reports no growing `framesDecoded` | `chrome://webrtc-internals`, `about:webrtc` |
-
-`state` in `/api/status` is only `streaming` when access units went out in
-the last 2 s and the browser acknowledged them with RTCP receiver reports;
-`sending` means media leaves but nothing is acknowledged, `no-media` means
-connected but nothing to send.
-
-`peer` in `/api/stats` is the source address of the browser's authenticated
-STUN checks, i.e. the real remote viewer; `signaling_peer` is the address
-that posted the offer. A peer equal to one of the Pi's own addresses means
-the viewer ran on the Pi itself (for example a desktop browser on
-`http://127.0.0.1:8080/`), and the log says so.
-
-## Web interface
-
-`web/index.html` is plain HTML, CSS and a few hundred lines of JavaScript. It
-is embedded into the binary at build time, so there is no web root to deploy
-and no way for the page to drift from the binary that serves it.
-
-The page shows the video, the connection state (it says `streaming` only
-once the video element plays decoded frames), a "Pipeline layers" panel,
-camera and encoder state
-(codec, resolution, capture and encode FPS, bitrate), transport counters
-(packets, bytes, retransmissions, NACKs, PLIs, send errors, RTT, loss),
-CPU and memory, and the server log with a level filter. Buttons cover
-Connect/Disconnect, camera restart, WebRTC restart and config reload. The
-footer repeats the addresses, the UDP media range, the HTTP port and the
-published `mdns.url`.
-
-Opening the page is enough to see video: it connects on load and retries five
-times with a growing delay when the server or the camera is not ready yet.
-Disconnect stops the automatic retries, Connect starts them again. See
-[Automatic LAN connection](#automatic-lan-connection).
-
-It uses `RTCPeerConnection` with `iceServers: []` (no STUN, no TURN),
-`fetch()` for the API, and no third-party library, framework, bundler or
-build step. The same job can be done by hand from a browser console with
-`fetch` plus `RTCPeerConnection` if a page is not available.
+---
 
 ## Diagnostics API
 
 | Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/` | Web interface |
+|---|---|---|
+| GET | `/` | Web UI |
 | GET | `/api/status` | Subsystem state, counters, interfaces, rates |
-| GET | `/api/stats` | Transport counters, per-session detail |
-| GET | `/api/logs` | Recent log ring, `?limit=1..256&level=debug|warn|info|error` |
-| POST | `/api/webrtc/offer` | WebRTC signaling, body `{"sdp":"..."}` |
-| POST | `/api/webrtc/close` | Close one session, body `{"session_id":N}` |
-| POST | `/api/webrtc/client-stats` | The page reports `frames_decoded` (diagnostic only) |
-| POST | `/api/camera/restart` | Rebuild the capture and encode pipeline |
-| POST | `/api/webrtc/restart` | Drop all sessions, new DTLS certificate |
-| POST | `/api/config/reload` | Re-read the config file |
+| GET | `/api/stats` | Transport, per-session |
+| GET | `/api/logs` | Ring `?limit=1..256&level=debug|warn|info|error` |
+| POST | `/api/webrtc/offer` | Signaling `{"sdp":"..."}` (native) |
+| POST | `/api/webrtc/close` | Close `{"session_id":N}` |
+| POST | `/api/webrtc/client-stats` | Page reports `frames_decoded` |
+| POST | `/api/camera/restart` | Rebuild pipeline |
+| POST | `/api/webrtc/restart` | Drop sessions, new DTLS cert |
+| POST | `/api/config/reload` | Re-read config |
+| POST | `/api/session` | Create libpeer session → `{"id":N,"sdp":"..."}` |
+| POST | `/api/session/answer` | Answer libpeer `{"id":N,"sdp":"..."}` |
+| POST | `/api/session/close` | Close libpeer |
 
-Unknown paths return `404` with a JSON error, unsupported methods `405`,
-malformed signaling input `400` with the parser's reason. Every error reply
-is JSON with an `error` field.
+Unknown → 404 JSON, method → 405, malformed → 400 with reason.
 
-`/api/status` reports: overall `state` (`idle`, `connecting`, `no-media`,
-`sending`, `streaming`, `camera-error`), `http` (bound address, open
-connections, TLS attempts rejected), `source` (kind, name, geometry,
-capture FPS, frames, errors), `encoder` (name, kind, preference, bitrate,
-frames, keyframes, status `idle|ok|stalled|failed`), `pipeline` (running,
-last error, next automatic retry), `layers` (see
-[LAN access](#lan-access-step-by-step-check)), `webrtc` (DTLS state
-and fingerprint, session counts, handshake counters), `media` (capture and
-encode FPS, bitrate, dropped access units, idle and mismatched frames skip
-counters), `process` (CPU percent, RSS in KiB, log counters), the `interfaces`
-the browser can use, the `config_file` in use, and `last_error` when the log
-holds an error message.
+`/api/status` reports: `state` (`idle`, `connecting`, `no-media`, `sending`, `streaming`, `camera-error`), `http` (bound, connections, TLS rejected), `source`, `encoder` (name, kind, bitrate, frames, keyframes, `idle|ok|stalled|failed`), `pipeline` (running, error, retry), `layers`, `webrtc` (DTLS fingerprint, handshake counters), `media` (FPS, bitrate, dropped), `process` (CPU%, RSS), `interfaces`, `config_file`, `last_error`.
 
-`/api/stats` adds RTP totals (packets, bytes, bitrate, retransmissions,
-NACKs, PLIs, RTCP sent, send errors) and one object per session with state,
-ICE peer and signaling peer addresses, negotiated H.264 payload type and
-profile-level-id, frames and keyframes sent, frames held while waiting for a
-keyframe, age of the last media and of the last receiver report, frames the
-browser reports as decoded, RTT, loss, jitter, per-session counters for datagrams received,
-STUN checks accepted and rejected, retransmissions, and socket errors.
-
-Examples:
+`/api/stats` adds RTP totals and per-session: ICE peer/signaling peer, payload type, profile-level-id, frames sent/held, last media/RR age, `framesDecoded`, RTT, loss, jitter, STUN counters.
 
 ```sh
 curl -s http://192.168.1.10:8080/api/status | python3 -m json.tool
 curl -s 'http://192.168.1.10:8080/api/logs?limit=20&level=warn'
 curl -s -X POST http://192.168.1.10:8080/api/camera/restart
-curl -s -X POST http://192.168.1.10:8080/api/webrtc/restart
-curl -s -X POST http://192.168.1.10:8080/api/config/reload
-curl -s -H 'Content-Type: application/json' \
-     -d '{"sdp":"<offer>"}' http://192.168.1.10:8080/api/webrtc/offer
 ```
 
-There is no endpoint that executes a command, opens a file by name, or
-restarts the process. The four POST endpoints above are the whole set of
-state-changing operations.
+No endpoint executes shell, opens file by name, or restarts process — 4 POSTs are whole state-changing set.
 
-## Recovery
+---
 
-| Symptom | Action |
-| --- | --- |
-| Video frozen, page still live | The browser socket is still open; press Connect again, or wait for the DTLS watchdog (30 s) and the page's automatic single retry |
-| Camera unplugged or `rpicam-vid` died | Automatic: the pipeline is rebuilt after 5 s, then 10, 20, ... up to 60 s between attempts. `POST /api/camera/restart` retries at once |
-| Hardware encoder fails while running | Automatic: rebuilt at once; with `encoder = auto` it continues on libx264 |
-| Handshake failures after a browser cache reset | `POST /api/webrtc/restart` rotates the certificate and drops stale sessions |
-| Bitrate or verbose flag changed on disk | `POST /api/config/reload` |
-| Server feels wedged | `GET /api/logs?level=error` then `GET /api/status`; a hang would be visible as a stale `uptime_sec` and `requests` counter |
+## Architecture Deep Dive
 
-The HTTP interface stays up when the camera or WebRTC fails. A missing camera
-or a failed DTLS initialisation is reported through `/api/status` and
-`/api/logs`, and the process keeps serving, because a management interface
-that dies together with the thing it manages is useless.
+Two binaries share camera pipeline; control path owns async.
 
-Sessions clean up after themselves: closing a tab sends RTCP BYE, the server
-destroys the session and closes the UDP socket; a tab that vanishes without
-BYE is reaped after 15 s of inactivity. `POST /api/webrtc/restart` closes all
-sessions immediately.
+```mermaid
+flowchart TB
+    SRC["V4L2 or test pattern\nsource thread"] --> HUB["frame hub\nkeep-newest per consumer"]
+    HUB --> ENC["encode thread\nI420 + H.264"]
+    ENC --> RING["AU ring 8x512KiB overwrite oldest"]
+    RING --> MAIN["main thread one poll loop\nHTTP, ICE, DTLS timers, RTCP"]
+    MAIN --> V1["viewer 1 RTP/SRTP/UDP"]
+    MAIN --> V2["viewer 2"]
+    MAIN --> VN["viewer 8"]
+```
 
-## Latency and performance
+**Why one loop (native)?** LAN has 1 operator, up to 8 viewers, per-packet few µs, single thread removes locks between packetization, retransmit, RTCP.
 
-What "low latency" means here: capture to display in the browser, not zero.
-The pipeline is built to avoid queuing, which is what usually turns a
-streaming setup into a seconds-behind one: the frame hub keeps only the
-newest frame per consumer, the access-unit ring overwrites the oldest slot,
-the RTP packetizer uses 1200-byte packets, and sender reports go out every
-second so the browser keeps a shallow jitter buffer. The browser controls
-its own playout delay; nothing on the server buffers decoded or encoded
-video.
+**Data flow:**
 
-Measure it, do not assume it:
+1. Source thread fills pooled frame, `CLOCK_MONOTONIC` timestamp, publishes to hub, waits next slot. Hub keeps newest per consumer → slow encoder drops, not buffers (latency would accumulate here otherwise).
+2. Encoder thread YUYV/YU12→I420, Annex B H.264, pushes AU + pts into ring. Ring overwrites oldest → encoder never blocks on network.
+3. Main thread drains ring, splits AU into RTP (single NAL or FU-A ≤1200 UDP), SRTP encrypt, sends per viewer.
+4. Retransmit cache 512 protected packets — RTCP NACK → resend cached bytes, not stall.
+5. Sender Reports every 1s with NTP wall-clock → browser RTT, shallow jitter buffer. Mid-GOP join → IDR request (rate limited 400ms/session).
 
-1. Network contribution: `GET /api/stats`, read `rtt_ms` for the session.
-   That is the RTCP round trip, and it is a lower bound for the one-way delay
-   contributed by the network.
-2. End-to-end: put a millisecond clock (a phone stopwatch app, or a page
-   showing `Date.now()`) in front of the camera, fill the browser viewport
-   with the stream, and capture both in one photo or screenshot. The
-   difference between the clock in the stream and the clock on the screen is
-   the glass-to-glass latency including capture, encode, network, decode and
-   display. Repeat ten times and take the median; a single sample is noise.
-3. Browser side: `chrome://webrtc-internals` shows `framesPerSecond` and the
-   inbound statistics for the peer connection, and
-   `video.requestVideoFrameCallback` in the console timestamps displayed
-   frames.
+**Libpeer variant:** same up to AU ring, then media thread fan-out → one session thread per viewer (owns PeerConnection, DTLS, SRTP). Mailbox 8 slots, flushed on overflow with resync flag → never builds delay, resumes on next IDR. First NAL must be SPS.
 
-RTT (`rtt_ms`) is computed per RFC 3550 section 6.4.1 from the receiver
-report block about our SSRC: `RTT = A - LSR - DLSR` in 1/65536 s units,
-converted to milliseconds. The previous version read LSR/DLSR at the wrong
-offsets of the report block, which produced values like 59770778 ms; it now
-reports -1 until a valid report arrives rather than a made-up number.
+---
 
-Server cost has to be measured on the device: `/api/status` gives
-`capture_fps`, `encode_fps` and `process.cpu_percent`, and `top -H -p $(pidof
-camstream)` shows the capture, encode and main threads separately. The
-earlier libx264 setup (`veryfast`, one thread) reached only about 13 encode
-FPS at 1280x720 on a Pi; `superfast` with sliced threads is the fix, with
-the latency properties of `zerolatency` unchanged.
+## Camera Pipeline Explained
 
-Knobs that matter, in order: use the hardware encoder (`--encoder hw`);
-lower `--fps`; lower `--width`/`--height`; raise `--keyframe` to save
-bitrate; raise `--bitrate` only if the picture is visibly soft, since a
-higher bitrate on a weak Wi-Fi link costs more than it buys.
+| Source | How | Use |
+|---|---|---|
+| `v4l2` | Opens device, negotiates YUYV→YU12, 4 mmap buffers | USB |
+| `csi` | Spawns `rpicam-vid --codec yuv420 --flush -o -` pipe | Pi CSI |
+| `stdin` | Raw YUV420 from stdin | `ffmpeg ... -f rawvideo -pix_fmt yuv420p -` |
+| `test` | Synthetic pattern | Bench, no HW |
 
-## Security model
+**CSI chain:**
+```
+IMX219 -> libcamera ISP -> rpicam-vid --codec yuv420 -o - -> pipe -> camstream -> H.264 -> RTP/SRTP -> browser
+```
 
-`camstream` assumes a trusted LAN. It has no authentication, no TLS on the
-HTTP interface, and no user accounts, because adding them would not protect
-anything on a network where an attacker can already see the video by
-connecting. Concretely:
+`rpicam-vid` pads luma rows to 64 bytes (chroma 32) — source reports stride, encoder strips padding. Even widths work, 640/1280/1920 avoid extra copy. Child started `posix_spawn`, CLOEXEC all fds, 1 MB pipe, `LIBCAMERA_LOG_LEVELS=*:WARN` unless verbose. EOF/dead child/truncated/5s no data (15s first frame) → pipeline rebuild.
 
-- Anyone who can reach TCP 8080 can read the page, the status, the stats and
-  the logs, create sessions (up to 8), and invoke the four POST endpoints.
-- Anyone who can reach the UDP range can send datagrams; they are ignored
-  unless they pass STUN MESSAGE-INTEGRITY or the DTLS handshake for an
-  existing session.
-- Media is encrypted with SRTP. DTLS certificates are self-signed and
-  regenerated at every start; there is no CA and no pinning beyond the SDP
-  fingerprint exchange. A peer whose certificate does not match the
-  fingerprint in its offer, or whose handshake negotiated no `use_srtp`
-  profile, never receives media.
-- There is no shell, no file API, no `system()` call, and no dynamic code
-  loading. All external input (HTTP requests, SDP, STUN, RTP, RTCP, mDNS
-  packets) is parsed with explicit length checks and bounded buffers. The
-  mDNS parser walks at most eight questions and sixty-four records per
-  packet, refuses name compression loops, and never follows a pointer
-  outside the packet.
-- mDNS is unauthenticated by design: any host on the LAN can claim the
-  published name, and nothing here detects or repairs that beyond renaming
-  this responder. It publishes the same addresses `/api/status` already
-  lists, so it reveals nothing that a scan of the LAN would not.
+**Encoders:**
 
-If the server must be reachable from an untrusted network, put it behind a
-VPN or an SSH tunnel, or front it with a reverse proxy that terminates TLS
-and authenticates, and firewall the UDP range to the addresses that need it.
-Treat any port-forward to the internet as unsafe: the failure mode is not
-just stolen video, it is strangers driving the restart endpoints.
+| Mode | Backend | Notes |
+|---|---|---|
+| `auto` | HW first, then SW, plus runtime HW→SW switch | Default |
+| `hw` | V4L2 M2M `/dev/video11` first, then any M2M | Pi Zero2/3/4 |
+| `hw:/dev/video11` | Explicit | Unusual numbering |
+| `sw` | libx264 | Pi 5 needs this |
 
-## Project structure
+libx264: `superfast`, `zerolatency` (no lookahead, no B-frames), sliced threads (1 per core max 4, no latency vs frame threads), constrained baseline, CBR-like VBV (max=target, buffer=0.5s), fixed GOP, SPS/PPS on every IDR.
+
+HW backend fix: previous left capture H.264 format at 0×0 — bcm2835 accepts at `S_FMT`, rejects at port enable → `STREAMON` EAGAIN (errno 11). Fixed to real size, retries EAGAIN/EBUSY 3× before fallback.
+
+Encoder runs only while viewer connected — with no viewer source keeps running (status still reports), encoder counts `skipped_idle` → warm camera, idle CPU.
+
+---
+
+## WebRTC Flow Explained
+
+For beginners: WebRTC needs signaling (SDP exchange) over HTTP, then ICE (STUN) to find path, DTLS handshake to authenticate and derive SRTP keys, then SRTP media.
+
+```mermaid
+stateDiagram-v2
+    [*] --> new
+    new --> ice: first authenticated STUN
+    ice --> dtls: first ClientHello
+    dtls --> streaming: keys exported
+    new --> closed: idle 15s
+    ice --> closed: DTLS watchdog 30s
+    dtls --> closed: DTLS watchdog 30s
+    streaming --> closed: BYE/idle/error/shutdown
+```
+
+**Native:**
+
+1. Browser loads `/`, creates receive-only video transceiver, POST offer to `/api/webrtc/offer`.
+2. Server parses offer (ICE ufrag/pwd, fingerprint, H264 PT, mid, setup), binds UDP port, answers with `a=ice-lite`, `a=setup:passive`, host candidates per local IPv4, DTLS fingerprint (self-signed P-256 regenerated per start, rotated via `/api/webrtc/restart`).
+3. ICE: ICE-lite — never sends checks, waits browser STUN binding request, verifies MESSAGE-INTEGRITY, answers XOR-MAPPED-ADDRESS, locks session to source address. Roaming → re-lock on new authenticated check.
+4. DTLS 1.2 passive, self-signed P-256 in memory never on disk. Verifies peer cert vs fingerprint in offer, browser verifies server via answer. Media only after both authenticated.
+5. SRTP `AES128_CM_SHA1_80`, keys from `EXTRACTOR-dtls_srtp`. Moves to `streaming` only after handshake and only if peer negotiated `use_srtp`; else refused. First keyframe requested immediately.
+
+**Libpeer:** Pi offers, browser answers, candidates inside answer. Same DTLS/SRTP but per-viewer thread, ECDSA cert per viewer (ms), consent checks.
+
+Ports: one UDP per session (native 50000-50007, libpeer ephemeral) bound at create, closed at end — idle server listens TCP only.
+
+---
+
+## Latency & Performance
+
+Low latency = avoid queuing, not zero. Hub keeps newest, ring overwrites oldest, RTP 1200 bytes, SR every 1s → browser shallow jitter buffer. Browser controls playout; server never buffers decoded/encoded video.
+
+**Measure, don't assume:**
+
+1. Network: `GET /api/stats` → `rtt_ms` (RTCP round trip, lower bound one-way).
+2. Glass-to-glass: millisecond clock in front of camera, browser fullscreen, photo both clocks — difference = capture+encode+network+decode+display. Median of 10.
+3. Browser: `chrome://webrtc-internals` → `framesPerSecond`, inbound stats, `video.requestVideoFrameCallback`.
+
+RTT per RFC 3550 6.4.1: `RTT = A - LSR - DLSR` in 1/65536s → ms. Reports -1 until valid RR (previous read LSR/DLSR at wrong offsets → 59770778 ms bug fixed).
+
+**Cost on device:** `/api/status` → `capture_fps`, `encode_fps`, `cpu_percent`, `top -H -p $(pidof camstream)`. Old libx264 `veryfast` 1 thread → ~13 FPS 720p on Pi; `superfast` sliced threads fixes, latency unchanged.
+
+**Knobs in order:** HW encoder → lower FPS → lower W×H → raise keyframe interval → raise bitrate only if soft (high bitrate on weak Wi-Fi costs).
+
+**Libpeer:** timestamps fixed 90kHz/30fps — at 30fps capture clock matches; other rates drift (server warns). ECDSA cert ms vs RSA seconds.
+
+---
+
+## Security Model
+
+Assumes **trusted LAN** — no auth, no TLS on HTTP, no user accounts (would not protect on network where attacker can already see video).
+
+- Anyone TCP 8080 can read page/status/stats/logs, create sessions (8 native / 4 libpeer), invoke 4 POST endpoints.
+- Anyone UDP range can send datagrams — ignored unless STUN MESSAGE-INTEGRITY or DTLS for existing session passes.
+- Media encrypted SRTP. DTLS certs self-signed, regenerated every start, no CA, pinning via SDP fingerprint. Peer cert mismatch or no `use_srtp` → no media.
+- No shell, no file API, no `system()`, no dynamic loading. All external input parsed with length checks, bounded buffers. mDNS parser max 8 questions, 64 records/packet, refuses compression loops, never follows pointer outside packet.
+- mDNS unauthenticated by design — any host can claim name, responder renames. Publishes same addresses `/api/status` already lists, reveals nothing scan wouldn't.
+- If untrusted network needed: VPN/SSH tunnel, or reverse proxy terminating TLS + auth, firewall UDP range. Port-forward to internet = unsafe — strangers can drive restart endpoints.
+
+---
+
+## Project Structure
 
 ```
-Makefile                  two binaries (native + libpeer), tests, install
-config/camstream.conf     commented sample configuration
-packaging/camstream.service          systemd unit for camstream
-packaging/camstream-libpeer.service  systemd unit for camstream-libpeer
-web/index.html            native stack web interface, embedded at build time
-web/libpeer.html          libpeer stack web interface, embedded at build time
-third_party/libpeer/      pure C WebRTC (sepfy/libpeer, pinned, with mbedtls/libsrtp/usrsctp/cJSON)
+Makefile                  two binaries (native+libpeer), tests, install
+server.c                  minimal HTTP static server (18 lines, pure C)
+mongoose.c/h              symlinks to third_party/mongoose/ (single-file)
+web_root/                 sample for minimal server (index.html, hello.txt)
+config/camstream.conf     commented sample config
+packaging/
+  camstream.service               systemd for camstream
+  camstream-libpeer.service       systemd for libpeer variant
+web/
+  index.html              native web UI (embedded at build)
+  libpeer.html            libpeer web UI (embedded)
+third_party/
+  mongoose/               HTTP server vendored MIT
+  libpeer/                pure C WebRTC (sepfy/libpeer pinned, with mbedtls/libsrtp/usrsctp/cJSON)
 tools/embed_assets.c      build-time page embedder
-third_party/mongoose/     HTTP server (vendored, MIT)
+cmake/zig-aarch64.cmake   cross compile toolchain for Pi 4 via Zig
 src/
-  camstream_main.c        process entry point, signals, log level
-  app/
-    app_config.c          defaults, config file, argv, usage, summary
-    app_server.c          main poll loop, HTTP routes and JSON replies
-    log.c                 ring buffer, levels, console and /api/logs
-    sysinfo.c             /proc based CPU and memory sampling
-  media/
-    v4l2_source.c         V4L2 mmap capture
-    csi_source.c          rpicam-vid pipe capture, stdin capture
-    test_source.c         synthetic pattern
-    frame_pool.c          refcounted frame pool
-    frame_hub.c           keep-newest mailbox per consumer
-    yuv_convert.c         YUYV/YU12 to I420
-    au_ring.c             access-unit ring, overwrite oldest
-    encoder_worker.c      encode thread, IDR requests, stats
-    encoder_x264.c        libx264 backend
-    encoder_v4l2m2m.c     hardware V4L2 M2M backend
-    h264_encoder.c        backend selection by preference
-    source_worker.c       capture thread with fatal error accounting
-  net/
-    mdns.c                mDNS responder: name, service discovery, conflicts
-  webrtc/
-    ice_lite.c            STUN parsing, ICE-lite checks, FINGERPRINT
-    dtls_srtp.c           DTLS 1.2, certificate, SRTP key export
-    rtp_h264.c            single NAL and FU-A packetization
-    rtcp.c                sender reports, RR/NACK/PLI/FIR parsing
-    sdp.c                 offer parsing, answer generation
-    webrtc_session.c      per-viewer session: state, timers, retransmit
+  camstream_main.c        entry point native, signals, log level
   lpstream/
-    camstream_libpeer_main.c  entry point for the libpeer binary
-    lp_server.c           HTTP signaling, pipeline ownership, media fan-out thread
-    lp_session.c          one viewer: libpeer PeerConnection + thread, IDR-gated start
-    lp_sdp.c              browser answer sanitizer protecting libpeer's fixed buffers
-include/                  one header per module, no implementation leaks
-tests/                    see below (including libpeer tests)
+    camstream_libpeer_main.c      entry point libpeer
+    lp_server.c           HTTP signaling, pipeline ownership, media fan-out
+    lp_session.c          one viewer: PeerConnection+thread, IDR-gated
+    lp_sdp.c              browser answer sanitizer
+  app/
+    app_config.c          defaults, config file, argv, summary
+    app_server.c          main poll loop, HTTP routes, JSON
+    log.c                 ring buffer, levels, console, /api/logs
+    sysinfo.c             /proc CPU/memory
+  media/
+    v4l2_source.c         V4L2 mmap
+    csi_source.c          rpicam-vid pipe + stdin
+    test_source.c         synthetic pattern
+    frame_pool.c          refcounted pool
+    frame_hub.c           keep-newest mailbox
+    yuv_convert.c         YUYV/YU12→I420
+    au_ring.c             AU ring overwrite oldest
+    encoder_worker.c      encode thread, IDR, stats
+    encoder_x264.c        libx264 backend
+    encoder_v4l2m2m.c     HW V4L2 M2M backend
+    h264_encoder.c        backend selection
+    source_worker.c       capture thread with fatal accounting
+  net/mdns.c              mDNS responder
+  webrtc/
+    ice_lite.c            STUN, ICE-lite, FINGERPRINT
+    dtls_srtp.c           DTLS 1.2, cert, SRTP key export
+    rtp_h264.c            single NAL & FU-A
+    rtcp.c                SR, RR/NACK/PLI/FIR
+    sdp.c                 offer parse, answer gen
+    webrtc_session.c      per-viewer session
+include/                  one header per module
+tests/
+  test_stun, test_encoder_worker, test_csi_source, test_mdns,
+  test_rtc_session, test_sdp_rtcp, test_server_api, test_lan_stream,
+  test_lp_sdp, test_libpeer_stream, libpeer_rx_config.h
 ```
+
+---
 
 ## Testing
 
 ```sh
-make test
+make test                 # native: 8 binaries
+make test-libpeer         # libpeer: 2 binaries
 ```
 
-Seven test binaries. Six link the real modules directly; `test_lan_stream`
-links OpenSSL and libsrtp2 only, because it acts as the browser and drives the
-built `camstream` binary over HTTP, UDP and multicast DNS:
-
 | Test | Covers |
-| --- | --- |
-| `test_stun` | STUN message parsing, MESSAGE-INTEGRITY verification, XOR-MAPPED-ADDRESS, fingerprints, RFC 5769 vectors, malformed input |
-| `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling, queued bitrate change applied by the encode thread |
-| `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
-| `test_mdns` | The responder against packets built by hand: probe and announcement timing, A record address, TTL and cache-flush flags, service discovery PTR, SRV port and TXT strings, legacy unicast replies with an echoed transaction ID and a clamped TTL, known answer suppression, seven malformed packets, name conflict rename with its rate limit, giving up when every suffix is taken, and the goodbye packet |
-| `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout, and a peer that never offers `use_srtp` being refused with the failure counted |
-| `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, oversized bodies, garbage requests and a 4 KiB URI, eight concurrent sessions plus slot recycling and the ninth viewer being refused, certificate rotation, config reload (applied, unchanged and refused), camera failure with the HTTP interface still serving, and a start from the configuration file `make install` ships, which catches a bad value in that file. Ends with a clean SIGTERM shutdown |
-| `test_lan_stream` | The real binary driven the way a browser drives it: the server is started with a test config, its mDNS name resolved through a real query, ICE check answered with a verified MESSAGE-INTEGRITY, DTLS 1.2 handshake with the certificate matching the answer's fingerprint, SRTP key export and decrypt, access units reassembled from single NAL and FU-A packets, a keyframe for a viewer that joins late, SRTCP Sender Reports, viewer close, a second viewer streaming without a restart, and SIGTERM exiting with status 0 |
+|---|---|
+| `test_stun` | STUN parsing, MESSAGE-INTEGRITY, XOR-MAPPED-ADDRESS, fingerprints, RFC 5769 vectors, malformed |
+| `test_encoder_worker` | Encode loop stub: accounting, mismatch/bad-size drops, stall watchdog, IDR, queued bitrate |
+| `test_csi_source` | stdin reads, short frames, missing binary, mock camera |
+| `test_mdns` | Responder vs hand-built packets: probe/announcement timing, A record, TTL, PTR/SRV/TXT, unicast reply with echoed TID and clamped TTL, suppression, 7 malformed, conflict rename rate limit, give up, goodbye |
+| `test_rtc_session` | Real session vs browser-role: STUN valid/invalid, DTLS, SRTP decrypt, NAL reassembly, RTP timestamp 90kHz, SRTCP NACK retransmit, malformed, idle timeout, no `use_srtp` refused |
+| `test_sdp_rtcp` | SDP offer parse, answer gen, RTCP RR parse, RTT math |
+| `test_server_api` | Real binary over HTTP: every endpoint, 404/405, malformed offers, oversized bodies, garbage, 4 KiB URI, 8 sessions + recycling + 9th refused, cert rotation, config reload (applied/unchanged/refused), camera failure HTTP still up, start from installed config. Clean SIGTERM |
+| `test_lan_stream` | Real binary as browser: start with test config, mDNS query, ICE check verified, DTLS 1.2 cert matches fingerprint, SRTP decrypt, AU reassembly single NAL/FU-A, late joiner keyframe, SR, close, second viewer no restart, SIGTERM 0 |
+| `test_lp_sdp` | SDP sanitizer: real browser answer, CRLF rewrite, fingerprint uppercasing, candidate filtering (IPv6/TCP/prflx/long fields), max candidates, rejections |
+| `test_libpeer_stream` | Full libpeer client vs `camstream-libpeer`: HTTP offer, sanitized answer, ICE host, DTLS ECDSA, SRTP, H.264 depacketization including FU-A reassembly (>1400 byte IDR proven), SPS-first, status single-slice, explicit close, vanished viewer via STUN consent (2s/10s), SIGTERM |
 
-Test quality rules followed here: a test only passes if the module under test
-produced the observed output, no test asserts on a reimplementation of the
-logic it is checking, and anything that cannot run in the test environment
-(hardware camera, hardware encoder, real browser) is covered by the black-box
-test through the API instead of being faked.
+Quality rules: test passes only if module produced observed output, no reimplementation of logic under test, HW/camera/browser covered via black-box API, not faked.
 
-Not covered: a real camera, a real hardware encoder, real browsers, and
-long-run stability beyond the process lifetime of a test.
-
-Not covered automatically either: the address that appears *after* the server
-started, which is the case the mDNS responder exists for. It needs an
-interface to change, so it is checked by hand in a network namespace, where
-anything can be plugged in without touching the machine:
+Not covered automatically: address appearing **after** server started (mDNS case) — checked by hand in netns:
 
 ```sh
 unshare -rn sh -c '
@@ -948,46 +688,38 @@ unshare -rn sh -c '
   /path/to/camstream --test --http-port 18996 --mdns-name camstream \
       --mdns-port 15353 --udp-port 60996 2>&1 | grep -E "mdns|mDNS" &
   sleep 2
-  ip link add veth0 type veth peer name veth1     # the cable goes in
+  ip link add veth0 type veth peer name veth1
   ip link set veth0 up
   ip addr add 192.0.2.55/24 dev veth0
   sleep 3
   kill %1'
 ```
 
-Expected: a warning that there is no address yet, then
-`camstream.local is now announced on 1 address(es), first 192.0.2.55`, and any
-mDNS resolver inside that namespace resolving the name to that address. Running
-the query outside the namespace needs the address instead, because the
-namespace has its own loopback.
+Expected: warning no address yet, then `camstream.local is now announced on 1 address(es), first 192.0.2.55`.
 
-Memory errors and thread races are checked with the same suite rather than by
-inspection. Both commands were run against this tree and passed with no
-report:
+Sanitizers (both passed no report):
 
 ```sh
-# Leaks, use after free, out of bounds, undefined behaviour
-make clean
-make -j4 OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+make clean && make -j4 OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
 ASAN_OPTIONS=detect_leaks=1 make test
 
-# Races between the capture, encode and HTTP threads
-make clean
-make -j4 OPT="-O1 -g -fsanitize=thread"
+make clean && make -j4 OPT="-O1 -g -fsanitize=thread"
 ./build/camstream --test --encoder sw --http-port 8080
 ```
 
-The sanitizer flags reach the link line as well as the compile lines, which
-is why `OPT` is repeated there.
+`OPT` repeated on link line so sanitizer runtime linked.
 
-## Deployment
+---
 
-`make install` (as root) copies three files: the binary to
-`/usr/local/bin/camstream`, the commented sample config to
-`/etc/camstream.conf` (an existing file is kept; the new defaults are then
-written to `/etc/camstream.conf.new`), and the unit to
-`/lib/systemd/system/camstream.service`. It prints the SHA-256 of the built
-and the installed binary, which must be equal.
+## Deployment (systemd)
+
+`make install` copies:
+
+- Binary → `/usr/local/bin/camstream`
+- Sample config → `/etc/camstream.conf` (existing kept → new defaults to `.conf.new`)
+- Unit → `/lib/systemd/system/camstream.service`
+
+Prints SHA256 built vs installed — must equal.
 
 ```sh
 make clean && make
@@ -997,19 +729,13 @@ sudo systemctl enable camstream
 sudo systemctl restart camstream
 systemctl status camstream --no-pager
 journalctl -u camstream -n 50 --no-pager
-# the running process uses the file that was just installed:
 sha256sum build/camstream /usr/local/bin/camstream
 sudo ls -l /proc/$(pidof camstream)/exe
 ```
 
-The shipped config uses `source = csi` at 1280x720@30. An older
-`/etc/camstream.conf` may still say `source = v4l2`; compare it with
-`/etc/camstream.conf.new`.
+Shipped config: `source = csi` 1280×720@30. Old `/etc/camstream.conf` may still say `v4l2` — compare with `.conf.new`.
 
-The installed unit starts `camstream` with `/etc/camstream.conf`, restarts it
-on failure, and lets it join the `video` group. It ships without `User=` so
-it works on a fresh install; a dedicated account is better and is one edit
-away:
+Unit starts with `/etc/camstream.conf`, restarts on failure, joins `video` group. Ships without `User=` so works fresh; dedicated account better:
 
 ```sh
 sudo useradd --system --no-create-home --groups video camstream
@@ -1018,97 +744,108 @@ sudo sed -i 's/^#User=camstream$/User=camstream/;s/^#Group=camstream$/Group=cams
 sudo systemctl daemon-reload
 ```
 
-Then edit `/etc/camstream.conf` for your camera and geometry, and confirm the
-unit's `ExecStart` path matches where `make install` put the binary when you
-override `PREFIX`. The installed configuration already has the mDNS responder
-on, so the page answers at `http://camstream.local:8080/` right after the
-first boot with no further setup; see
-[Automatic LAN connection](#automatic-lan-connection).
+Edit `/etc/camstream.conf` for your camera/geometry, confirm `ExecStart` matches `PREFIX`. mDNS on → `http://camstream.local:8080/` right after first boot.
 
-To update, rebuild and `sudo make install`, then `sudo systemctl restart
-camstream`. For the libpeer variant:
+Update:
 
 ```sh
-make camstream-libpeer
-sudo make install-libpeer
-sudo systemctl daemon-reload
-sudo systemctl restart camstream-libpeer
+make && sudo make install && sudo systemctl restart camstream
+make camstream-libpeer && sudo make install-libpeer
+sudo systemctl daemon-reload && sudo systemctl restart camstream-libpeer
 ```
 
-`install-libpeer` installs `camstream-libpeer` and
-`camstream-libpeer.service`; it reuses `/etc/camstream.conf` when present.
+`install-libpeer` installs `camstream-libpeer` + `camstream-libpeer.service`, reuses `/etc/camstream.conf`.
+
+---
 
 ## Troubleshooting
 
 | Symptom | Check |
-| --- | --- |
-| `v4l2: cannot open /dev/video0` | Device path, permissions, `video` group membership |
-| `VIDIOC_STREAMON failed: errno=16 (Device or resource busy)` | Another process holds the camera; `fuser -v /dev/video0` |
-| `csi: camera busy: PID ... holds it` | Log names the PID; stop it |
-| Browser: `PR_END_OF_FILE_ERROR`, "secure connection failed", "connection was reset" | The browser used `https://`. Type `http://<pi>:8080/`; the log shows `TLS handshake on the plain HTTP port` |
-| `http: cannot listen on 0.0.0.0:8080: TCP port 8080 is already in use` | The service (or another instance) runs: `sudo ss -ltnp 'sport = :8080'`, `sudo systemctl stop camstream` |
-| `curl http://127.0.0.1:8080/` works, the LAN address does not | `listen` is not `0.0.0.0`, or a firewall: [LAN access](#lan-access-step-by-step-check) |
-| `VIDIOC_STREAMON` errno 22 on `/dev/video0` with a CSI camera | Expected: use `--source csi` |
-| `m2m ... VIDIOC_STREAMON ... errno=11` | Hardware encoder refused the stream; `auto` falls back to libx264, `--encoder sw` skips the probe |
-| `peer` in stats is the Pi's own address | The viewer runs on the Pi; open the page from the other PC |
-| Page loads, Connect stays on `connecting` | Firewall blocks UDP in the media range; check the browser console and `/api/logs` |
-| `ICE failed` in the page and `stun_rejected` climbing in stats | The offer was regenerated by a stale page; press Connect again, then `POST /api/webrtc/restart` |
-| Black video, counters climbing | Encoder issue: `/api/status` `encoder.status`, `media.skipped_mismatch`, `/api/logs` |
-| Frozen after Wi-Fi drop | The 30 s DTLS watchdog closes the session; the page retries five times automatically, otherwise press Connect |
-| `camstream.local` does not resolve | Client without mDNS (table in [Automatic LAN connection](#automatic-lan-connection)); use the addresses from `/api/status`. On Linux check `resolvectl query camstream.local` |
-| The name resolves to the wrong address, or `mdns: name conflict` in the log | Another host claims the name; the log names the suffix it moved to, or set `mdns_name` |
-| `mdns: responder unavailable: bind to 0.0.0.0:5353 failed` | Another responder owns the port and refuses to share it; the server keeps serving by address |
-| `OpenSSL headers not found` from `make` | Install `libssl-dev` or pass `DEPS_PREFIX` |
-| `libsrtp2 headers not found` from `make` | Install `libsrtp2-dev`; a source build needs `--enable-openssl` |
-| High CPU with no viewer | Expected only in `stdin`/`test` capture; a real camera using the hardware encoder idles near zero |
+|---|---|
+| `v4l2: cannot open /dev/video0` | Path, perms, `video` group |
+| `STREAMON errno=16 busy` | `fuser -v /dev/video0` |
+| `csi: camera busy: PID ...` | Log names PID, stop it |
+| Browser `PR_END_OF_FILE_ERROR` | Used `https://` → type `http://<pi>:8080/` |
+| `cannot listen on 0.0.0.0:8080: already in use` | `sudo ss -ltnp 'sport = :8080'`, `systemctl stop camstream` |
+| `127.0.0.1:8080` works, LAN IP not | `listen` not `0.0.0.0` or firewall |
+| `STREAMON errno 22` on `/dev/video0` CSI | Expected, use `--source csi` |
+| `m2m ... STREAMON errno=11` | HW encoder refused, `auto` falls back to libx264, `sw` skips probe |
+| `peer` is Pi's own address | Viewer runs on Pi, open from other PC |
+| Connect stays `connecting` | Firewall blocks UDP 50000-50007, check console + `/api/logs` |
+| `ICE failed`, `stun_rejected` climbing | Stale page regenerated offer, press Connect, `POST /api/webrtc/restart` |
+| Black video, counters climbing | Encoder: `/api/status` `encoder.status`, `skipped_mismatch`, logs |
+| Frozen after Wi-Fi drop | DTLS watchdog 30s closes, page retries 5× auto, else Connect |
+| `camstream.local` not resolve | Client without mDNS (see table), use IP from `/api/status`, `resolvectl query camstream.local` |
+| Wrong address / `mdns: name conflict` | Another host claims name, log shows suffix, or set `mdns_name` |
+| `mdns: responder unavailable: bind 5353 failed` | Another responder owns port and refuses share, server still serves by IP |
+| `OpenSSL headers not found` | `libssl-dev` or `DEPS_PREFIX` |
+| `libsrtp2 headers not found` | `libsrtp2-dev`, source build needs `--enable-openssl` |
+| High CPU no viewer | Expected only `stdin`/`test`, HW encoder idles near zero |
+| Minimal server 404 | `web_root/` missing or wrong `root_dir`, check `ls web_root/` |
 
-Errors name the subsystem and the operation, and include `errno` when a
-system call failed, for example:
+Errors name subsystem + operation + `errno`:
 
 ```
 [    1.234] ERROR capture: v4l2 VIDIOC_STREAMON: errno=16 (Device or resource busy)
 ```
 
-Log levels: `error` for failures needing attention, `warn` for recoverable
-degradation, `info` for state changes and configuration (the default console
-level), `debug` only with `--verbose`. Log output is one line per event on
-stderr; the same entries, with timestamps, are available from `/api/logs`
-without `--verbose`, because the ring keeps all levels.
+Levels: `error` (needs attention), `warn` (recoverable), `info` (state/config, default console), `debug` (`--verbose`). Ring keeps all levels for `/api/logs`.
 
-## Known limitations
+---
 
-- Plain HTTP only. There is no HTTPS listener; a browser forced to
-  `https://` cannot load the page (the server rejects the TLS handshake with
-  an alert and logs it).
-- The Pi 5 has no hardware H.264 encoder; `auto` uses libx264 there.
-- The V4L2 M2M fixes (capture format size, stream-on order, one-by-one
-  controls) follow the bcm2835-codec driver source and pass the build and
-  the test suite, but they have not been run on Pi hardware in this
-  revision.
-- LAN only. No STUN, TURN, or internet traversal; ICE-lite with host
-  candidates assumes the browser can reach the server's addresses.
-- Video only. No audio, no `getUserMedia` on the page.
-- H.264 only, constrained baseline (`42e01f`), because that is what both
-  encoder backends produce and what every browser decodes.
-- Eight concurrent viewers for the native stack, four for libpeer (one thread
-  per viewer), each viewer gets the same encoded stream. There is no
-  per-viewer scaling or simulcast.
-- libpeer build quirk: upstream `src/config.h` defines `CONFIG_MTU` without
-  `#ifndef`, so `-DCONFIG_MTU` cannot override it. The test binary works
-  around it with a forced include (`tests/libpeer_rx_config.h`) that undefines
-  and redefines the value to 1500, giving room for the 10-byte SRTP tag on
-  full-size packets. Browsers are unaffected; only a libpeer receiver needs it.
-- Changing resolution, FPS, source, device, encoder, or ports requires a
-  restart; `/api/config/reload` only re-applies the bitrate.
-- No recording, no snapshot endpoint, no RTSP or HLS.
-- No authentication on the HTTP interface by design; see
-  [Security model](#security-model). The mDNS name is unauthenticated too:
-  any host on the LAN can claim it, and a hostile host can therefore take
-  `camstream.local` or answer with its own address. The name is a convenience
-  for a trusted LAN, the addresses in `/api/status` are the ground truth.
-- mDNS publishes IPv4 addresses only, so an IPv6-only network needs the
-  address instead of the name.
-- The retransmission cache covers 512 packets and the access-unit ring 8
-  slots; a viewer that stops reading faster than the encoder produces will
-  lose quality rather than apply backpressure, which keeps latency bounded
-  at the cost of artifacts.
+## Known Limitations
+
+- Plain HTTP only — no HTTPS listener, browser forced to `https://` gets TLS alert.
+- Pi 5 has no HW H.264 encoder, `auto` uses libx264.
+- V4L2 M2M fixes (capture format size, stream-on order, one-by-one controls) follow bcm2835-codec driver source, pass tests, not run on Pi HW in this revision.
+- LAN only — no STUN/TURN/internet traversal, ICE-lite host candidates assume browser can reach server.
+- Video only — no audio, no `getUserMedia`.
+- H.264 constrained baseline `42e01f` — what both backends produce and browsers decode.
+- 8 viewers native, 4 libpeer (one thread per viewer), same stream, no simulcast.
+- libpeer MTU quirk: upstream `config.h` defines `CONFIG_MTU` without `#ifndef`, so `-D` cannot override. Test binary uses forced include `tests/libpeer_rx_config.h` → 1500 bytes for SRTP tag. Browsers unaffected.
+- Changing resolution/FPS/source/device/encoder/ports needs restart, `/api/config/reload` only bitrate.
+- No recording, snapshot, RTSP, HLS.
+- No auth on HTTP by design (see Security). mDNS name unauthenticated — any LAN host can claim `camstream.local`, addresses in `/api/status` are ground truth.
+- mDNS IPv4 only — IPv6-only needs IP.
+- Retransmit cache 512 packets, AU ring 8 slots — viewer not reading loses quality rather than backpressure, keeps latency bounded at cost of artifacts.
+
+---
+
+## Extending / Contributing
+
+**How to add a new capture source:**
+
+1. Implement `VideoSource` interface in `src/media/your_source.c` (`name`, `width`, `height`, `fps`, `frame_size`, `start`, `capture` → 1 frame ready / 0 no frame / -1 fatal, `release`, `close`, `ended` flag).
+2. Add factory in `video_source.h` + `create_source()` in `app_server.c` / `lp_server.c`.
+3. Test with `--test` pattern first, then real HW.
+
+**How to add encoder:**
+
+- Implement `m2m_backend_open`, `probe`, `encode`, `set_bitrate`, `close` like `encoder_x264.c` / `encoder_v4l2m2m.c`, register in `h264_encoder.c` factory.
+
+**How to use `server.c` in your project:**
+
+```sh
+cp server.c mongoose.c mongoose.h your_project/
+mkdir your_project/web_root
+# edit root_dir in server.c if needed
+gcc -O2 -DMG_ENABLE_LOG=0 server.c mongoose.c -o your_server
+```
+
+**Style:** C11, `-Wall -Wextra -Wpedantic -Wshadow -Wundef -Wformat=2 -Wstrict-prototypes -Wpointer-arith -Wvla`, no warnings. `clang-format` not enforced but keep minimal headers, explicit length checks, bounded buffers.
+
+**PRs:** Keep one binary's behavior in one PR, add test in `tests/`, run `make test` + `make test-libpeer` + sanitizers.
+
+---
+
+## License
+
+MIT — see `LICENSE`. Mongoose vendored MIT, libpeer MIT.
+
+---
+
+## Acknowledgments
+
+- [Cesanta Mongoose](https://github.com/cesanta/mongoose) — single-file HTTP server, embedded-ready.
+- [sepfy/libpeer](https://github.com/sepfy/libpeer) — pure C WebRTC, ARM/Linux target.
+- Raspberry Pi libcamera / `rpicam-vid` team — stable pipe interface for CSI cameras.
