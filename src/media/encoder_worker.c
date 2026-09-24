@@ -55,6 +55,17 @@ struct EncoderWorker {
     atomic_uint_fast64_t skipped_mismatch;
     atomic_uint_fast64_t skipped_bad_size;
     atomic_uint_fast64_t no_output;
+
+    /*
+     * Live reconfiguration mailbox. The HTTP thread only stores a
+     * request here; the encode thread is the one that owns the encoder
+     * handle and applies it, because calling into libx264 or issuing a
+     * V4L2 control ioctl while x264_encoder_encode or VIDIOC_QBUF is
+     * running on the same handle is a data race. 0 means "nothing
+     * pending", which is also why a bitrate request of 0 is refused.
+     */
+    atomic_uint pending_bitrate_kbps;
+    atomic_uint applied_bitrate_kbps;
 };
 
 static void counter_add(atomic_uint_fast64_t *counter)
@@ -102,6 +113,29 @@ static void *encoder_thread(void *arg)
         counter_add(&worker->frames_in);
 
         uint64_t frames_in = counter_get(&worker->frames_in);
+
+        /*
+         * Apply a queued bitrate change now: a frame just arrived, so
+         * the encoder is between calls and nothing else is touching it.
+         * Done before the idle check so the change lands even while no
+         * viewer is connected.
+         */
+        unsigned int pending_kbps =
+            atomic_exchange_explicit(&worker->pending_bitrate_kbps, 0,
+                                     memory_order_relaxed);
+
+        if (pending_kbps != 0) {
+            if (h264_encoder_set_bitrate(worker->encoder, pending_kbps) == 0) {
+                atomic_store_explicit(&worker->applied_bitrate_kbps,
+                                      pending_kbps, memory_order_relaxed);
+                log_info("encode", "encode worker: bitrate now %u kbps",
+                         pending_kbps);
+            } else {
+                log_error("encode", "encode worker: encoder refused the "
+                                    "bitrate change to %u kbps",
+                          pending_kbps);
+            }
+        }
 
         int active = 0;
         if (worker->active != NULL) {
@@ -344,6 +378,36 @@ void encoder_worker_join(EncoderWorker *worker)
         pthread_join(worker->thread, NULL);
         worker->started = 0;
     }
+}
+
+int encoder_worker_request_bitrate(EncoderWorker *worker, uint32_t kbps)
+{
+    if (worker == NULL) {
+        return -1;
+    }
+
+    /*
+     * The encode thread is stopped and joined during a pipeline restart;
+     * ask for a non-zero value so the mailbox stays unambiguous.
+     */
+    if (kbps == 0) {
+        return -1;
+    }
+
+    atomic_store_explicit(&worker->pending_bitrate_kbps, kbps,
+                          memory_order_relaxed);
+
+    return 0;
+}
+
+uint32_t encoder_worker_bitrate_kbps(const EncoderWorker *worker)
+{
+    if (worker == NULL) {
+        return 0;
+    }
+
+    return (uint32_t) atomic_load_explicit(&worker->applied_bitrate_kbps,
+                                           memory_order_relaxed);
 }
 
 uint64_t encoder_worker_frames_encoded(const EncoderWorker *worker)

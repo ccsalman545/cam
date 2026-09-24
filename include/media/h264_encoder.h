@@ -72,6 +72,11 @@ int h264_encoder_encode(H264Encoder *encoder,
  * backend accepted the new rate and -1 when it cannot (the caller then
  * reports the setting as requiring a restart). The picture size and
  * frame rate cannot change on a live encoder.
+ *
+ * Only the thread that owns the encoder may call this: reconfiguring
+ * libx264 or issuing a V4L2 control ioctl concurrently with encoding on
+ * the same handle is a data race. The HTTP thread goes through
+ * encoder_worker_request_bitrate() instead.
  */
 int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps);
 

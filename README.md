@@ -362,7 +362,8 @@ verbose = 0
 `POST /api/config/reload` re-reads the file and applies what can change
 without interrupting the stream:
 
-- applied live: `bitrate_kbps`
+- applied live: `bitrate_kbps` (queued to the encode thread, which owns
+  the encoder handle and applies it before its next frame)
 - reported under `restart_required`: everything else that changed
   (`source`, `device`, `width`, `height`, `fps`, `encoder`, ports, `listen`)
 
@@ -623,7 +624,7 @@ Five test binaries, each linked against the real modules:
 | Test | Covers |
 | --- | --- |
 | `test_stun` | STUN message parsing, MESSAGE-INTEGRITY verification, XOR-MAPPED-ADDRESS, fingerprints, RFC 5769 vectors, malformed input |
-| `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling |
+| `test_encoder_worker` | Encode loop with a stub encoder: frame accounting, mismatch and bad-size drops, stall watchdog, IDR handling, queued bitrate change applied by the encode thread |
 | `test_csi_source` | stdin frame reads, short frames, missing binary, mock camera process |
 | `test_rtc_session` | The real session against a browser-role client: STUN check with valid and invalid integrity, DTLS handshake, SRTP key export and decrypt, NAL reassembly, RTP timestamp advance at 90 kHz, SRTCP NACK and retransmission, malformed datagrams, idle timeout |
 | `test_server_api` | The real binary over HTTP: every endpoint, 404 and 405 handling, malformed offers, certificate rotation, config reload (applied and refused), camera failure with the HTTP interface still serving, clean SIGTERM shutdown |

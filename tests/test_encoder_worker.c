@@ -12,6 +12,7 @@
 #include "encoder_worker.h"
 
 #include <linux/videodev2.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,21 @@ enum EncodeMode {
 };
 
 static enum EncodeMode encode_mode = ENCODE_OK;
+
+/* Target bitrate the worker asked the stub to apply, 0 = never asked. */
+static atomic_uint stub_bitrate_kbps;
+
+int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps)
+{
+    (void) encoder;
+
+    if (bitrate_kbps == 0) {
+        return -1;
+    }
+
+    atomic_store(&stub_bitrate_kbps, bitrate_kbps);
+    return 0;
+}
 
 int h264_encoder_encode(H264Encoder *encoder,
                         const uint8_t *plane_y,
@@ -238,7 +254,38 @@ int main(void)
     check(stats.no_output > 0, "encoder no-output rounds counted");
 
     /*
-     * 5. Null worker getters behave.
+     * 5. A bitrate change is queued by the caller and applied by the
+     *    encode thread, which is the only thread allowed to touch the
+     *    encoder handle.
+     */
+    encode_mode = ENCODE_OK;
+    atomic_store(&active, 1);
+
+    check(encoder_worker_request_bitrate(worker, 1337) == 0,
+          "bitrate request queued");
+    check(encoder_worker_request_bitrate(worker, 0) == -1,
+          "a zero bitrate request is refused");
+    check(encoder_worker_request_bitrate(NULL, 1337) == -1,
+          "a request without a worker is refused");
+
+    uint64_t seen_before_bitrate = stats.frames_seen;
+
+    for (int i = 0; i < 10; i++) {
+        frame_hub_publish(hub, raw, (size_t) WIDTH * HEIGHT * 2,
+                          WIDTH, HEIGHT, V4L2_PIX_FMT_YUYV,
+                          WIDTH * 2, sequence++, (uint64_t) i * 33333);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 3000000 };
+        nanosleep(&ts, NULL);
+    }
+    wait_for_frames(worker, seen_before_bitrate + 10);
+
+    check(atomic_load(&stub_bitrate_kbps) == 1337,
+          "encode thread applied the queued bitrate");
+    check(encoder_worker_bitrate_kbps(worker) == 1337,
+          "applied bitrate is reported back");
+
+    /*
+     * 6. Null worker getters behave.
      */
     encoder_worker_get_stats(NULL, &stats);
     check(stats.frames_seen == 0 && stats.frames_encoded == 0,

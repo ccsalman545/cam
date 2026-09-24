@@ -1580,9 +1580,12 @@ static void apply_runtime_config(Server *server,
     restart_required[0] = 0;
 
     if (candidate->bitrate_kbps != server->config.bitrate_kbps) {
-        if (server->encoder != NULL &&
-            h264_encoder_set_bitrate(server->encoder,
-                                     candidate->bitrate_kbps) == 0) {
+        /*
+         * The encode thread applies this before its next encode call;
+         * see encoder_worker_request_bitrate().
+         */
+        if (encoder_worker_request_bitrate(server->encoder_worker,
+                                           candidate->bitrate_kbps) == 0) {
             server->config.bitrate_kbps = candidate->bitrate_kbps;
             note_change(applied, applied_size, &applied_len, "bitrate_kbps");
         } else {
