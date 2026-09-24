@@ -37,6 +37,19 @@ void encoder_worker_stop(EncoderWorker *worker);
 
 void encoder_worker_join(EncoderWorker *worker);
 
+/*
+ * Queue a target bitrate change for the encode thread. Returns 0 when the
+ * request was queued, -1 when there is no worker or the value is 0.
+ *
+ * The caller must not call into the encoder itself: the encode thread owns
+ * the encoder handle, and libx264 reconfiguration is not safe to run
+ * concurrently with x264_encoder_encode.
+ */
+int encoder_worker_request_bitrate(EncoderWorker *worker, uint32_t kbps);
+
+/* Bitrate the encode thread last applied, 0 when none has been applied. */
+uint32_t encoder_worker_bitrate_kbps(const EncoderWorker *worker);
+
 uint64_t encoder_worker_frames_encoded(const EncoderWorker *worker);
 
 /*

@@ -12,6 +12,7 @@
 #include "encoder_worker.h"
 
 #include <linux/videodev2.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +31,28 @@ enum EncodeMode {
     ENCODE_NO_OUTPUT    /* simulate pipeline depth: never emit */
 };
 
-static enum EncodeMode encode_mode = ENCODE_OK;
+/*
+ * Atomic because main switches the mode between phases while the encode
+ * thread may still be inside the stub. The sleeps in the test make the
+ * switch land between frames in practice, but relying on that would
+ * leave a real race in the test itself.
+ */
+static atomic_int encode_mode = ENCODE_OK;
+
+/* Target bitrate the worker asked the stub to apply, 0 = never asked. */
+static atomic_uint stub_bitrate_kbps;
+
+int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps)
+{
+    (void) encoder;
+
+    if (bitrate_kbps == 0) {
+        return -1;
+    }
+
+    atomic_store(&stub_bitrate_kbps, bitrate_kbps);
+    return 0;
+}
 
 int h264_encoder_encode(H264Encoder *encoder,
                         const uint8_t *plane_y,
@@ -47,7 +69,7 @@ int h264_encoder_encode(H264Encoder *encoder,
     (void) pts_us;
     (void) force_idr;
 
-    if (encode_mode == ENCODE_NO_OUTPUT) {
+    if (atomic_load(&encode_mode) == ENCODE_NO_OUTPUT) {
         return 0;
     }
 
@@ -77,6 +99,35 @@ static void check(int condition, const char *what)
     }
 }
 
+/*
+ * The counters are updated one at a time as the worker progresses: a frame
+ * is counted as seen when it is taken from the hub and lands in exactly one
+ * of encoded, skipped_idle, skipped_mismatch, skipped_bad_size or
+ * no_output when that frame is done. A snapshot taken in between shows one
+ * frame unaccounted for, so the identity is retried instead of sampled
+ * once. Failure to ever reach it is a real accounting bug.
+ */
+static int wait_for_accounting(EncoderWorker *worker, EncoderWorkerStats *out)
+{
+    for (int attempt = 0; attempt < 200; attempt++) {
+        encoder_worker_get_stats(worker, out);
+
+        uint64_t accounted = out->frames_encoded + out->skipped_idle +
+                             out->skipped_mismatch + out->skipped_bad_size +
+                             out->no_output;
+
+        if (accounted == out->frames_seen) {
+            return 0;
+        }
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+
+        nanosleep(&ts, NULL);
+    }
+
+    return -1;
+}
+
 static void wait_for_frames(EncoderWorker *worker, uint64_t target_seen)
 {
     for (int i = 0; i < 2000; i++) {
@@ -104,6 +155,10 @@ int main(void)
         return 1;
     }
 
+    /*
+     * The stub ignores its encoder handle; the address of the mode flag
+     * is only a non-NULL token for the worker.
+     */
     EncoderWorker *worker = encoder_worker_create(hub,
                                                   (H264Encoder *) &encode_mode,
                                                   WIDTH, HEIGHT,
@@ -154,12 +209,15 @@ int main(void)
     }
     wait_for_frames(worker, seen_before + 30);
 
-    encoder_worker_get_stats(worker, &stats);
+    check(wait_for_accounting(worker, &stats) == 0,
+          "every frame is accounted for exactly once");
     check(stats.frames_encoded > 0, "active window encodes frames");
-    check(stats.frames_encoded == stats.frames_seen - stats.skipped_idle -
-                                   stats.skipped_mismatch -
-                                   stats.skipped_bad_size,
-          "drop accounting is exact");
+    printf("     active window: seen=%llu encoded=%llu idle=%llu "
+           "no-output=%llu\n",
+           (unsigned long long) stats.frames_seen,
+           (unsigned long long) stats.frames_encoded,
+           (unsigned long long) stats.skipped_idle,
+           (unsigned long long) stats.no_output);
     check(stats.skipped_mismatch == 0, "no mismatch when sizes agree");
 
     /*
@@ -201,7 +259,7 @@ int main(void)
      * 4. Encoder produces no output (pipeline depth): counted
      *    separately so the status endpoint can name the cause.
      */
-    encode_mode = ENCODE_NO_OUTPUT;
+    atomic_store(&encode_mode, ENCODE_NO_OUTPUT);
     atomic_store(&active, 0);
 
     /* Give the worker a chance to observe the idle state so the
@@ -238,7 +296,38 @@ int main(void)
     check(stats.no_output > 0, "encoder no-output rounds counted");
 
     /*
-     * 5. Null worker getters behave.
+     * 5. A bitrate change is queued by the caller and applied by the
+     *    encode thread, which is the only thread allowed to touch the
+     *    encoder handle.
+     */
+    atomic_store(&encode_mode, ENCODE_OK);
+    atomic_store(&active, 1);
+
+    check(encoder_worker_request_bitrate(worker, 1337) == 0,
+          "bitrate request queued");
+    check(encoder_worker_request_bitrate(worker, 0) == -1,
+          "a zero bitrate request is refused");
+    check(encoder_worker_request_bitrate(NULL, 1337) == -1,
+          "a request without a worker is refused");
+
+    uint64_t seen_before_bitrate = stats.frames_seen;
+
+    for (int i = 0; i < 10; i++) {
+        frame_hub_publish(hub, raw, (size_t) WIDTH * HEIGHT * 2,
+                          WIDTH, HEIGHT, V4L2_PIX_FMT_YUYV,
+                          WIDTH * 2, sequence++, (uint64_t) i * 33333);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 3000000 };
+        nanosleep(&ts, NULL);
+    }
+    wait_for_frames(worker, seen_before_bitrate + 10);
+
+    check(atomic_load(&stub_bitrate_kbps) == 1337,
+          "encode thread applied the queued bitrate");
+    check(encoder_worker_bitrate_kbps(worker) == 1337,
+          "applied bitrate is reported back");
+
+    /*
+     * 6. Null worker getters behave.
      */
     encoder_worker_get_stats(NULL, &stats);
     check(stats.frames_seen == 0 && stats.frames_encoded == 0,

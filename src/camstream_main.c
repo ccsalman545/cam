@@ -7,12 +7,11 @@
  * hand control to the server until SIGINT or SIGTERM.
  */
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "app/app_config.h"
 #include "app/app_server.h"
+#include "app/log.h"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -54,9 +53,15 @@ int main(int argc, char **argv)
      */
     signal(SIGPIPE, SIG_IGN);
 
-    printf("camstream %s starting\n", APP_VERSION);
+    /*
+     * The console level follows --verbose: DEBUG is never printed
+     * unless the operator asked for it, while the in-memory ring keeps
+     * every level for GET /api/logs.
+     */
+    log_init(config.verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_INFO);
+
+    log_info("app", "camstream %s starting", APP_VERSION);
     app_config_print_summary(&config);
-    printf("\n");
 
     return app_server_run(&config, &g_stop);
 }

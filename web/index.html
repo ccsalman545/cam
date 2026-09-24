@@ -1,967 +1,498 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>camstream — libpeer WebRTC Video Feed</title>
-  <style>
-    :root {
-      --bg: #0b1020;
-      --card: rgba(255, 255, 255, 0.045);
-      --card-border: rgba(255, 255, 255, 0.09);
-      --card-hover: rgba(255, 255, 255, 0.08);
-      --text: #e8ecf8;
-      --dim: #93a0bd;
-      --teal: #2dd4bf;
-      --blue: #60a5fa;
-      --violet: #a78bfa;
-      --red: #f87171;
-      --amber: #fbbf24;
-      --green: #34d399;
-      --mono: ui-monospace, 'Cascadia Mono', Menlo, Consolas, monospace;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background:
-        radial-gradient(1200px 700px at 85% -10%, rgba(96, 165, 250, 0.16), transparent 60%),
-        radial-gradient(1000px 600px at -10% 110%, rgba(167, 139, 250, 0.14), transparent 55%),
-        var(--bg);
-      color: var(--text);
-      min-height: 100%;
-      padding: 20px;
-    }
-    .wrap {
-      max-width: 1200px;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 16px;
-      padding: 8px 4px;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .logo {
-      width: 40px;
-      height: 40px;
-      border-radius: 12px;
-      background: linear-gradient(135deg, var(--teal), var(--blue) 55%, var(--violet));
-      display: grid;
-      place-items: center;
-      box-shadow: 0 6px 24px rgba(96, 165, 250, 0.35);
-    }
-    .logo svg {
-      width: 22px;
-      height: 22px;
-      fill: #0b1020;
-    }
-    h1 {
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: 0.2px;
-    }
-    .sub {
-      color: var(--dim);
-      font-size: 13px;
-      margin-top: 2px;
-    }
-    .header-badges {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .pill {
-      font-size: 12px;
-      font-weight: 500;
-      padding: 4px 12px;
-      border-radius: 20px;
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      color: var(--dim);
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .pill.active {
-      background: rgba(52, 211, 153, 0.15);
-      border-color: rgba(52, 211, 153, 0.4);
-      color: var(--green);
-    }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: currentColor;
-    }
-    .dot.live {
-      box-shadow: 0 0 8px currentColor;
-    }
-
-    /* Pipeline Status Bar */
-    .steps {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 10px;
-    }
-    .step {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 10px 14px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-size: 13px;
-      color: var(--dim);
-      transition: all 0.2s ease;
-    }
-    .step-num {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
-      display: grid;
-      place-items: center;
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--dim);
-    }
-    .step.active {
-      border-color: var(--blue);
-      color: var(--blue);
-      background: rgba(96, 165, 250, 0.1);
-    }
-    .step.active .step-num {
-      background: var(--blue);
-      color: #0b1020;
-    }
-    .step.ok {
-      border-color: var(--green);
-      color: var(--green);
-      background: rgba(52, 211, 153, 0.08);
-    }
-    .step.ok .step-num {
-      background: var(--green);
-      color: #0b1020;
-    }
-    .step.fail {
-      border-color: var(--red);
-      color: var(--red);
-      background: rgba(248, 113, 113, 0.08);
-    }
-    .step.fail .step-num {
-      background: var(--red);
-      color: #0b1020;
-    }
-
-    /* Video Layout */
-    .main-grid {
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      gap: 20px;
-    }
-    @media (max-width: 960px) {
-      .main-grid { grid-template-columns: 1fr; }
-    }
-    .video-card {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      position: relative;
-    }
-    .video-wrap {
-      background: #000;
-      aspect-ratio: 4 / 3;
-      max-height: 520px;
-      position: relative;
-      display: grid;
-      place-items: center;
-      overflow: hidden;
-    }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      background: #000;
-      display: block;
-    }
-    .video-overlay {
-      position: absolute;
-      top: 14px;
-      left: 14px;
-      display: flex;
-      gap: 8px;
-      z-index: 2;
-    }
-    .tag {
-      font-size: 11px;
-      font-family: var(--mono);
-      padding: 3px 8px;
-      border-radius: 6px;
-      background: rgba(11, 16, 32, 0.75);
-      backdrop-filter: blur(8px);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      color: var(--text);
-    }
-    .tag.live-badge {
-      background: rgba(239, 68, 68, 0.85);
-      border-color: rgba(239, 68, 68, 0.6);
-      color: #fff;
-      font-weight: 700;
-    }
-    .idle-cover {
-      position: absolute;
-      inset: 0;
-      background: #060913;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 14px;
-      z-index: 1;
-      color: var(--dim);
-    }
-    .idle-cover svg {
-      width: 48px;
-      height: 48px;
-      fill: var(--dim);
-      opacity: 0.6;
-    }
-
-    /* Video Controls */
-    .controls {
-      padding: 14px 18px;
-      background: rgba(0, 0, 0, 0.25);
-      border-top: 1px solid var(--card-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
-    .btn-group {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    button {
-      font-family: inherit;
-      font-size: 13px;
-      font-weight: 600;
-      padding: 8px 18px;
-      border-radius: 8px;
-      border: 1px solid transparent;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: all 0.15s ease;
-    }
-    button:disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-    }
-    .btn-primary {
-      background: linear-gradient(135deg, var(--teal), var(--blue));
-      color: #0b1020;
-    }
-    .btn-primary:not(:disabled):hover {
-      box-shadow: 0 4px 16px rgba(45, 212, 191, 0.35);
-      transform: translateY(-1px);
-    }
-    .btn-secondary {
-      background: var(--card);
-      border-color: var(--card-border);
-      color: var(--text);
-    }
-    .btn-secondary:not(:disabled):hover {
-      background: var(--card-hover);
-    }
-    .btn-danger {
-      background: rgba(248, 113, 113, 0.15);
-      border-color: rgba(248, 113, 113, 0.35);
-      color: var(--red);
-    }
-    .btn-danger:not(:disabled):hover {
-      background: rgba(248, 113, 113, 0.25);
-    }
-    .signaling-mode {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--dim);
-    }
-    select {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      color: var(--text);
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-family: inherit;
-      outline: none;
-    }
-
-    /* Right Stats Panel */
-    .stats-col {
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    .panel {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 14px;
-      padding: 16px;
-    }
-    .panel-title {
-      font-size: 13px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: var(--dim);
-      margin-bottom: 14px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .metrics-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-    }
-    .metric {
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 10px 12px;
-    }
-    .metric-label {
-      font-size: 11px;
-      color: var(--dim);
-      margin-bottom: 4px;
-    }
-    .metric-val {
-      font-size: 18px;
-      font-weight: 700;
-      font-family: var(--mono);
-      color: var(--text);
-    }
-    .metric-val span {
-      font-size: 11px;
-      font-weight: 400;
-      color: var(--dim);
-      margin-left: 2px;
-    }
-    .sparkline {
-      width: 100%;
-      height: 42px;
-      margin-top: 10px;
-      border-radius: 4px;
-      background: rgba(0, 0, 0, 0.2);
-    }
-
-    /* Diagnostics Log */
-    .log-panel {
-      display: flex;
-      flex-direction: column;
-      height: 190px;
-    }
-    .log-list {
-      flex: 1;
-      overflow-y: auto;
-      font-family: var(--mono);
-      font-size: 11px;
-      line-height: 1.6;
-      color: var(--dim);
-      padding: 6px 0;
-    }
-    .log-item {
-      display: flex;
-      gap: 8px;
-    }
-    .log-item .time { color: rgba(255, 255, 255, 0.28); }
-    .log-item.ok { color: var(--green); }
-    .log-item.err { color: var(--red); }
-    .log-item.info { color: var(--blue); }
-
-    /* LAN Banner / Hint */
-    .hint-banner {
-      display: none;
-      background: rgba(251, 191, 36, 0.1);
-      border: 1px solid rgba(251, 191, 36, 0.3);
-      border-radius: 10px;
-      padding: 12px 16px;
-      font-size: 13px;
-      line-height: 1.5;
-      color: #fef08a;
-    }
-    .hint-banner.show { display: block; }
-    .hint-banner code {
-      background: rgba(0, 0, 0, 0.3);
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: var(--mono);
-      font-size: 12px;
-      color: #fff;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>camstream</title>
+<style>
+  :root {
+    --bg: #14171a;
+    --panel: #1d2126;
+    --line: #2c3238;
+    --text: #e6e9ec;
+    --muted: #9aa4ae;
+    --ok: #46b17b;
+    --warn: #d9a441;
+    --bad: #d1605b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  #state-text { color: var(--muted); }
+  main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+  .video-wrap {
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+  }
+  video { display: block; width: 100%; max-height: 70vh; background: #000; }
+  .placeholder {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted);
+  }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    margin: 12px 0 16px;
+  }
+  button {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 7px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #3d464e; }
+  button:disabled { color: var(--muted); cursor: default; }
+  button.primary { background: #2a5f8f; border-color: #2a5f8f; }
+  section { margin-bottom: 18px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+       color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  .grid {
+    display: grid; gap: 8px;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+  .cell {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 8px 10px;
+  }
+  .cell .k { color: var(--muted); font-size: 12px; }
+  .cell .v { font-variant-numeric: tabular-nums; margin-top: 2px; }
+  pre {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 10px; margin: 0;
+    max-height: 260px; overflow: auto;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+  .log-error { color: var(--bad); }
+  .log-warn { color: var(--warn); }
+  .log-info { color: var(--text); }
+  .log-debug { color: var(--muted); }
+  footer { color: var(--muted); font-size: 12px; padding: 0 16px 20px; max-width: 1100px; margin: 0 auto; }
+  footer code { color: var(--text); }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row label { color: var(--muted); }
+  select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px;
+    font: inherit;
+  }
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <!-- Header -->
-    <header>
-      <div class="brand">
-        <div class="logo">
-          <svg viewBox="0 0 24 24"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
-        </div>
-        <div>
-          <h1>camstream — libpeer</h1>
-          <div class="sub">Embedded C WebRTC video streaming over LAN</div>
-        </div>
-      </div>
-      <div class="header-badges">
-        <div class="pill" id="backendPill">
-          <span class="dot"></span>
-          <span>Backend: libpeer C</span>
-        </div>
-        <div class="pill" id="statusPill">
-          <span class="dot"></span>
-          <span id="statusText">Ready</span>
-        </div>
-      </div>
-    </header>
+<header>
+  <span id="state-dot" class="dot"></span>
+  <h1>camstream</h1>
+  <span id="state-text">idle</span>
+</header>
 
-    <!-- Pipeline Step Indicators -->
-    <div class="steps">
-      <div class="step" id="stepSignaling">
-        <div class="step-num">1</div>
-        <div>Signaling (HTTP/WS)</div>
-      </div>
-      <div class="step" id="stepIce">
-        <div class="step-num">2</div>
-        <div>ICE Candidate Pair</div>
-      </div>
-      <div class="step" id="stepDtls">
-        <div class="step-num">3</div>
-        <div>DTLS-SRTP Handshake</div>
-      </div>
-      <div class="step" id="stepMedia">
-        <div class="step-num">4</div>
-        <div>H.264 Live Video</div>
-      </div>
-    </div>
-
-    <!-- Hint / Firewall Warning -->
-    <div class="hint-banner" id="hintBanner"></div>
-
-    <!-- Main Grid -->
-    <div class="main-grid">
-      <!-- Video Element Area -->
-      <div class="video-card">
-        <div class="video-wrap">
-          <div class="video-overlay">
-            <span class="tag live-badge" id="badgeLive" style="display:none;">LIVE</span>
-            <span class="tag" id="tagRes">640x480</span>
-            <span class="tag" id="tagCodec">H.264 Baseline</span>
-            <span class="tag" id="tagLatency">&lt;50ms LAN</span>
-          </div>
-
-          <video id="remoteVideo" autoplay playsinline muted></video>
-
-          <div class="idle-cover" id="idleCover">
-            <svg viewBox="0 0 24 24"><path d="M21 6.5l-4 4V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11z"/></svg>
-            <div>Stream disconnected. Click "Start Stream" below.</div>
-          </div>
-        </div>
-
-        <!-- Controls Bar -->
-        <div class="controls">
-          <div class="btn-group">
-            <button class="btn-primary" id="btnStart" onclick="startStream()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-              Start Stream
-            </button>
-            <button class="btn-danger" id="btnStop" onclick="stopStream()" disabled>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h12v12H6z"/></svg>
-              Stop
-            </button>
-            <button class="btn-secondary" id="btnSnapshot" onclick="takeSnapshot()" disabled>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h3l2-2h6l2 2h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm8 3a5 5 0 1 0 0 10 5 5 0 0 0 0-10z"/></svg>
-              Snapshot
-            </button>
-          </div>
-
-          <div class="signaling-mode">
-            <label for="signalingSelect">Signaling:</label>
-            <select id="signalingSelect">
-              <option value="ws">WebSocket (/ws)</option>
-              <option value="http">HTTP REST (/rtc/offer)</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      <!-- Stats & Diagnostic Column -->
-      <div class="stats-col">
-        <!-- Live Telemetry Panel -->
-        <div class="panel">
-          <div class="panel-title">
-            <span>WebRTC Telemetry</span>
-            <span id="telemetryState" style="font-size:11px; color:var(--teal)">IDLE</span>
-          </div>
-          <div class="metrics-grid">
-            <div class="metric">
-              <div class="metric-label">Bitrate</div>
-              <div class="metric-val" id="valBitrate">0.0 <span>Mbps</span></div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">Framerate</div>
-              <div class="metric-val" id="valFps">0 <span>fps</span></div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">Est. Latency (RTT)</div>
-              <div class="metric-val" id="valRtt">&mdash; <span>ms</span></div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">Packets Recv / Lost</div>
-              <div class="metric-val" id="valPackets">0 / 0</div>
-            </div>
-          </div>
-          <canvas class="sparkline" id="sparklineCanvas" width="340" height="42"></canvas>
-        </div>
-
-        <!-- Diagnostic Log Panel -->
-        <div class="panel log-panel">
-          <div class="panel-title">
-            <span>Connection Log</span>
-            <button class="btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="clearLog()">Clear</button>
-          </div>
-          <div class="log-list" id="logList"></div>
-        </div>
-      </div>
-    </div>
+<main>
+  <div class="video-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <div id="placeholder" class="placeholder">not connected</div>
   </div>
 
-  <script>
-    // Browser Client: WebRTC Native RTCPeerConnection Implementation
-    const video = document.getElementById('remoteVideo');
-    const idleCover = document.getElementById('idleCover');
-    const btnStart = document.getElementById('btnStart');
-    const btnStop = document.getElementById('btnStop');
-    const btnSnapshot = document.getElementById('btnSnapshot');
-    const badgeLive = document.getElementById('badgeLive');
-    const statusPill = document.getElementById('statusPill');
-    const statusText = document.getElementById('statusText');
-    const logList = document.getElementById('logList');
-    const hintBanner = document.getElementById('hintBanner');
+  <div class="controls">
+    <button id="connect" class="primary">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="restart-camera">Restart camera</button>
+    <button id="restart-webrtc">Restart WebRTC</button>
+    <button id="reload-config">Reload config</button>
+  </div>
 
-    let pc = null;
-    let ws = null;
-    let sessionId = 0;
-    let statsTimer = null;
-    let lastBytes = 0;
-    let lastFrames = 0;
-    let lastTime = 0;
-    const bitrateHistory = [];
+  <section>
+    <h2>Stream</h2>
+    <div class="grid" id="stream-grid"></div>
+  </section>
 
-    function log(msg, type = 'info') {
-      const d = new Date();
-      const ts = d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
-      const div = document.createElement('div');
-      div.className = 'log-item ' + type;
-      div.innerHTML = `<span class="time">${ts}</span> <span>${msg}</span>`;
-      logList.appendChild(div);
-      logList.scrollTop = logList.scrollHeight;
+  <section>
+    <h2>Camera and encoder</h2>
+    <div class="grid" id="camera-grid"></div>
+  </section>
+
+  <section>
+    <h2>Transport counters</h2>
+    <div class="grid" id="transport-grid"></div>
+  </section>
+
+  <section>
+    <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+      <h2 style="margin: 0;">Server log</h2>
+      <div class="row">
+        <label for="log-level">level</label>
+        <select id="log-level">
+          <option value="debug">debug</option>
+          <option value="info" selected>info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+      </div>
+    </div>
+    <pre id="log">loading...</pre>
+  </section>
+</main>
+
+<footer>
+  Interfaces: <span id="interfaces">-</span>.
+  Media flows over UDP ports <span id="udp-range">-</span>, signaling and these
+  panels over HTTP port <span id="http-port">-</span>.
+  Name for other devices: <span id="mdns-name">-</span>.
+  The server must be on the same LAN as this browser: no STUN, no TURN, no relay.
+</footer>
+
+<script>
+"use strict";
+
+var state = {
+  pc: null,
+  sessionId: null,
+  connecting: false,
+  retried: false,
+  lastStats: null,
+  /* Auto connect on load, and how many attempts are left. A manual
+     disconnect stops it; a successful stream resets it. */
+  autoConnect: true,
+  autoRetries: 0
+};
+
+var AUTO_RETRY_LIMIT = 5;
+
+var el = function (id) { return document.getElementById(id); };
+
+function setState(text, level) {
+  el("state-text").textContent = text;
+  el("state-dot").className = "dot" + (level ? " " + level : "");
+}
+
+function cell(key, value) {
+  return '<div class="cell"><div class="k">' + key +
+         '</div><div class="v">' + value + "</div></div>";
+}
+
+function num(value) {
+  return (typeof value === "number") ? value.toLocaleString() : String(value);
+}
+
+function getJson(path) {
+  return fetch(path, { cache: "no-store" }).then(function (response) {
+    if (!response.ok) {
+      throw new Error(path + ": HTTP " + response.status);
     }
+    return response.json();
+  });
+}
 
-    function clearLog() {
-      logList.innerHTML = '';
-    }
-
-    function setStep(id, state) {
-      const el = document.getElementById(id);
-      if (el) el.className = 'step ' + (state || '');
-    }
-
-    function resetSteps() {
-      ['stepSignaling', 'stepIce', 'stepDtls', 'stepMedia'].forEach(s => setStep(s, ''));
-    }
-
-    function setStatus(text, live = false) {
-      statusText.textContent = text;
-      if (live) {
-        statusPill.classList.add('active');
-        badgeLive.style.display = 'inline-block';
-      } else {
-        statusPill.classList.remove('active');
-        badgeLive.style.display = 'none';
+function postJson(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {})
+  }).then(function (response) {
+    return response.json().catch(function () { return {}; }).then(function (data) {
+      if (!response.ok) {
+        throw new Error(data.error || (path + ": HTTP " + response.status));
       }
+      return data;
+    });
+  });
+}
+
+/* --- connection ---------------------------------------------------- */
+
+function connect() {
+  if (state.connecting || state.pc) {
+    return;
+  }
+
+  state.connecting = true;
+  state.retried = false;
+  setState("connecting", "warn");
+  el("connect").disabled = true;
+  el("placeholder").textContent = "connecting...";
+
+  var pc = new RTCPeerConnection({ iceServers: [] });
+
+  state.pc = pc;
+
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  pc.ontrack = function (event) {
+    el("video").srcObject = event.streams[0];
+    el("placeholder").style.display = "none";
+    /*
+     * The video element is muted, which is what browsers require before
+     * they allow a stream to start without a click. If a policy still
+     * refuses, the stream is running and only playback needs a gesture,
+     * so say that instead of showing a stalled picture.
+     */
+    el("video").play().catch(function () {
+      setState("stream ready, press Connect to start playback", "warn");
+    });
+    el("disconnect").disabled = false;
+    state.autoRetries = 0;
+    setState("streaming", "ok");
+  };
+
+  pc.oniceconnectionstatechange = function () {
+    var s = pc.iceConnectionState;
+
+    if (s === "failed") {
+      setState("ICE failed, retrying", "bad");
+      teardown(250);
+    } else if (s === "disconnected") {
+      setState("ICE disconnected", "warn");
+    } else if (s === "connected" || s === "completed") {
+      setState("connected", "ok");
     }
+  };
 
-    async function sendCandidate(candidate) {
-      if (!candidate || !candidate.candidate) return;
-      const candStr = candidate.candidate;
+  pc.createOffer({ offerToReceiveVideo: true })
+    .then(function (offer) { return pc.setLocalDescription(offer); })
+    .then(function () {
+      return postJson("/api/webrtc/offer", { sdp: pc.localDescription.sdp });
+    })
+    .then(function (answer) {
+      state.sessionId = answer.session_id;
+      state.connecting = false;
+      return pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+    })
+    .catch(function (error) {
+      state.connecting = false;
+      setState("signaling failed: " + error.message, "bad");
+      teardown(1000);
+    });
+}
 
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'candidate',
-          session_id: sessionId,
-          candidate: candStr
-        }));
-      } else if (sessionId) {
-        try {
-          await fetch('/rtc/candidate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, candidate: candStr })
-          });
-        } catch (e) {
-          console.warn('Trickle ICE candidate send failed', e);
-        }
-      }
+function teardown(delayMs) {
+  var pc = state.pc;
+  var sessionId = state.sessionId;
+
+  state.pc = null;
+  state.sessionId = null;
+  state.connecting = false;
+
+  if (pc) {
+    pc.getSenders().forEach(function () {});
+    pc.close();
+  }
+
+  el("video").srcObject = null;
+  el("placeholder").style.display = "flex";
+  el("placeholder").textContent = "not connected";
+  el("connect").disabled = false;
+  el("disconnect").disabled = true;
+  setState("idle");
+
+  if (sessionId !== null) {
+    postJson("/api/webrtc/close", { session_id: sessionId }).catch(function () {});
+  }
+
+  /*
+   * One automatic retry covers a camera or network blip. After that the
+   * retries are bounded so a server that stays down is not hammered,
+   * and the operator decides when to try again.
+   */
+  if (delayMs && !state.retried) {
+    state.retried = true;
+    window.setTimeout(connect, delayMs);
+  } else if (state.autoConnect && state.autoRetries < AUTO_RETRY_LIMIT) {
+    state.autoRetries++;
+    setState("reconnecting (" + state.autoRetries + "/" + AUTO_RETRY_LIMIT +
+             ")", "warn");
+    window.setTimeout(connect, Math.min(1000 * state.autoRetries, 5000));
+  }
+}
+
+/* --- status and stats ---------------------------------------------- */
+
+function refreshStatus() {
+  return getJson("/api/status").then(function (status) {
+    var encoder = status.encoder || {};
+    var source = status.source || {};
+    var webrtc = status.webrtc || {};
+    var process_ = status.process || {};
+    var media = status.media || {};
+
+    el("stream-grid").innerHTML =
+      cell("state", status.state) +
+      cell("transport", webrtc.transport || "-") +
+      cell("DTLS", webrtc.dtls || "-") +
+      cell("viewers", num(webrtc.sessions_active) + " / " + num(webrtc.sessions_max)) +
+      cell("codec", encoder.name || "-") +
+      cell("resolution", (source.width || 0) + "x" + (source.height || 0)) +
+      cell("capture fps", media.capture_fps.toFixed(1)) +
+      cell("encode fps", media.encode_fps.toFixed(1)) +
+      cell("bitrate", media.bitrate_kbps.toFixed(0) + " kbps") +
+      cell("RSS", num(process_.rss_kb) + " kB") +
+      cell("CPU", process_.cpu_percent.toFixed(1) + " %") +
+      cell("uptime", num(status.uptime_sec) + " s");
+
+    el("camera-grid").innerHTML =
+      cell("source", source.name || source.kind || "-") +
+      cell("source status", source.status || "-") +
+      cell("frames", num(source.frames)) +
+      cell("capture errors", num(source.capture_errors)) +
+      cell("encoder", encoder.preference || "-") +
+      cell("encoder status", encoder.status || "-") +
+      cell("target bitrate", num(encoder.bitrate_kbps) + " kbps") +
+      cell("frames encoded", num(encoder.frames)) +
+      cell("keyframe every", num(encoder.keyframe_seconds) + " s") +
+      cell("dropped AUs", num(media.au_dropped)) +
+      cell("idle frames", num(media.skipped_idle)) +
+      cell("errors logged", num(process_.log_errors));
+
+    el("interfaces").textContent = (status.interfaces || []).map(function (i) {
+      return i.ip + " (" + i.name + ")";
+    }).join(", ") || "none";
+
+    el("http-port").textContent = status.http.port;
+
+    var mdns = status.mdns || {};
+
+    el("mdns-name").textContent =
+      mdns.enabled && mdns.url ? mdns.url : "off";
+    el("udp-range").textContent = status.webrtc.udp_base_port + " to " +
+      (status.webrtc.udp_base_port + status.webrtc.sessions_max - 1);
+
+    if (status.last_error) {
+      setState(status.state + ": " + status.last_error, "bad");
+    } else if (!state.pc) {
+      setState(status.state);
     }
+  }).catch(function (error) {
+    setState("server unreachable: " + error.message, "bad");
+  });
+}
 
-    async function startStream() {
-      if (pc) return;
-      resetSteps();
-      btnStart.disabled = true;
-      btnStop.disabled = false;
-      btnSnapshot.disabled = true;
-      setStatus('Connecting...');
-      log('Starting WebRTC connection with libpeer C server...');
+function refreshStats() {
+  return getJson("/api/stats").then(function (stats) {
+    var rtp = stats.rtp || {};
+    var dtls = stats.dtls || {};
+    var session = (stats.sessions && stats.sessions.length) ? stats.sessions[0] : null;
+    var video = el("video");
 
-      try {
-        setStep('stepSignaling', 'active');
+    el("transport-grid").innerHTML =
+      cell("video size", (video.videoWidth || 0) + "x" + (video.videoHeight || 0)) +
+      cell("client state", session ? session.state : "-") +
+      cell("peer", session ? (session.peer || "-") : "-") +
+      cell("RTT", session && session.rtt_ms >= 0 ? session.rtt_ms + " ms" : "-") +
+      cell("packets sent", num(rtp.packets_sent)) +
+      cell("bytes sent", num(rtp.bytes_sent)) +
+      cell("NACKs", num(rtp.nacks_received)) +
+      cell("PLIs", num(rtp.pli_received)) +
+      cell("retransmits", num(rtp.retransmissions)) +
+      cell("send errors", num(rtp.send_errors)) +
+      cell("loss (last RR)", session ? (session.fraction_lost / 256 * 100).toFixed(1) + " %" : "-") +
+      cell("handshakes", num(dtls.handshakes_completed) + " / " + num(dtls.handshake_failures) + " failed");
+  });
+}
 
-        // 1. Initialize native RTCPeerConnection (no STUN required for LAN)
-        pc = new RTCPeerConnection({
-          iceServers: [],
-          bundlePolicy: 'max-bundle'
-        });
+function refreshLogs() {
+  var level = el("log-level").value;
 
-        // 2. Add recvonly video transceiver
-        pc.addTransceiver('video', { direction: 'recvonly' });
+  return getJson("/api/logs?limit=120&level=" + level).then(function (data) {
+    el("log").innerHTML = (data.entries || []).map(function (entry) {
+      var stamp = (entry.uptime_ms / 1000).toFixed(1);
+      return '<span class="log-' + entry.level + '">[' + stamp + "s] " +
+             entry.level + " " + entry.tag + ": " + escapeHtml(entry.msg) + "</span>";
+    }).join("\n") || "no entries at this level";
+    el("log").scrollTop = el("log").scrollHeight;
+  }).catch(function (error) {
+    el("log").textContent = "logs unavailable: " + error.message;
+  });
+}
 
-        // 3. Handle incoming remote MediaStreamTrack
-        pc.ontrack = (event) => {
-          log('Received remote media track: ' + event.track.kind, 'ok');
-          const stream = event.streams[0] || new MediaStream([event.track]);
-          video.srcObject = stream;
-          video.play().catch(err => log('Video play error: ' + err, 'err'));
-          idleCover.style.display = 'none';
-          btnSnapshot.disabled = false;
-          setStep('stepMedia', 'ok');
-          setStatus('Streaming', true);
-        };
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
-        // 4. Handle ICE state changes
-        pc.oniceconnectionstatechange = () => {
-          const state = pc.iceConnectionState;
-          log('ICE connection state: ' + state, state === 'connected' || state === 'completed' ? 'ok' : 'info');
-          if (state === 'checking') {
-            setStep('stepIce', 'active');
-          } else if (state === 'connected' || state === 'completed') {
-            setStep('stepIce', 'ok');
-          } else if (state === 'failed') {
-            setStep('stepIce', 'fail');
-            setStatus('ICE Failed', false);
-            showIceError();
-          }
-        };
+function reportError(error) {
+  setState(error.message, "bad");
+  refreshLogs();
+}
 
-        // 5. Handle DTLS peer connection state
-        pc.onconnectionstatechange = () => {
-          const state = pc.connectionState;
-          log('Peer connection state: ' + state, state === 'connected' ? 'ok' : 'info');
-          if (state === 'connecting') {
-            setStep('stepDtls', 'active');
-          } else if (state === 'connected') {
-            setStep('stepDtls', 'ok');
-          } else if (state === 'failed') {
-            setStep('stepDtls', 'fail');
-          }
-        };
+/* --- controls ------------------------------------------------------ */
 
-        // 6. Handle Trickle ICE candidate generation
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            log('Local ICE candidate gathered: ' + event.candidate.candidate);
-            sendCandidate(event.candidate);
-          }
-        };
+el("connect").addEventListener("click", function () {
+  state.autoConnect = true;
+  state.autoRetries = 0;
+  connect();
+});
 
-        // 7. Create SDP Offer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        log('Created and set local SDP offer (' + offer.sdp.length + ' bytes)');
+el("disconnect").addEventListener("click", function () {
+  state.autoConnect = false;
+  teardown(0);
+});
+el("log-level").addEventListener("change", refreshLogs);
 
-        // 8. Exchange signaling (WebSocket or HTTP REST)
-        const mode = document.getElementById('signalingSelect').value;
-        if (mode === 'ws' && window.WebSocket) {
-          await signalingViaWebSocket(offer);
-        } else {
-          await signalingViaHttp(offer);
-        }
-
-        setStep('stepSignaling', 'ok');
-        startStatsTelemetry();
-
-      } catch (err) {
-        log('Connection failed: ' + err.message, 'err');
-        setStep('stepSignaling', 'fail');
-        setStatus('Error', false);
-        stopStream();
-      }
+el("restart-camera").addEventListener("click", function () {
+  postJson("/api/camera/restart").then(function (data) {
+    setState("camera restarted: " + data.encoder, "ok");
+    if (state.autoConnect && !state.pc) {
+      connect();
     }
+  }).catch(reportError);
+});
 
-    async function signalingViaHttp(offer) {
-      log('Exchanging SDP via HTTP POST /rtc/offer...');
-      const resp = await fetch('/rtc/offer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'offer', sdp: offer.sdp })
-      });
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error('Signaling server responded ' + resp.status + ': ' + text);
-      }
-      const data = await resp.json();
-      sessionId = data.session_id;
-      log('Received SDP answer from libpeer (session: ' + sessionId + ')', 'ok');
-      await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: data.sdp }));
-      log('Remote SDP answer applied successfully', 'ok');
-    }
+el("restart-webrtc").addEventListener("click", function () {
+  teardown(0);
+  postJson("/api/webrtc/restart").then(function (data) {
+    setState("WebRTC restarted, new fingerprint " +
+             (data.fingerprint || "?").slice(0, 24) + "...", "ok");
+  }).catch(reportError);
+});
 
-    function signalingViaWebSocket(offer) {
-      return new Promise((resolve, reject) => {
-        const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-        const url = proto + location.host + '/ws';
-        log('Connecting WebSocket signaling to ' + url + '...');
+el("reload-config").addEventListener("click", function () {
+  postJson("/api/config/reload").then(function (data) {
+    var applied = (data.applied || []).join(", ") || "nothing";
+    var restart = (data.restart_required || []).join(", ");
 
-        ws = new WebSocket(url);
-        let resolved = false;
+    setState("config applied: " + applied +
+             (restart ? "; restart required for: " + restart : ""), "ok");
+  }).catch(reportError);
+});
 
-        ws.onopen = () => {
-          log('WebSocket signaling connected', 'ok');
-          ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
-        };
+window.addEventListener("pagehide", function () { teardown(0); });
 
-        ws.onmessage = async (ev) => {
-          try {
-            const data = JSON.parse(ev.data);
-            if (data.type === 'answer') {
-              sessionId = data.session_id;
-              log('Received SDP answer over WebSocket (session: ' + sessionId + ')', 'ok');
-              await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: data.sdp }));
-              log('Remote SDP answer applied successfully', 'ok');
-              resolved = true;
-              resolve();
-            } else if (data.type === 'candidate_ack') {
-              // candidate acknowledged
-            } else if (data.error) {
-              log('Signaling error: ' + data.error, 'err');
-              if (!resolved) reject(new Error(data.error));
-            }
-          } catch (e) {
-            log('WebSocket message parse error: ' + e, 'err');
-          }
-        };
+/*
+ * A page that is opened is a page that wants video: connecting on load
+ * is what makes "plug in the cable, open the address" a single step.
+ * The connect is skipped for a page loaded from the file system, where
+ * /api/ callbacks would fail anyway.
+ */
+if (location.protocol === "http:" || location.protocol === "https:") {
+  connect();
+} else {
+  setState("open this page from the server address");
+}
 
-        ws.onerror = (err) => {
-          log('WebSocket signaling error; falling back to HTTP', 'info');
-          if (!resolved) {
-            signalingViaHttp(offer).then(resolve).catch(reject);
-          }
-        };
-
-        ws.onclose = () => {
-          log('WebSocket signaling closed');
-        };
-      });
-    }
-
-    function stopStream() {
-      if (statsTimer) {
-        clearInterval(statsTimer);
-        statsTimer = null;
-      }
-      if (sessionId) {
-        fetch('/rtc/close', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId })
-        }).catch(() => {});
-        sessionId = 0;
-      }
-      if (ws) {
-        ws.close();
-        ws = null;
-      }
-      if (pc) {
-        pc.close();
-        pc = null;
-      }
-      video.srcObject = null;
-      idleCover.style.display = 'flex';
-      btnStart.disabled = false;
-      btnStop.disabled = true;
-      btnSnapshot.disabled = true;
-      resetSteps();
-      setStatus('Disconnected', false);
-      document.getElementById('telemetryState').textContent = 'IDLE';
-      document.getElementById('valBitrate').innerHTML = '0.0 <span>Mbps</span>';
-      document.getElementById('valFps').innerHTML = '0 <span>fps</span>';
-      document.getElementById('valRtt').innerHTML = '&mdash; <span>ms</span>';
-      log('Stream stopped and session cleaned up');
-    }
-
-    function startStatsTelemetry() {
-      lastBytes = 0;
-      lastFrames = 0;
-      lastTime = performance.now();
-      bitrateHistory.length = 0;
-      document.getElementById('telemetryState').textContent = 'RECEIVING';
-
-      statsTimer = setInterval(async () => {
-        if (!pc) return;
-        try {
-          const stats = await pc.getStats();
-          let inboundVideo = null;
-          let candidatePair = null;
-
-          stats.forEach(report => {
-            if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
-              inboundVideo = report;
-            }
-            if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.nominated || report.selected)) {
-              candidatePair = report;
-            }
-          });
-
-          const now = performance.now();
-          const dt = (now - lastTime) / 1000;
-          lastTime = now;
-
-          if (inboundVideo && dt > 0) {
-            const bytes = inboundVideo.bytesReceived || 0;
-            const frames = inboundVideo.framesDecoded || 0;
-            const lost = inboundVideo.packetsLost || 0;
-            const packets = inboundVideo.packetsReceived || 0;
-
-            const mbps = ((bytes - lastBytes) * 8) / (dt * 1000000);
-            const fps = Math.round((frames - lastFrames) / dt);
-
-            lastBytes = bytes;
-            lastFrames = frames;
-
-            if (mbps >= 0) {
-              document.getElementById('valBitrate').innerHTML = mbps.toFixed(2) + ' <span>Mbps</span>';
-              bitrateHistory.push(mbps);
-              if (bitrateHistory.length > 50) bitrateHistory.shift();
-              renderSparkline(bitrateHistory);
-            }
-            if (fps >= 0) {
-              document.getElementById('valFps').innerHTML = fps + ' <span>fps</span>';
-            }
-            document.getElementById('valPackets').textContent = `${packets} / ${lost}`;
-
-            if (inboundVideo.frameWidth && inboundVideo.frameHeight) {
-              document.getElementById('tagRes').textContent = `${inboundVideo.frameWidth}x${inboundVideo.frameHeight}`;
-            }
-          }
-
-          if (candidatePair) {
-            const rtt = candidatePair.currentRoundTripTime != null ?
-              Math.round(candidatePair.currentRoundTripTime * 1000) : null;
-            if (rtt != null) {
-              document.getElementById('valRtt').innerHTML = rtt + ' <span>ms</span>';
-              document.getElementById('tagLatency').textContent = rtt + 'ms RTT';
-            }
-          }
-        } catch (e) {
-          console.warn('Stats error', e);
-        }
-      }, 1000);
-    }
-
-    function renderSparkline(data) {
-      const cvs = document.getElementById('sparklineCanvas');
-      const ctx = cvs.getContext('2d');
-      const w = cvs.width;
-      const h = cvs.height;
-      ctx.clearRect(0, 0, w, h);
-      if (data.length < 2) return;
-
-      const max = Math.max(...data, 3.5);
-      const step = w / 49;
-
-      ctx.beginPath();
-      for (let i = 0; i < data.length; i++) {
-        const x = w - (data.length - 1 - i) * step;
-        const y = h - 4 - (data[i] / max) * (h - 8);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = '#60a5fa';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.lineTo(w, h);
-      ctx.lineTo(w - (data.length - 1) * step, h);
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(96, 165, 250, 0.15)';
-      ctx.fill();
-    }
-
-    function takeSnapshot() {
-      if (!video.videoWidth) return;
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const a = document.createElement('a');
-      a.download = `camstream-snap-${Date.now()}.png`;
-      a.href = canvas.toDataURL('image/png');
-      a.click();
-      log('Snapshot saved: ' + a.download, 'ok');
-    }
-
-    function showIceError() {
-      hintBanner.classList.add('show');
-      hintBanner.innerHTML = `
-        <strong>ICE Connection Failed:</strong> Direct UDP media exchange was not established.<br>
-        1. Ensure your browser can reach the host UDP port directly over the LAN (Ethernet/Wi-Fi).<br>
-        2. WebRTC UDP media cannot traverse reverse HTTP proxies. Connect directly to <code>http://&lt;lan-ip&gt;:8000/</code>.
-      `;
-    }
-
-    // Auto-fetch server status
-    fetch('/status').then(r => r.json()).then(s => {
-      if (s.transport) {
-        document.getElementById('backendPill').innerHTML = `<span class="dot live"></span><span>Backend: ${s.transport}</span>`;
-      }
-      if (s.source) {
-        document.getElementById('tagRes').textContent = `${s.source.width}x${s.source.height}`;
-      }
-    }).catch(() => {});
-  </script>
+refreshStatus();
+refreshStats();
+refreshLogs();
+window.setInterval(refreshStatus, 2000);
+window.setInterval(refreshStats, 1000);
+window.setInterval(refreshLogs, 3000);
+</script>
 </body>
 </html>

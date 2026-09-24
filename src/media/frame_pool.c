@@ -3,10 +3,11 @@
  *
  * See frame_pool.h for the pool contract.
  */
+#include "log.h"
+
 #include "frame_pool.h"
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,8 +113,8 @@ void frame_unref(FramePool *pool, Frame *frame)
     pthread_mutex_lock(&pool->lock);
 
     if (frame->refcount <= 0) {
-        fprintf(stderr, "frame_pool: double unref detected (index %d)\n",
-                frame->pool_index);
+        log_error("media", "frame_pool: double unref detected (index %d)",
+                  frame->pool_index);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
@@ -122,7 +123,7 @@ void frame_unref(FramePool *pool, Frame *frame)
 
     if (frame->refcount <= 0 && frame->pool_index >= 0) {
         if (pool->free_count >= pool->count) {
-            fprintf(stderr, "frame_pool: free list overflow\n");
+            log_error("media", "frame_pool: free list overflow");
         } else {
             pool->free_list[pool->free_count++] = frame->pool_index;
         }

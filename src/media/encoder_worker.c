@@ -8,9 +8,10 @@
  */
 #include "encoder_worker.h"
 
+#include "log.h"
+
 #include <linux/videodev2.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -40,13 +41,42 @@ struct EncoderWorker {
     atomic_int running;
     int started;
 
-    uint64_t frames_in;
-    uint64_t frames_encoded;
-    uint64_t skipped_idle;
-    uint64_t skipped_mismatch;
-    uint64_t skipped_bad_size;
-    uint64_t no_output;
+    /*
+     * The HTTP thread reads these while the encode thread writes them,
+     * so they are atomics. A plain uint64_t would be a data race, and a
+     * race is undefined behaviour even for a counter that only grows.
+     * The encode thread keeps local copies for its own logic and
+     * publishes each change with a relaxed fetch_add: no ordering is
+     * needed because no other state depends on these values.
+     */
+    atomic_uint_fast64_t frames_in;
+    atomic_uint_fast64_t frames_encoded;
+    atomic_uint_fast64_t skipped_idle;
+    atomic_uint_fast64_t skipped_mismatch;
+    atomic_uint_fast64_t skipped_bad_size;
+    atomic_uint_fast64_t no_output;
+
+    /*
+     * Live reconfiguration mailbox. The HTTP thread only stores a
+     * request here; the encode thread is the one that owns the encoder
+     * handle and applies it, because calling into libx264 or issuing a
+     * V4L2 control ioctl while x264_encoder_encode or VIDIOC_QBUF is
+     * running on the same handle is a data race. 0 means "nothing
+     * pending", which is also why a bitrate request of 0 is refused.
+     */
+    atomic_uint pending_bitrate_kbps;
+    atomic_uint applied_bitrate_kbps;
 };
+
+static void counter_add(atomic_uint_fast64_t *counter)
+{
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+}
+
+static uint64_t counter_get(const atomic_uint_fast64_t *counter)
+{
+    return (uint64_t) atomic_load_explicit(counter, memory_order_relaxed);
+}
 
 /*
  * Frames the worker may consume while active before the stall
@@ -59,7 +89,7 @@ static void *encoder_thread(void *arg)
 {
     EncoderWorker *worker = arg;
 
-    printf("encode worker: started\n");
+    log_info("encode", "encode worker: started");
 
     int was_active = 0;
     int stall_warned = 0;
@@ -80,7 +110,32 @@ static void *encoder_thread(void *arg)
             continue;
         }
 
-        worker->frames_in++;
+        counter_add(&worker->frames_in);
+
+        uint64_t frames_in = counter_get(&worker->frames_in);
+
+        /*
+         * Apply a queued bitrate change now: a frame just arrived, so
+         * the encoder is between calls and nothing else is touching it.
+         * Done before the idle check so the change lands even while no
+         * viewer is connected.
+         */
+        unsigned int pending_kbps =
+            atomic_exchange_explicit(&worker->pending_bitrate_kbps, 0,
+                                     memory_order_relaxed);
+
+        if (pending_kbps != 0) {
+            if (h264_encoder_set_bitrate(worker->encoder, pending_kbps) == 0) {
+                atomic_store_explicit(&worker->applied_bitrate_kbps,
+                                      pending_kbps, memory_order_relaxed);
+                log_info("encode", "encode worker: bitrate now %u kbps",
+                         pending_kbps);
+            } else {
+                log_error("encode", "encode worker: encoder refused the "
+                                    "bitrate change to %u kbps",
+                          pending_kbps);
+            }
+        }
 
         int active = 0;
         if (worker->active != NULL) {
@@ -93,7 +148,7 @@ static void *encoder_thread(void *arg)
              * watchdog for this active window.
              */
             stall_warned = 0;
-            last_encode_at_seen = worker->frames_in;
+            last_encode_at_seen = frames_in;
         }
         was_active = active;
 
@@ -103,7 +158,7 @@ static void *encoder_thread(void *arg)
              * to send the stream to, so skip conversion and
              * encoding entirely.
              */
-            worker->skipped_idle++;
+            counter_add(&worker->skipped_idle);
             frame_unref(frame_hub_pool(worker->hub), frame);
             continue;
         }
@@ -115,31 +170,28 @@ static void *encoder_thread(void *arg)
          * the encoder produces output again.
          */
         if (!stall_warned &&
-            worker->frames_in - last_encode_at_seen >= STALL_WATCHDOG_FRAMES) {
+            frames_in - last_encode_at_seen >= STALL_WATCHDOG_FRAMES) {
             stall_warned = 1;
-            fprintf(stderr,
-                    "encode worker: stalled, no output for %llu frames while "
-                    "active (encoded total=%llu, skipped: mismatch=%llu "
-                    "bad-size=%llu, encoder-no-output=%llu)\n",
-                    (unsigned long long) (worker->frames_in -
-                                          last_encode_at_seen),
-                    (unsigned long long) worker->frames_encoded,
-                    (unsigned long long) worker->skipped_mismatch,
-                    (unsigned long long) worker->skipped_bad_size,
-                    (unsigned long long) worker->no_output);
+            log_warn("encode", "encode worker: stalled, no output for %llu frames "
+                    "while active (encoded total=%llu, skipped: mismatch=%llu "
+                    "bad-size=%llu, encoder-no-output=%llu)",
+                    (unsigned long long) (frames_in - last_encode_at_seen),
+                    (unsigned long long) counter_get(&worker->frames_encoded),
+                    (unsigned long long) counter_get(&worker->skipped_mismatch),
+                    (unsigned long long) counter_get(&worker->skipped_bad_size),
+                    (unsigned long long) counter_get(&worker->no_output));
         }
 
         if (frame->width != worker->width ||
             frame->height != worker->height) {
             if (!mismatch_logged) {
                 mismatch_logged = 1;
-                fprintf(stderr,
-                        "encode worker: frame %ux%u does not match the "
-                        "encoder %ux%u, frames are dropped\n",
+                log_error("encode", "encode worker: frame %ux%u does not match the "
+                        "encoder %ux%u, frames are dropped",
                         frame->width, frame->height,
                         worker->width, worker->height);
             }
-            worker->skipped_mismatch++;
+            counter_add(&worker->skipped_mismatch);
             frame_unref(frame_hub_pool(worker->hub), frame);
             continue;
         }
@@ -147,11 +199,10 @@ static void *encoder_thread(void *arg)
         if (frame->size == 0) {
             if (!bad_size_logged) {
                 bad_size_logged = 1;
-                fprintf(stderr,
-                        "encode worker: empty frame (size 0), "
-                        "frames are dropped\n");
+                log_info("encode", "encode worker: empty frame (size 0), "
+                        "frames are dropped");
             }
-            worker->skipped_bad_size++;
+            counter_add(&worker->skipped_bad_size);
             frame_unref(frame_hub_pool(worker->hub), frame);
             continue;
         }
@@ -207,7 +258,7 @@ static void *encoder_thread(void *arg)
         frame_unref(frame_hub_pool(worker->hub), frame);
 
         if (result < 0) {
-            fprintf(stderr, "encode worker: encoder error, stopping\n");
+            log_error("encode", "encode worker: encoder error, stopping");
             break;
         }
 
@@ -215,12 +266,12 @@ static void *encoder_thread(void *arg)
             /*
              * Hardware pipeline depth: no output this round.
              */
-            worker->no_output++;
+            counter_add(&worker->no_output);
             continue;
         }
 
-        worker->frames_encoded++;
-        last_encode_at_seen = worker->frames_in;
+        counter_add(&worker->frames_encoded);
+        last_encode_at_seen = frames_in;
         stall_warned = 0;
 
         if (is_idr) {
@@ -236,13 +287,13 @@ static void *encoder_thread(void *arg)
                          au_size,
                          pts_us,
                          is_idr) != 0) {
-            fprintf(stderr, "encode worker: access unit too large\n");
+            log_info("encode", "encode worker: access unit too large");
         }
     }
 
-    printf("encode worker: stopped (%llu frames in, %llu encoded)\n",
-           (unsigned long long) worker->frames_in,
-           (unsigned long long) worker->frames_encoded);
+    log_info("encode", "encode worker: stopped (%llu frames in, %llu encoded)",
+           (unsigned long long) counter_get(&worker->frames_in),
+           (unsigned long long) counter_get(&worker->frames_encoded));
 
     return NULL;
 }
@@ -265,9 +316,7 @@ EncoderWorker *encoder_worker_create(FrameHub *hub,
     size_t i420_size = (size_t) width * height * 3 / 2;
 
     if (i420_size > ENCODE_SCRATCH_MAX) {
-        fprintf(stderr,
-                "encode worker: %ux%u exceeds the scratch limit (%lu MB)\n",
-                width, height, (unsigned long) (ENCODE_SCRATCH_MAX / 1048576));
+        log_info("encode", "encode worker: %ux%u exceeds the scratch limit (%lu MB)", width, height, (unsigned long) (ENCODE_SCRATCH_MAX / 1048576));
         if (worker->consumer != NULL) {
             frame_hub_unsubscribe(hub, worker->consumer);
         }
@@ -331,9 +380,39 @@ void encoder_worker_join(EncoderWorker *worker)
     }
 }
 
+int encoder_worker_request_bitrate(EncoderWorker *worker, uint32_t kbps)
+{
+    if (worker == NULL) {
+        return -1;
+    }
+
+    /*
+     * The encode thread is stopped and joined during a pipeline restart;
+     * ask for a non-zero value so the mailbox stays unambiguous.
+     */
+    if (kbps == 0) {
+        return -1;
+    }
+
+    atomic_store_explicit(&worker->pending_bitrate_kbps, kbps,
+                          memory_order_relaxed);
+
+    return 0;
+}
+
+uint32_t encoder_worker_bitrate_kbps(const EncoderWorker *worker)
+{
+    if (worker == NULL) {
+        return 0;
+    }
+
+    return (uint32_t) atomic_load_explicit(&worker->applied_bitrate_kbps,
+                                           memory_order_relaxed);
+}
+
 uint64_t encoder_worker_frames_encoded(const EncoderWorker *worker)
 {
-    return worker != NULL ? worker->frames_encoded : 0;
+    return worker != NULL ? counter_get(&worker->frames_encoded) : 0;
 }
 
 void encoder_worker_get_stats(const EncoderWorker *worker,
@@ -348,17 +427,12 @@ void encoder_worker_get_stats(const EncoderWorker *worker,
         return;
     }
 
-    /*
-     * The counters are written by the encode thread only and
-     * only ever grow, so a plain read from the HTTP thread is
-     * benign here (same contract as frames_encoded above).
-     */
-    out->frames_seen = worker->frames_in;
-    out->frames_encoded = worker->frames_encoded;
-    out->skipped_idle = worker->skipped_idle;
-    out->skipped_mismatch = worker->skipped_mismatch;
-    out->skipped_bad_size = worker->skipped_bad_size;
-    out->no_output = worker->no_output;
+    out->frames_seen = counter_get(&worker->frames_in);
+    out->frames_encoded = counter_get(&worker->frames_encoded);
+    out->skipped_idle = counter_get(&worker->skipped_idle);
+    out->skipped_mismatch = counter_get(&worker->skipped_mismatch);
+    out->skipped_bad_size = counter_get(&worker->skipped_bad_size);
+    out->no_output = counter_get(&worker->no_output);
 }
 
 void encoder_worker_destroy(EncoderWorker *worker)

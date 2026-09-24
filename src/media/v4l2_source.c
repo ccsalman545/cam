@@ -13,6 +13,8 @@
  */
 #include "video_source.h"
 
+#include "log.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/videodev2.h>
@@ -84,7 +86,7 @@ static int v4l2_start(VideoSource *source)
         buffer.index = i;
 
         if (xioctl(impl->fd, VIDIOC_QBUF, &buffer) == -1) {
-            perror("v4l2 VIDIOC_QBUF");
+            log_error("capture", "v4l2 VIDIOC_QBUF: errno=%d (%s)", errno, strerror(errno));
             return -1;
         }
     }
@@ -92,7 +94,7 @@ static int v4l2_start(VideoSource *source)
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (xioctl(impl->fd, VIDIOC_STREAMON, &type) == -1) {
-        perror("v4l2 VIDIOC_STREAMON");
+        log_error("capture", "v4l2 VIDIOC_STREAMON: errno=%d (%s)", errno, strerror(errno));
         return -1;
     }
 
@@ -121,7 +123,7 @@ static int v4l2_capture(VideoSource *source,
         if (errno == EINTR) {
             return 0;
         }
-        perror("v4l2 poll");
+        log_error("capture", "v4l2 poll: errno=%d (%s)", errno, strerror(errno));
         return -1;
     }
 
@@ -139,7 +141,7 @@ static int v4l2_capture(VideoSource *source,
         if (errno == EAGAIN) {
             return 0;
         }
-        perror("v4l2 VIDIOC_DQBUF");
+        log_error("capture", "v4l2 VIDIOC_DQBUF: errno=%d (%s)", errno, strerror(errno));
         return -1;
     }
 
@@ -182,7 +184,7 @@ static void v4l2_release(VideoSource *source, uint32_t buffer_index)
     struct V4l2Source *impl = source->impl;
 
     if (buffer_index >= impl->buffer_count) {
-        fprintf(stderr, "v4l2: release with invalid index %u\n", buffer_index);
+        log_info("capture", "v4l2: release with invalid index %u", buffer_index);
         return;
     }
 
@@ -194,7 +196,7 @@ static void v4l2_release(VideoSource *source, uint32_t buffer_index)
     buffer.index = buffer_index;
 
     if (xioctl(impl->fd, VIDIOC_QBUF, &buffer) == -1) {
-        perror("v4l2 VIDIOC_QBUF (release)");
+        log_error("capture", "v4l2 VIDIOC_QBUF (release): errno=%d (%s)", errno, strerror(errno));
     }
 }
 
@@ -255,8 +257,7 @@ VideoSource *v4l2_source_create(const char *device,
     impl->fd = open(device, O_RDWR | O_NONBLOCK);
 
     if (impl->fd == -1) {
-        fprintf(stderr, "v4l2: cannot open %s: %s\n",
-                device, strerror(errno));
+        log_error("capture", "v4l2: cannot open %s: %s", device, strerror(errno));
         free(impl);
         free(source);
         return NULL;
@@ -267,7 +268,7 @@ VideoSource *v4l2_source_create(const char *device,
     memset(&capability, 0, sizeof(capability));
 
     if (xioctl(impl->fd, VIDIOC_QUERYCAP, &capability) == -1) {
-        perror("v4l2 VIDIOC_QUERYCAP");
+        log_error("capture", "v4l2 VIDIOC_QUERYCAP: errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
@@ -278,11 +279,11 @@ VideoSource *v4l2_source_create(const char *device,
 
     if (!(caps & V4L2_CAP_VIDEO_CAPTURE) ||
         !(caps & V4L2_CAP_STREAMING)) {
-        fprintf(stderr, "v4l2: %s does not support mmap capture\n", device);
+        log_info("capture", "v4l2: %s does not support mmap capture", device);
         goto fail;
     }
 
-    printf("v4l2: device %s (%s)\n", device, capability.card);
+    log_info("capture", "v4l2: device %s (%s)", device, capability.card);
 
     /*
      * Format negotiation: try YUYV first, then planar YU12.
@@ -322,7 +323,7 @@ VideoSource *v4l2_source_create(const char *device,
     }
 
     if (!format_ok) {
-        fprintf(stderr, "v4l2: %s supports neither YUYV nor YU12\n", device);
+        log_info("capture", "v4l2: %s supports neither YUYV nor YU12", device);
         goto fail;
     }
 
@@ -355,12 +356,12 @@ VideoSource *v4l2_source_create(const char *device,
     request.memory = V4L2_MEMORY_MMAP;
 
     if (xioctl(impl->fd, VIDIOC_REQBUFS, &request) == -1) {
-        perror("v4l2 VIDIOC_REQBUFS");
+        log_error("capture", "v4l2 VIDIOC_REQBUFS: errno=%d (%s)", errno, strerror(errno));
         goto fail;
     }
 
     if (request.count < 2) {
-        fprintf(stderr, "v4l2: only %u buffers granted\n", request.count);
+        log_info("capture", "v4l2: only %u buffers granted", request.count);
         goto fail;
     }
 
@@ -375,7 +376,7 @@ VideoSource *v4l2_source_create(const char *device,
         buffer.index = i;
 
         if (xioctl(impl->fd, VIDIOC_QUERYBUF, &buffer) == -1) {
-            perror("v4l2 VIDIOC_QUERYBUF");
+            log_error("capture", "v4l2 VIDIOC_QUERYBUF: errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
 
@@ -387,7 +388,7 @@ VideoSource *v4l2_source_create(const char *device,
                                       buffer.m.offset);
 
         if (impl->buffers[i].start == MAP_FAILED) {
-            perror("v4l2 mmap");
+            log_error("capture", "v4l2 mmap: errno=%d (%s)", errno, strerror(errno));
             goto fail;
         }
     }
@@ -405,8 +406,7 @@ VideoSource *v4l2_source_create(const char *device,
     source->close = v4l2_close;
     source->impl = impl;
 
-    printf("v4l2: %ux%u %s, stride %u, %u fps, %u buffers\n",
-           impl->width, impl->height,
+    log_info("capture", "v4l2: %ux%u %s, stride %u, %u fps, %u buffers", impl->width, impl->height,
            impl->format == V4L2_PIX_FMT_YUYV ? "YUYV" : "YU12",
            impl->stride, impl->fps, impl->buffer_count);
 

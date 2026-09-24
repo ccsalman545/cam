@@ -3,13 +3,19 @@
 /*
  * encoder_x264.c
  *
- * libx264 backend. Tune: zerolatency, no lookahead, closed
- * GOP, repeated SPS/PPS headers so a viewer can join the
- * stream at any keyframe.
+ * libx264 backend. Tune: zerolatency, no lookahead, closed GOP,
+ * repeated SPS/PPS headers so a viewer can join the stream at any
+ * keyframe.
  *
- * Compiled only when HAVE_X264 is set by the Makefile.
+ * The whole file is guarded by HAVE_X264 (set by the Makefile) rather
+ * than excluded from the source list, so a build without libx264 has no
+ * unsatisfied symbols and no second place to keep in sync.
  */
 #include "h264_encoder.h"
+
+#if HAVE_X264
+
+#include <stdio.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +168,29 @@ static int x264_encode(struct X264Backend *encoder,
     return 1;
 }
 
+/*
+ * Rate changes are the only live reconfiguration libx264 reliably
+ * supports; x264_encoder_reconfig() rejects structural changes such as
+ * a new resolution, which is why those are reported as restart
+ * required instead.
+ */
+static int x264_set_bitrate(struct X264Backend *encoder, uint32_t bitrate_kbps)
+{
+    if (encoder == NULL || encoder->handle == NULL || bitrate_kbps == 0) {
+        return -1;
+    }
+
+    encoder->params.rc.i_bitrate = (int) bitrate_kbps;
+    encoder->params.rc.i_vbv_max_bitrate = (int) bitrate_kbps;
+    encoder->params.rc.i_vbv_buffer_size = (int) bitrate_kbps;
+
+    if (x264_encoder_reconfig(encoder->handle, &encoder->params) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static void x264_close(struct X264Backend *encoder)
 {
     if (encoder == NULL) {
@@ -197,7 +226,14 @@ int x264_backend_encode(void *backend,
                        force_idr, out, out_capacity, out_size, out_is_idr);
 }
 
+int x264_backend_set_bitrate(void *backend, uint32_t bitrate_kbps)
+{
+    return x264_set_bitrate((struct X264Backend *) backend, bitrate_kbps);
+}
+
 void x264_backend_close(void *backend)
 {
     x264_close((struct X264Backend *) backend);
 }
+
+#endif /* HAVE_X264 */

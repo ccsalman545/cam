@@ -6,10 +6,8 @@
 #include "ice_lite.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -204,6 +202,23 @@ int stun_is_binding_request(const uint8_t *buf, size_t len,
     return 1;
 }
 
+int stun_is_binding_indication(const uint8_t *buf, size_t len)
+{
+    if (len < STUN_HEADER_SIZE) {
+        return 0;
+    }
+
+    uint16_t type = read_be16(buf);
+    uint16_t message_len = read_be16(buf + 2);
+    uint32_t cookie = ((uint32_t) buf[4] << 24) |
+                      ((uint32_t) buf[5] << 16) |
+                      ((uint32_t) buf[6] << 8) |
+                      (uint32_t) buf[7];
+
+    return type == 0x0011 && cookie == STUN_MAGIC_COOKIE &&
+           (size_t) message_len + STUN_HEADER_SIZE <= len;
+}
+
 int stun_copy_username(const uint8_t *buf, size_t len,
                        char *out, size_t out_size)
 {
@@ -289,7 +304,13 @@ int stun_build_binding_response(const char *local_pwd,
                                 size_t out_capacity,
                                 size_t *out_len)
 {
-    if (request_len < STUN_HEADER_SIZE || out_capacity < 128) {
+    /*
+     * 20 header + 12 XOR-MAPPED-ADDRESS + 24 MESSAGE-INTEGRITY +
+     * 8 FINGERPRINT = 64 bytes. IPv4 only: the media socket is
+     * AF_INET, so an IPv6 peer cannot appear here.
+     */
+    if (request_len < STUN_HEADER_SIZE || out_capacity < 64 ||
+        peer == NULL || peer->ss_family != AF_INET || local_pwd == NULL) {
         return -1;
     }
 
@@ -308,42 +329,22 @@ int stun_build_binding_response(const char *local_pwd,
     {
         uint8_t *attr = out + STUN_HEADER_SIZE;
 
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *) peer;
+
         write_be16(attr, 0x0020);
         write_be16(attr + 2, 8);
         attr[4] = 0;
+        attr[5] = 0x01;                 /* IPv4 */
 
-        if (peer->ss_family == AF_INET6) {
-            attr[5] = 0x02;
+        /* RFC 5389 section 15.2: port and address XOR the magic cookie. */
+        write_be16(attr + 6, (uint16_t) (ntohs(a4->sin_port) ^ 0x2112));
 
-            const struct sockaddr_in6 *a6 =
-                (const struct sockaddr_in6 *) peer;
+        uint32_t addr = ntohl(a4->sin_addr.s_addr) ^ STUN_MAGIC_COOKIE;
 
-            uint16_t xport = ntohs(a6->sin6_port) ^ 0x2112;
-            write_be16(attr + 6, xport);
-
-            const uint8_t cookie[4] = {
-                0x21, 0x12, 0xA4, 0x42
-            };
-
-            for (int i = 0; i < 16; i++) {
-                attr[8 + i] = ((const uint8_t *) &a6->sin6_addr)[i] ^
-                              (i < 4 ? cookie[i] : request[8 + (i - 4)]);
-            }
-        } else {
-            attr[5] = 0x01;
-
-            const struct sockaddr_in *a4 = (const struct sockaddr_in *) peer;
-
-            uint16_t xport = ntohs(a4->sin_port) ^ 0x2112;
-            write_be16(attr + 6, xport);
-
-            uint32_t addr = ntohl(a4->sin_addr.s_addr) ^ STUN_MAGIC_COOKIE;
-
-            attr[8] = (uint8_t) (addr >> 24);
-            attr[9] = (uint8_t) (addr >> 16);
-            attr[10] = (uint8_t) (addr >> 8);
-            attr[11] = (uint8_t) addr;
-        }
+        attr[8] = (uint8_t) (addr >> 24);
+        attr[9] = (uint8_t) (addr >> 16);
+        attr[10] = (uint8_t) (addr >> 8);
+        attr[11] = (uint8_t) addr;
 
         payload += 4 + 8;
     }
@@ -454,10 +455,21 @@ int stun_verify_mi(const uint8_t *buf, size_t len,
         return 0;
     }
 
-    uint8_t *scratch = malloc(mi_header);
+    /*
+     * Connectivity checks are a few hundred bytes at most; the stack
+     * copy keeps this path free of allocation.
+     */
+    uint8_t stack_scratch[512];
+    uint8_t *scratch = stack_scratch;
+    uint8_t *heap_scratch = NULL;
 
-    if (scratch == NULL) {
-        return 0;
+    if (mi_header > sizeof(stack_scratch)) {
+        heap_scratch = malloc(mi_header);
+        scratch = heap_scratch;
+
+        if (scratch == NULL) {
+            return 0;
+        }
     }
 
     memcpy(scratch, buf, mi_header);
@@ -466,16 +478,15 @@ int stun_verify_mi(const uint8_t *buf, size_t len,
     unsigned char mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
 
-    if (HMAC(EVP_sha1(), password, (int) strlen(password),
-             scratch, mi_header, mac, &mac_len) == NULL || mac_len != 20) {
-        free(scratch);
-        return 0;
-    }
+    int verified = HMAC(EVP_sha1(), password, (int) strlen(password),
+                        scratch, mi_header, mac, &mac_len) != NULL &&
+                   mac_len == 20 &&
+                   CRYPTO_memcmp(mac, mi, 20) == 0;
 
-    free(scratch);
+    free(heap_scratch);
 
-    /* constant-time compare: this MAC guards the peer slot */
-    return CRYPTO_memcmp(mac, mi, 20) == 0;
+    /* CRYPTO_memcmp is constant time: this MAC guards the peer slot. */
+    return verified;
 }
 
 int stun_build_error_response(const uint8_t tid[12],

@@ -8,11 +8,12 @@
  */
 #include "dtls_srtp.h"
 
-#include <errno.h>
-#include <pthread.h>
+#include "log.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <openssl/err.h>
@@ -25,13 +26,28 @@
 
 #define DTLS_RX_QUEUE 64
 #define DTLS_MTU 1200
-#define SRTP_KEY_MATERIAL_LEN 60     /* 2 x (16 key + 14 salt) */
+
+/*
+ * RFC 5764 keying material: a 16 byte master key and a 14 byte master
+ * salt per direction, 60 bytes in total.
+ */
+#define SRTP_KEY_MATERIAL_LEN 60
+
+/*
+ * The one DTLS-SRTP profile offered: AES128 CM with HMAC-SHA1-80, the
+ * RFC 5764 mandatory to implement profile that browsers require. It is
+ * also the only implemented profile whose key sizes match the libsrtp
+ * AES128 CM policies used below, so the negotiation result is checked
+ * rather than assumed.
+ */
+#define SRTP_PROFILE_NAME "SRTP_AES128_CM_SHA1_80"
 
 static SSL_CTX *g_ctx;
 static X509 *g_cert;
 static EVP_PKEY *g_key;
 static char g_fingerprint[128];
 static int g_srtp_initialized;
+static DtlsSrtpGlobalStats g_stats;
 
 struct DtlsRxPacket {
     uint8_t *data;
@@ -61,11 +77,30 @@ struct DtlsSrtp {
     int srtp_ready;
 
     char expected_fingerprint[128];
+    char failure_reason[96];
     int handshake_started;
     int fingerprint_ok;
 
     uint8_t read_buffer[4096];
 };
+
+/*
+ * OpenSSL keeps errors on a per-thread queue; drain it so the log
+ * line names the failing call and the library reason.
+ */
+static void dtls_log_openssl(const char *operation)
+{
+    unsigned long code = ERR_get_error();
+    char text[128];
+
+    if (code == 0) {
+        log_error("dtls", "%s failed (no OpenSSL error queued)", operation);
+        return;
+    }
+
+    ERR_error_string_n(code, text, sizeof(text));
+    log_error("dtls", "%s failed: %s", operation, text);
+}
 
 /* ------------------------------------------------------------------ */
 /* Global certificate and SSL_CTX                                      */
@@ -93,6 +128,8 @@ static int generate_certificate(void)
 
     g_cert = X509_new();
     if (g_cert == NULL) {
+        EVP_PKEY_free(g_key);
+        g_key = NULL;
         return -1;
     }
 
@@ -147,20 +184,23 @@ int dtls_srtp_global_init(void)
     }
 
     if (!g_srtp_initialized) {
-        if (srtp_init() != srtp_err_status_ok) {
-            fprintf(stderr, "dtls: srtp_init() failed\n");
+        srtp_err_status_t srtp_status = srtp_init();
+
+        if (srtp_status != srtp_err_status_ok) {
+            log_error("dtls", "srtp_init() failed: status=%d", (int) srtp_status);
             return -1;
         }
         g_srtp_initialized = 1;
     }
 
     if (generate_certificate() != 0) {
-        fprintf(stderr, "dtls: certificate generation failed\n");
+        log_error("dtls", "self signed certificate generation failed");
         return -1;
     }
 
     g_ctx = SSL_CTX_new(DTLS_method());
     if (g_ctx == NULL) {
+        dtls_log_openssl("SSL_CTX_new(DTLS_method)");
         return -1;
     }
 
@@ -168,7 +208,7 @@ int dtls_srtp_global_init(void)
     SSL_CTX_use_PrivateKey(g_ctx, g_key);
 
     if (SSL_CTX_check_private_key(g_ctx) != 1) {
-        fprintf(stderr, "dtls: private key check failed\n");
+        dtls_log_openssl("SSL_CTX_check_private_key");
         return -1;
     }
 
@@ -177,8 +217,8 @@ int dtls_srtp_global_init(void)
      * the universally implemented WebRTC baseline profile and
      * keeps the exported key layout at exactly 60 bytes.
      */
-    if (SSL_CTX_set_tlsext_use_srtp(g_ctx, "SRTP_AES128_CM_SHA1_80") != 0) {
-        fprintf(stderr, "dtls: setting SRTP profiles failed\n");
+    if (SSL_CTX_set_tlsext_use_srtp(g_ctx, SRTP_PROFILE_NAME) != 0) {
+        dtls_log_openssl("SSL_CTX_set_tlsext_use_srtp");
         return -1;
     }
 
@@ -207,8 +247,7 @@ int dtls_srtp_global_init(void)
     SSL_CTX_set_max_proto_version(g_ctx, DTLS1_2_VERSION);
 #endif
 
-    printf("dtls: local certificate fingerprint (sha-256)\n");
-    printf("      %s\n", g_fingerprint);
+    log_info("dtls", "local certificate fingerprint %s", g_fingerprint);
 
     return 0;
 }
@@ -416,6 +455,21 @@ static int derive_srtp_keys(DtlsSrtp *session)
     uint8_t server_key[30];
 
     /*
+     * The keys are only meaningful if the handshake agreed on a
+     * use_srtp profile. Without this check a peer that never offered
+     * the extension would be sent media protected with a key schedule
+     * it does not know, instead of the handshake failing where the
+     * cause is visible.
+     */
+    if (SSL_get_selected_srtp_profile(session->ssl) == NULL) {
+        snprintf(session->failure_reason, sizeof(session->failure_reason),
+                 "peer negotiated no use_srtp profile "
+                 "(offered %s)", SRTP_PROFILE_NAME);
+        log_error("dtls", "%s", session->failure_reason);
+        return -1;
+    }
+
+    /*
      * Export order (RFC 5764):
      *   client write key (16) | server write key (16)
      *   client write salt (14) | server write salt (14)
@@ -426,7 +480,7 @@ static int derive_srtp_keys(DtlsSrtp *session)
                                    "EXTRACTOR-dtls_srtp",
                                    19,
                                    NULL, 0, 0) != 1) {
-        fprintf(stderr, "dtls: keying material export failed\n");
+        dtls_log_openssl("SSL_export_keying_material");
         return -1;
     }
 
@@ -452,16 +506,22 @@ static int derive_srtp_keys(DtlsSrtp *session)
     policy.key = server_key;
     policy.allow_repeat_tx = 1;
 
-    if (srtp_create(&session->srtp_out, &policy) != srtp_err_status_ok) {
-        fprintf(stderr, "dtls: srtp_create(out) failed\n");
+    srtp_err_status_t status = srtp_create(&session->srtp_out, &policy);
+
+    if (status != srtp_err_status_ok) {
+        log_error("dtls", "srtp_create(outbound) failed: status=%d",
+                  (int) status);
         return -1;
     }
 
     policy.ssrc.type = ssrc_any_inbound;
     policy.key = client_key;
 
-    if (srtp_create(&session->srtp_in, &policy) != srtp_err_status_ok) {
-        fprintf(stderr, "dtls: srtp_create(in) failed\n");
+    status = srtp_create(&session->srtp_in, &policy);
+
+    if (status != srtp_err_status_ok) {
+        log_error("dtls", "srtp_create(inbound) failed: status=%d",
+                  (int) status);
         return -1;
     }
 
@@ -472,7 +532,10 @@ static int derive_srtp_keys(DtlsSrtp *session)
         X509 *peer = SSL_get1_peer_certificate(session->ssl);
 
         if (peer == NULL) {
-            fprintf(stderr, "dtls: peer sent no certificate\n");
+            snprintf(session->failure_reason, sizeof(session->failure_reason),
+                     "peer completed the handshake without a certificate");
+            g_stats.handshake_failures++;
+            log_error("dtls", "handshake failed: %s", session->failure_reason);
             return -1;
         }
 
@@ -486,7 +549,11 @@ static int derive_srtp_keys(DtlsSrtp *session)
         X509_free(peer);
 
         if (!ok) {
-            fprintf(stderr, "dtls: peer certificate fingerprint mismatch\n");
+            g_stats.fingerprint_mismatches++;
+            g_stats.handshake_failures++;
+            snprintf(session->failure_reason, sizeof(session->failure_reason),
+                     "peer certificate does not match the a=fingerprint in "
+                     "the offer");
             return -1;
         }
     }
@@ -506,6 +573,7 @@ static void pump_ssl(DtlsSrtp *session)
 
     if (!session->handshake_started) {
         session->handshake_started = 1;
+        g_stats.handshakes_started++;
         dtls_set_state(session, DTLS_SRTP_HANDSHAKING);
 
         int rc = SSL_accept(session->ssl);
@@ -516,8 +584,15 @@ static void pump_ssl(DtlsSrtp *session)
             int err = SSL_get_error(session->ssl, rc);
 
             if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                fprintf(stderr, "dtls: SSL_accept failed (%d)\n", err);
-                ERR_print_errors_fp(stderr);
+                snprintf(session->failure_reason,
+                         sizeof(session->failure_reason),
+                         "SSL_accept: %s (%d)",
+                         err == SSL_ERROR_SSL ? "protocol error" :
+                         err == SSL_ERROR_SYSCALL ? "unexpected EOF" :
+                         "handshake rejected", err);
+                g_stats.handshake_failures++;
+                log_error("dtls", "handshake failed: %s", session->failure_reason);
+                dtls_log_openssl("SSL_accept");
                 dtls_set_state(session, DTLS_SRTP_FAILED);
                 return;
             }
@@ -531,7 +606,10 @@ static void pump_ssl(DtlsSrtp *session)
             int err = SSL_get_error(session->ssl, rc);
 
             if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                fprintf(stderr, "dtls: SSL_read failed (%d)\n", err);
+                snprintf(session->failure_reason,
+                         sizeof(session->failure_reason),
+                         "SSL_read: error %d", err);
+                dtls_log_openssl("SSL_read");
                 dtls_set_state(session, DTLS_SRTP_FAILED);
                 return;
             }
@@ -546,9 +624,19 @@ static void pump_ssl(DtlsSrtp *session)
 
     if (!session->srtp_ready && SSL_is_init_finished(session->ssl) == 1) {
         if (derive_srtp_keys(session) != 0) {
+            if (session->failure_reason[0] == 0) {
+                snprintf(session->failure_reason,
+                         sizeof(session->failure_reason),
+                         "SRTP key derivation failed");
+            }
+            g_stats.handshake_failures++;
+            log_error("dtls", "handshake failed: %s", session->failure_reason);
             dtls_set_state(session, DTLS_SRTP_FAILED);
             return;
         }
+
+        session->failure_reason[0] = 0;
+        g_stats.handshakes_completed++;
 
         dtls_set_state(session, DTLS_SRTP_CONNECTED);
 
@@ -640,7 +728,8 @@ void dtls_srtp_on_udp(DtlsSrtp *session,
                       const uint8_t *packet,
                       size_t len)
 {
-    if (session == NULL || session->state == DTLS_SRTP_FAILED) {
+    if (session == NULL || session->state == DTLS_SRTP_FAILED ||
+        session->state == DTLS_SRTP_CLOSED) {
         return;
     }
 
@@ -811,4 +900,16 @@ void dtls_srtp_session_destroy(DtlsSrtp *session)
     }
 
     free(session);
+}
+
+void dtls_srtp_global_stats(DtlsSrtpGlobalStats *out)
+{
+    if (out != NULL) {
+        *out = g_stats;
+    }
+}
+
+const char *dtls_srtp_failure_reason(const DtlsSrtp *session)
+{
+    return session != NULL ? session->failure_reason : "";
 }

@@ -1,0 +1,22 @@
+[Unit]
+Description=camstream WebRTC camera server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camstream --config /etc/camstream.conf
+Restart=on-failure
+RestartSec=2
+# The camera and the encoder are reached through /dev nodes and V4L2
+# ioctls, so the process only needs video group membership, not root.
+# Uncomment the two lines below after creating the account:
+#   sudo useradd --system --no-create-home --groups video camstream
+#User=camstream
+#Group=camstream
+SupplementaryGroups=video
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

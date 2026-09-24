@@ -17,6 +17,8 @@
  */
 #include "h264_encoder.h"
 
+#include "log.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +37,7 @@ int m2m_backend_encode(void *backend,
                        uint64_t pts_us, int force_idr,
                        uint8_t *out, size_t out_capacity,
                        size_t *out_size, int *out_is_idr);
+int m2m_backend_set_bitrate(void *backend, uint32_t bitrate_kbps);
 void m2m_backend_close(void *backend);
 
 /*
@@ -50,6 +53,7 @@ int x264_backend_encode(void *backend,
                         uint64_t pts_us, int force_idr,
                         uint8_t *out, size_t out_capacity,
                         size_t *out_size, int *out_is_idr);
+int x264_backend_set_bitrate(void *backend, uint32_t bitrate_kbps);
 void x264_backend_close(void *backend);
 #endif
 
@@ -60,6 +64,7 @@ struct H264Encoder {
                   uint64_t pts_us, int force_idr,
                   uint8_t *out, size_t out_capacity,
                   size_t *out_size, int *out_is_idr);
+    int (*set_bitrate)(void *backend, uint32_t bitrate_kbps);
     void (*close)(void *backend);
 };
 
@@ -95,7 +100,9 @@ H264Encoder *h264_encoder_open(const char *preference,
     }
 
     if (width % 2 != 0 || height % 2 != 0 || fps == 0) {
-        fprintf(stderr, "encoder: even dimensions and nonzero fps required\n");
+        log_error("encode", "even dimensions and a nonzero frame rate are "
+                            "required (requested %ux%u @ %u)", width, height,
+                  fps);
         return NULL;
     }
 
@@ -114,8 +121,8 @@ H264Encoder *h264_encoder_open(const char *preference,
         want_hw = 1;
         explicit_device = preference + 3;
     } else {
-        fprintf(stderr, "encoder: unknown preference '%s' "
-                "(use auto, hw, hw:/dev/videoNN or sw)\n", preference);
+        log_error("encode", "unknown encoder preference '%s' (use auto, hw, "
+                            "hw:/dev/videoNN or sw)", preference);
         return NULL;
     }
 
@@ -131,10 +138,10 @@ H264Encoder *h264_encoder_open(const char *preference,
         if (path == NULL) {
             if (find_m2m_device(device_path, sizeof(device_path)) != 0) {
                 if (!want_sw) {
-                    fprintf(stderr,
-                            "encoder: no V4L2 M2M H.264 encoder detected\n");
+                    log_error("encode", "no V4L2 M2M H.264 encoder detected");
                 } else {
-                    printf("encoder: no V4L2 M2M H.264 hardware encoder detected; falling back to software (libx264)\n");
+                    log_info("encode", "no V4L2 M2M H.264 encoder detected, "
+                                       "using software encoding (libx264)");
                 }
             } else {
                 path = device_path;
@@ -155,9 +162,10 @@ H264Encoder *h264_encoder_open(const char *preference,
 
                 encoder->backend = backend;
                 encoder->encode = m2m_backend_encode;
+                encoder->set_bitrate = m2m_backend_set_bitrate;
                 encoder->close = m2m_backend_close;
 
-                printf("encoder: using hardware backend [%s]\n", selected);
+                log_info("encode", "hardware encoder: %s", selected);
 
                 if (name_out != NULL && name_out_size > 0) {
                     snprintf(name_out, name_out_size, "%s", selected);
@@ -166,8 +174,7 @@ H264Encoder *h264_encoder_open(const char *preference,
                 return encoder;
             }
 
-            fprintf(stderr, "encoder: hardware backend %s failed to open\n",
-                    path);
+            log_error("encode", "hardware encoder %s failed to open", path);
 
             if (explicit_device != NULL || !want_sw) {
                 return NULL;
@@ -193,9 +200,10 @@ H264Encoder *h264_encoder_open(const char *preference,
 
             encoder->backend = backend;
             encoder->encode = x264_backend_encode;
+            encoder->set_bitrate = x264_backend_set_bitrate;
             encoder->close = x264_backend_close;
 
-            printf("encoder: using software backend [%s]\n", selected);
+            log_info("encode", "software encoder: %s", selected);
 
             if (name_out != NULL && name_out_size > 0) {
                 snprintf(name_out, name_out_size, "%s", selected);
@@ -204,22 +212,20 @@ H264Encoder *h264_encoder_open(const char *preference,
             return encoder;
         }
 
-        fprintf(stderr, "encoder: libx264 failed to open\n");
+        log_error("encode", "libx264 failed to open");
         return NULL;
     }
 #else
     if (want_sw) {
-        fprintf(stderr,
-            "encoder: libx264 support is not compiled in.\n"
-            "Install libx264-dev (or pass X264_DIR=...) and rebuild, or\n"
-            "run with --encoder auto on hardware that provides a V4L2 M2M\n"
-            "H.264 encoder (Raspberry Pi: /dev/video11).\n");
+        log_error("encode", "libx264 support is not compiled in: install "
+                            "libx264-dev and rebuild, or use --encoder auto on "
+                            "hardware with a V4L2 M2M encoder (Raspberry Pi: "
+                            "/dev/video11)");
         return NULL;
     }
 #endif
 
-    fprintf(stderr, "encoder: no usable backend for preference '%s'\n",
-            preference);
+    log_error("encode", "no usable backend for preference '%s'", preference);
 
     return NULL;
 }
@@ -244,6 +250,15 @@ int h264_encoder_encode(H264Encoder *encoder,
                            pts_us, force_idr,
                            out, out_capacity,
                            out_size, out_is_idr);
+}
+
+int h264_encoder_set_bitrate(H264Encoder *encoder, uint32_t bitrate_kbps)
+{
+    if (encoder == NULL || encoder->set_bitrate == NULL) {
+        return -1;
+    }
+
+    return encoder->set_bitrate(encoder->backend, bitrate_kbps);
 }
 
 void h264_encoder_close(H264Encoder *encoder)
