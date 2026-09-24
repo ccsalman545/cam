@@ -26,6 +26,7 @@
 # library file, and Pi images occasionally ship without pkg-config.
 
 CC       ?= gcc
+HOST_CC  ?= cc
 CSTD      = -std=c11 -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
 WARN      = -Wall -Wextra -Wpedantic -Wshadow -Wundef -Wformat=2 \
             -Wstrict-prototypes -Wpointer-arith -Wvla
@@ -219,7 +220,7 @@ $(BUILD)/obj/third_party/mongoose/mongoose.o: third_party/mongoose/mongoose.c \
 # Regenerating it only when web/index.html changes keeps rebuilds cheap.
 $(EMBED_TOOL): tools/embed_assets.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CSTD) -O2 -o $@ $<
+	$(HOST_CC) $(CSTD) -O2 -o $@ $<
 
 $(WEB_ASSETS): $(WEB_PAGE) $(EMBED_TOOL)
 	@mkdir -p $(dir $@)
